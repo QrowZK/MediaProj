@@ -34,6 +34,15 @@ brass-accented interface built for long listening sessions.
 - **ReplayGain** — track or album mode, read from your files' tags.
 - **Output device selection** — route playback straight to your DAC.
 - **Live spectrum analyzer** (log-frequency, peak-hold) and **stereo VU meters**.
+- **Lyrics on the Now Playing screen** — from `.lrc`/`.txt` side files, embedded tags, or
+  LRCLIB lookup (cached). Time-synced lyrics follow the music with the active line
+  highlighted; click a line to seek. The artwork slides over gracefully when lyrics are
+  present and recenters when they're not. Toggle in Settings.
+- **Last.fm scrobbling** — standard half-track/four-minute rule, now-playing updates,
+  and an offline queue that retries failed scrobbles. Bring your own free API key
+  (last.fm/api/account/create), connect once in the browser, done.
+- **Mini player** — a compact always-on-top window (art, transport, seek) in the spirit
+  of MusicBee's mini mode. Toggle from the player bar; pop back to full size anytime.
 - **OS media key support** via MediaSession.
 
 ### Honest notes for the discerning ear
@@ -48,6 +57,20 @@ at the output device's shared-mode rate.
 Grab `Auralis-Setup-<version>.exe` from the releases page (or build it yourself, below),
 run it, and pick an install directory. The installer creates Start Menu and desktop
 shortcuts. No telemetry, no accounts, no nonsense.
+
+### Auto-updates
+
+The installed app checks GitHub Releases on startup (toggle under Settings →
+About & Updates), downloads new versions in the background using differential
+blockmap updates, and offers a one-click restart — declined updates install on
+the next quit. Publishing an update is just pushing a tag:
+
+```bash
+git tag v1.3.1 && git push origin v1.3.1
+```
+
+The CI workflow builds the installer and publishes the release (including the
+`latest.yml` update manifest) automatically.
 
 ## Build from source
 

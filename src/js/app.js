@@ -83,16 +83,26 @@ function shortFmt(t) {
   return codec || '—';
 }
 
-function toast(msg, isError = false) {
+function toast(msg, isError = false, action = null) {
   const el = document.createElement('div');
   el.className = 'toast' + (isError ? ' error' : '');
   el.textContent = msg;
+  if (action) {
+    const btn = document.createElement('button');
+    btn.className = 'toast-action';
+    btn.textContent = action.label;
+    btn.addEventListener('click', () => { action.fn(); el.remove(); });
+    el.appendChild(btn);
+  }
   $('#toasts').appendChild(el);
-  setTimeout(() => {
-    el.style.transition = 'opacity 0.3s';
-    el.style.opacity = '0';
-    setTimeout(() => el.remove(), 320);
-  }, 3400);
+  if (!action) {
+    setTimeout(() => {
+      el.style.transition = 'opacity 0.3s';
+      el.style.opacity = '0';
+      setTimeout(() => el.remove(), 320);
+    }, 3400);
+  }
+  return el;
 }
 
 // ── Library derived data ─────────────────────────────────────────────────
@@ -726,6 +736,41 @@ async function renderSettings() {
       </div>
 
       <div class="settings-card">
+        <h3>Now Playing</h3>
+        <div class="setting-row" style="padding-top:0">
+          <div><div class="lbl">Display lyrics</div>
+            <div class="hint">Shows lyrics beside the artwork on the Now Playing screen — from .lrc/.txt files next to your audio, embedded tags, or LRCLIB lookup (cached). Time-synced lyrics follow the music; click a line to jump there.</div></div>
+          <button class="toggle ${state.settings.showLyrics !== false ? 'on' : ''}" id="toggle-lyrics"></button>
+        </div>
+      </div>
+
+      <div class="settings-card">
+        <h3>Last.fm Scrobbling
+          <button class="toggle ${state.settings.lastfm?.enabled ? 'on' : ''}" id="toggle-lastfm" style="margin-left:auto"></button>
+        </h3>
+        <div class="desc">
+          Scrobbles follow the standard rule: half the track or four minutes. Auralis uses your own
+          (free) Last.fm API account — create one at last.fm/api/account/create, then paste the key
+          and shared secret here and connect. Failed scrobbles queue offline and submit later.
+        </div>
+        <div id="lastfm-status" style="margin-bottom:12px;font-size:12.5px;color:${state.settings.lastfm?.sessionKey ? 'var(--lossless)' : 'var(--text-3)'}">
+          ${state.settings.lastfm?.sessionKey
+            ? `Connected as ${esc(state.settings.lastfm.username || 'Last.fm user')}`
+            : 'Not connected'}
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px">
+          <input type="text" class="lf-input" id="lf-key" placeholder="API key" spellcheck="false"
+                 value="${esc(state.settings.lastfm?.apiKey || '')}" />
+          <input type="text" class="lf-input" id="lf-secret" placeholder="Shared secret" spellcheck="false"
+                 value="${esc(state.settings.lastfm?.apiSecret || '')}" />
+        </div>
+        <div style="display:flex;gap:10px">
+          <button class="btn primary" id="lf-connect">${state.settings.lastfm?.sessionKey ? 'Reconnect' : 'Connect to Last.fm'}</button>
+          ${state.settings.lastfm?.sessionKey ? '<button class="btn danger" id="lf-disconnect">Disconnect</button>' : ''}
+        </div>
+      </div>
+
+      <div class="settings-card">
         <h3>Parametric Equalizer
           <button class="toggle ${engine.eqEnabled ? 'on' : ''}" id="toggle-eq" style="margin-left:auto"></button>
         </h3>
@@ -750,15 +795,48 @@ async function renderSettings() {
       </div>
 
       <div class="settings-card">
-        <h3>About</h3>
-        <div class="desc">
-          Auralis 1.0 — a lossless-first library and player for people who hear the difference.<br><br>
-          Decoding is handled by the Chromium media engine: FLAC, WAV, AIFF, ALAC-in-MP4 is not supported,
-          MP3, AAC, OGG/Opus play natively. DSD (.dsf/.dff), APE and WavPack files are indexed and
-          catalogued with full quality metadata; native decode for these formats is on the roadmap.
+        <h3>About &amp; Updates</h3>
+        <div class="desc" id="about-version">
+          Auralis — a lossless-first library and player for people who hear the difference.
+        </div>
+        <div class="setting-row">
+          <div><div class="lbl">Automatic updates</div>
+            <div class="hint">Checks GitHub Releases on startup, downloads in the background, and offers a one-click restart. Declined updates install on next quit.</div></div>
+          <button class="toggle ${state.settings.autoUpdate !== false ? 'on' : ''}" id="toggle-autoupdate"></button>
+        </div>
+        <div style="display:flex;gap:10px;align-items:center;margin-top:12px">
+          <button class="btn" id="update-check">Check for updates</button>
+          <span id="update-status" style="font-size:12px;color:var(--text-3)"></span>
+        </div>
+        <div class="desc" style="margin-top:16px;margin-bottom:0">
+          Decoding is handled by the Chromium media engine: FLAC, WAV, AIFF, MP3, AAC and OGG/Opus
+          play natively. DSD (.dsf/.dff), APE, WavPack and ALAC files are indexed and catalogued
+          with full quality metadata; native decode for these formats is on the roadmap.
         </div>
       </div>
     </div>`;
+
+  window.auralis.updates.version().then((v) => {
+    const el = $('#about-version');
+    if (el) el.innerHTML = `Auralis <b>${esc(v)}</b> — a lossless-first library and player for people who hear the difference.`;
+  });
+
+  $('#toggle-autoupdate').addEventListener('click', (e) => {
+    const on = state.settings.autoUpdate === false;
+    state.settings.autoUpdate = on;
+    e.target.classList.toggle('on', on);
+    saveSettings();
+  });
+
+  $('#update-check').addEventListener('click', async () => {
+    const status = $('#update-status');
+    status.textContent = 'Checking…';
+    const res = await window.auralis.updates.check();
+    if (!res.supported) status.textContent = 'Updates apply to the installed app (not dev mode).';
+    else if (res.error) status.textContent = 'Check failed: ' + res.error;
+    else if (res.available) status.textContent = `Version ${res.version} found — downloading in the background…`;
+    else status.textContent = 'You’re up to date.';
+  });
 
   $('#settings-add-folder').addEventListener('click', addFolders);
   $('#settings-rescan').addEventListener('click', rescan);
@@ -777,6 +855,64 @@ async function renderSettings() {
     } catch {
       toast('Could not switch output device', true);
     }
+  });
+
+  $('#toggle-lyrics').addEventListener('click', (e) => {
+    const on = state.settings.showLyrics === false;
+    state.settings.showLyrics = on;
+    e.target.classList.toggle('on', on);
+    saveSettings();
+    if (engine.currentTrack && !$('#now-playing').classList.contains('hidden')) {
+      refreshLyrics(on ? engine.currentTrack : null);
+    }
+  });
+
+  $('#toggle-lastfm').addEventListener('click', (e) => {
+    state.settings.lastfm = state.settings.lastfm || {};
+    state.settings.lastfm.enabled = !state.settings.lastfm.enabled;
+    e.target.classList.toggle('on', state.settings.lastfm.enabled);
+    saveSettings();
+  });
+
+  let lfAwaitingAuth = false;
+  $('#lf-connect').addEventListener('click', async () => {
+    const apiKey = $('#lf-key').value.trim();
+    const apiSecret = $('#lf-secret').value.trim();
+    if (!apiKey || !apiSecret) return toast('Enter your Last.fm API key and shared secret first', true);
+    state.settings.lastfm = { ...(state.settings.lastfm || {}), apiKey, apiSecret };
+    saveSettings();
+    try {
+      if (!lfAwaitingAuth) {
+        await window.auralis.lastfm.startAuth({ apiKey, apiSecret });
+        lfAwaitingAuth = true;
+        $('#lf-connect').textContent = 'I’ve authorized — finish connecting';
+        $('#lastfm-status').textContent = 'Authorize Auralis in the browser window, then click the button again.';
+        toast('Approve Auralis in your browser, then finish connecting');
+      } else {
+        const session = await window.auralis.lastfm.completeAuth({ apiKey, apiSecret });
+        lfAwaitingAuth = false;
+        state.settings.lastfm = {
+          ...state.settings.lastfm,
+          sessionKey: session.sessionKey, username: session.username, enabled: true,
+        };
+        saveSettings();
+        toast(`Connected to Last.fm as ${session.username}`);
+        render();
+      }
+    } catch (err) {
+      lfAwaitingAuth = false;
+      $('#lf-connect').textContent = 'Connect to Last.fm';
+      toast('Last.fm: ' + err.message, true);
+    }
+  });
+
+  $('#lf-disconnect')?.addEventListener('click', () => {
+    state.settings.lastfm = {
+      ...state.settings.lastfm, sessionKey: null, username: null, enabled: false,
+    };
+    saveSettings();
+    render();
+    toast('Disconnected from Last.fm');
   });
 
   $('#toggle-artistinfo').addEventListener('click', (e) => {
@@ -975,7 +1111,11 @@ engine.onError = (track, msg) => {
 
 function onTrackStarted(track) {
   playCountedFor = null;
+  trackStartedAt = Math.floor(Date.now() / 1000);
   updatePlayButton(true);
+  updateMiniUi(track);
+  if (!$('#now-playing').classList.contains('hidden')) refreshLyrics(track);
+  sendNowPlaying(track);
   $('#pb-title').textContent = track.title;
   $('#pb-artist').textContent = `${track.artist} — ${track.album}`;
   $('#pb-art').style.backgroundImage = track.artUrl ? `url("${track.artUrl}")` : 'none';
@@ -1024,6 +1164,8 @@ function onTrackStarted(track) {
 function updatePlayButton(playing) {
   $('#icon-play').classList.toggle('hidden', playing);
   $('#icon-pause').classList.toggle('hidden', !playing);
+  $('#mini-icon-play').classList.toggle('hidden', playing);
+  $('#mini-icon-pause').classList.toggle('hidden', !playing);
   document.body.classList.toggle('paused', !playing);
 }
 
@@ -1095,6 +1237,7 @@ let seeking = false;
 // ── Play counting (a play = half the track, or 4 minutes, whichever first) ──
 let playCountedFor = null;
 let statsSaveTimer = null;
+let trackStartedAt = 0;
 
 function countPlayIfEligible(time, duration) {
   const track = engine.currentTrack;
@@ -1105,10 +1248,44 @@ function countPlayIfEligible(time, duration) {
   state.stats.lastPlayed[track.id] = Date.now();
   clearTimeout(statsSaveTimer);
   statsSaveTimer = setTimeout(() => window.auralis.stats.set(state.stats), 800);
+  sendScrobble(track);
+}
+
+// ── Last.fm scrobbling ──
+
+function lastfmCreds() {
+  const lf = state.settings.lastfm || {};
+  return lf.enabled && lf.apiKey && lf.apiSecret && lf.sessionKey ? lf : null;
+}
+
+async function sendNowPlaying(track) {
+  const creds = lastfmCreds();
+  if (!creds) return;
+  window.auralis.lastfm.nowPlaying(creds, {
+    artist: track.artist, title: track.title, album: track.album, duration: track.duration,
+  }).catch(() => {});
+}
+
+async function sendScrobble(track) {
+  const creds = lastfmCreds();
+  // Last.fm ignores tracks shorter than 30 seconds
+  if (!creds || (track.duration && track.duration < 30)) return;
+  try {
+    const res = await window.auralis.lastfm.scrobble(creds, {
+      artist: track.artist, title: track.title, album: track.album,
+      duration: track.duration, timestamp: trackStartedAt,
+    });
+    if (res?.error && res.queued === 1) {
+      // first failure — surface once, later failures queue silently
+      toast('Last.fm unreachable — scrobble queued', true);
+    }
+  } catch { /* queued in main */ }
 }
 
 engine.onTimeUpdate = (time, duration) => {
   countPlayIfEligible(time, duration);
+  syncLyrics(time);
+  updateMiniProgress(time, duration);
   if (seeking) return;
   const pct = duration ? (time / duration) * 100 : 0;
   $('#seek-fill').style.width = pct + '%';
@@ -1127,7 +1304,7 @@ function seekFromEvent(e) {
 seekBar.addEventListener('pointerdown', (e) => {
   if (!engine.duration) return;
   seeking = true;
-  seekBar.setPointerCapture(e.pointerId);
+  try { seekBar.setPointerCapture(e.pointerId); } catch { /* stale pointer id */ }
   const update = (ev) => {
     const frac = seekFromEvent(ev);
     $('#seek-fill').style.width = frac * 100 + '%';
@@ -1187,14 +1364,112 @@ function renderQueue() {
     }));
 }
 
+// ── Lyrics ──
+
+const lyricsState = { trackId: null, lines: [], synced: false, activeIdx: -1 };
+
+function parseLrc(text) {
+  const lines = [];
+  for (const raw of text.split(/\r?\n/)) {
+    const stamps = [...raw.matchAll(/\[(\d{1,2}):(\d{2})(?:[.:](\d{1,3}))?\]/g)];
+    const content = raw.replace(/\[[^\]]*\]/g, '').trim();
+    if (!stamps.length) continue;
+    for (const m of stamps) {
+      const cs = (m[3] || '0').padEnd(3, '0').slice(0, 3);
+      lines.push({ time: Number(m[1]) * 60 + Number(m[2]) + Number(cs) / 1000, text: content });
+    }
+  }
+  return lines.filter((l) => l.text).sort((a, b) => a.time - b.time);
+}
+
+async function refreshLyrics(track) {
+  const np = $('#now-playing');
+  const scroll = $('#np-lyrics-scroll');
+  const sourceEl = $('#np-lyrics-source');
+  lyricsState.trackId = track?.id ?? null;
+  lyricsState.lines = [];
+  lyricsState.activeIdx = -1;
+
+  if (!track || state.settings.showLyrics === false) {
+    np.classList.remove('with-lyrics');
+    scroll.innerHTML = '';
+    sourceEl.textContent = '';
+    return;
+  }
+
+  // Clear stale lyrics right away; keep the panel open during the lookup so
+  // the layout doesn't bounce when consecutive tracks both have lyrics.
+  scroll.innerHTML = '';
+  sourceEl.textContent = 'Looking for lyrics…';
+
+  let lyr = null;
+  try {
+    lyr = await window.auralis.lyrics.get({
+      id: track.id, path: track.path, artist: track.artist,
+      title: track.title, album: track.album, duration: track.duration,
+    });
+  } catch { /* offline */ }
+  // Track may have changed while fetching
+  if (lyricsState.trackId !== track.id) return;
+
+  if (!lyr || !lyr.text?.trim()) {
+    np.classList.remove('with-lyrics');
+    scroll.innerHTML = '';
+    sourceEl.textContent = '';
+    return;
+  }
+
+  lyricsState.synced = !!lyr.synced;
+  if (lyr.synced) {
+    lyricsState.lines = parseLrc(lyr.text);
+  }
+  if (lyricsState.synced && lyricsState.lines.length) {
+    scroll.innerHTML = lyricsState.lines.map((l, i) =>
+      `<div class="lyric-line synced" data-i="${i}">${esc(l.text)}</div>`).join('');
+    scroll.querySelectorAll('.lyric-line').forEach((el) =>
+      el.addEventListener('click', () => {
+        engine.seek(lyricsState.lines[Number(el.dataset.i)].time);
+      }));
+  } else {
+    lyricsState.synced = false;
+    scroll.innerHTML = lyr.text.split(/\r?\n/).map((l) =>
+      `<div class="lyric-line plain">${esc(l) || '&nbsp;'}</div>`).join('');
+  }
+  scroll.scrollTop = 0;
+  sourceEl.textContent = { file: 'Lyrics · local file', embedded: 'Lyrics · embedded tag', lrclib: 'Lyrics · LRCLIB' }[lyr.source] || 'Lyrics';
+  np.classList.add('with-lyrics');
+}
+
+function syncLyrics(time) {
+  if (!lyricsState.synced || !lyricsState.lines.length) return;
+  if ($('#now-playing').classList.contains('hidden')) return;
+  let idx = lyricsState.lines.findIndex((l) => l.time > time) - 1;
+  if (idx === -2) idx = lyricsState.lines.length - 1; // past the last stamp
+  if (idx === lyricsState.activeIdx || idx < 0) return;
+  lyricsState.activeIdx = idx;
+  const scroll = $('#np-lyrics-scroll');
+  scroll.querySelector('.lyric-line.active')?.classList.remove('active');
+  const el = scroll.querySelector(`.lyric-line[data-i="${idx}"]`);
+  if (el) {
+    el.classList.add('active');
+    el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }
+}
+
 // ── Now Playing overlay ──
 
 function toggleNowPlaying(show) {
   const np = $('#now-playing');
   const shouldShow = show ?? np.classList.contains('hidden');
   np.classList.toggle('hidden', !shouldShow);
-  if (shouldShow) spectrum.start();
-  else spectrum.stop();
+  if (shouldShow) {
+    spectrum.start();
+    if (engine.currentTrack && lyricsState.trackId !== engine.currentTrack.id) {
+      refreshLyrics(engine.currentTrack);
+    }
+  } else {
+    spectrum.stop();
+  }
 }
 $('#pb-art').addEventListener('click', () => engine.currentTrack && toggleNowPlaying(true));
 $('#pb-favorite').addEventListener('click', () => engine.currentTrack && toggleNowPlaying(true));
@@ -1286,6 +1561,15 @@ function choosePlaylist(track) {
     }));
 }
 
+// ── Auto-update ──
+
+window.auralis.updates.onReady((info) => {
+  toast(`Auralis ${info.version} is ready to install`, false, {
+    label: 'Restart now',
+    fn: () => window.auralis.updates.install(),
+  });
+});
+
 // ── Search ──
 
 let searchTimer = null;
@@ -1317,6 +1601,48 @@ document.addEventListener('keydown', (e) => {
     case 'ArrowLeft': if (e.ctrlKey) $('#btn-prev').click(); else engine.seek(engine.currentTime - 5); break;
     case 'Escape': toggleNowPlaying(false); $('#queue-panel').classList.add('hidden'); break;
   }
+});
+
+// ── Mini player ──
+
+function setMini(on) {
+  document.body.classList.toggle('mini', on);
+  $('#mini-player').classList.toggle('hidden', !on);
+  if (on) {
+    toggleNowPlaying(false);
+    $('#queue-panel').classList.add('hidden');
+    updateMiniUi(engine.currentTrack);
+  }
+  window.auralis.win.mini(on);
+}
+
+function updateMiniUi(track) {
+  if (!track) return;
+  $('#mini-title').textContent = track.title;
+  $('#mini-artist').textContent = `${track.artist} — ${track.album}`;
+  $('#mini-art').style.backgroundImage = track.artUrl ? `url("${track.artUrl}")` : 'none';
+  $('#mini-dur').textContent = fmtTime(track.duration);
+}
+
+function updateMiniProgress(time, duration) {
+  if (!document.body.classList.contains('mini')) return;
+  const d = duration || engine.currentTrack?.duration || 0;
+  $('#mini-seek-fill').style.width = (d ? Math.min(100, (time / d) * 100) : 0) + '%';
+  $('#mini-time').textContent = fmtTime(time);
+  $('#mini-dur').textContent = fmtTime(d);
+}
+
+$('#btn-mini').addEventListener('click', () => setMini(true));
+$('#mini-restore').addEventListener('click', () => setMini(false));
+$('#mini-close').addEventListener('click', () => window.auralis.win.close());
+$('#mini-play').addEventListener('click', () => $('#btn-play').click());
+$('#mini-prev').addEventListener('click', () => $('#btn-prev').click());
+$('#mini-next').addEventListener('click', () => $('#btn-next').click());
+$('#mini-seek').addEventListener('pointerdown', (e) => {
+  if (!engine.duration) return;
+  const rect = $('#mini-seek').getBoundingClientRect();
+  const frac = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+  engine.seek(frac * engine.duration);
 });
 
 // ── Window controls ──
