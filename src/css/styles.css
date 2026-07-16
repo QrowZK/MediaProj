@@ -803,12 +803,14 @@ select.styled:focus { border-color: var(--accent-2); }
   z-index: 2;
   display: flex;
   align-items: center;
+  justify-content: center;
   gap: 60px;
-  padding: 0 8vw;
+  padding: 0 6vw;
   width: 100%;
   max-width: 1200px;
   transition: gap 0.45s cubic-bezier(0.33, 1, 0.68, 1), padding 0.45s cubic-bezier(0.33, 1, 0.68, 1);
 }
+.np-meta { max-width: 520px; }
 
 /* When lyrics are visible, everything slides left to make room */
 #now-playing.with-lyrics .np-content {

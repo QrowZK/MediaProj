@@ -1,13 +1,12 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, dialog, protocol, net, shell, Menu } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, protocol, shell, Menu } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const fsp = fs.promises;
 const http = require('http');
 const https = require('https');
 const crypto = require('crypto');
-const { pathToFileURL } = require('url');
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -56,20 +55,64 @@ protocol.registerSchemesAsPrivileged([
   },
 ]);
 
+const MIME_BY_EXT = {
+  '.flac': 'audio/flac', '.wav': 'audio/wav', '.aiff': 'audio/aiff', '.aif': 'audio/aiff',
+  '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4', '.alac': 'audio/mp4', '.aac': 'audio/aac',
+  '.ogg': 'audio/ogg', '.opus': 'audio/ogg', '.wma': 'audio/x-ms-wma',
+  '.ape': 'audio/x-ape', '.wv': 'audio/x-wavpack', '.dsf': 'audio/x-dsf', '.dff': 'audio/x-dff',
+  '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
+};
+
 function registerAuralisProtocol() {
-  protocol.handle('auralis', (request) => {
+  const { Readable } = require('stream');
+  protocol.handle('auralis', async (request) => {
     try {
       const url = new URL(request.url);
       // auralis://media/<base64url-encoded absolute path>
       const encoded = url.pathname.replace(/^\//, '');
       const filePath = Buffer.from(encoded, 'base64url').toString('utf8');
-      if (!AUDIO_EXTENSIONS.has(path.extname(filePath).toLowerCase()) &&
-          !filePath.startsWith(ART_CACHE_DIR())) {
+      const ext = path.extname(filePath).toLowerCase();
+      if (!AUDIO_EXTENSIONS.has(ext) && !filePath.startsWith(ART_CACHE_DIR())) {
         return new Response('Forbidden', { status: 403 });
       }
-      // net.fetch on a file:// URL handles Range requests + streaming.
-      return net.fetch(pathToFileURL(filePath).toString(), {
-        headers: request.headers,
+
+      const stat = await fsp.stat(filePath);
+      const mime = MIME_BY_EXT[ext] || 'application/octet-stream';
+      const baseHeaders = {
+        'Content-Type': mime,
+        'Accept-Ranges': 'bytes',
+        'Cache-Control': 'no-store',
+      };
+
+      // Serve Range requests ourselves (206) so the media element can seek.
+      const range = request.headers.get('range');
+      const match = range && /bytes=(\d*)-(\d*)/.exec(range);
+      if (match && (match[1] || match[2])) {
+        const start = match[1] ? parseInt(match[1], 10) : Math.max(0, stat.size - parseInt(match[2], 10));
+        const end = match[1] && match[2]
+          ? Math.min(parseInt(match[2], 10), stat.size - 1)
+          : stat.size - 1;
+        if (start >= stat.size || start > end) {
+          return new Response('Range Not Satisfiable', {
+            status: 416,
+            headers: { 'Content-Range': `bytes */${stat.size}` },
+          });
+        }
+        const stream = fs.createReadStream(filePath, { start, end });
+        return new Response(Readable.toWeb(stream), {
+          status: 206,
+          headers: {
+            ...baseHeaders,
+            'Content-Range': `bytes ${start}-${end}/${stat.size}`,
+            'Content-Length': String(end - start + 1),
+          },
+        });
+      }
+
+      const stream = fs.createReadStream(filePath);
+      return new Response(Readable.toWeb(stream), {
+        status: 200,
+        headers: { ...baseHeaders, 'Content-Length': String(stat.size) },
       });
     } catch (err) {
       return new Response('Bad request: ' + err.message, { status: 400 });

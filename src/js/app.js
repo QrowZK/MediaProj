@@ -1261,7 +1261,7 @@ function seekFromEvent(e) {
 seekBar.addEventListener('pointerdown', (e) => {
   if (!engine.duration) return;
   seeking = true;
-  seekBar.setPointerCapture(e.pointerId);
+  try { seekBar.setPointerCapture(e.pointerId); } catch { /* stale pointer id */ }
   const update = (ev) => {
     const frac = seekFromEvent(ev);
     $('#seek-fill').style.width = frac * 100 + '%';
