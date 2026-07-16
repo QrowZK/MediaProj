@@ -655,6 +655,54 @@ function registerIpc() {
 }
 
 // ---------------------------------------------------------------------------
+// Auto-update (GitHub Releases via electron-updater)
+// ---------------------------------------------------------------------------
+
+let updater = null;
+
+function setupAutoUpdater() {
+  // In dev there is no app-update.yml and nothing to update against.
+  if (app.isPackaged) {
+    try {
+      ({ autoUpdater: updater } = require('electron-updater'));
+      updater.autoDownload = true;
+      updater.autoInstallOnAppQuit = true; // "Later" still updates on next quit
+      updater.on('update-downloaded', (info) => {
+        mainWindow?.webContents.send('update:ready', { version: info.version });
+      });
+      updater.on('error', () => { /* offline or rate-limited — try again next launch */ });
+    } catch {
+      updater = null;
+    }
+  }
+
+  ipcMain.handle('update:check', async () => {
+    if (!updater) return { supported: false };
+    try {
+      const res = await updater.checkForUpdates();
+      const available = !!res?.updateInfo &&
+        res.updateInfo.version !== app.getVersion();
+      return { supported: true, available, version: res?.updateInfo?.version || null };
+    } catch (err) {
+      return { supported: true, available: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle('update:install', () => {
+    if (updater) setImmediate(() => updater.quitAndInstall());
+  });
+
+  ipcMain.handle('app:version', () => app.getVersion());
+
+  // Silent startup check, unless the user turned auto-updates off.
+  if (updater) {
+    readJson(SETTINGS_FILE(), {}).then((s) => {
+      if (s.autoUpdate !== false) updater.checkForUpdates().catch(() => {});
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Mini player mode
 // ---------------------------------------------------------------------------
 
@@ -738,6 +786,7 @@ app.whenReady().then(async () => {
   if (process.env.AURALIS_SCAN_DIR) {
     await scanFolders([process.env.AURALIS_SCAN_DIR]);
   }
+  setupAutoUpdater();
   createWindow();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();

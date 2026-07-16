@@ -33,6 +33,16 @@ contextBridge.exposeInMainWorld('auralis', {
   lyrics: {
     get: (track) => ipcRenderer.invoke('lyrics:get', track),
   },
+  updates: {
+    check: () => ipcRenderer.invoke('update:check'),
+    install: () => ipcRenderer.invoke('update:install'),
+    version: () => ipcRenderer.invoke('app:version'),
+    onReady: (cb) => {
+      const listener = (_e, info) => cb(info);
+      ipcRenderer.on('update:ready', listener);
+      return () => ipcRenderer.removeListener('update:ready', listener);
+    },
+  },
   lastfm: {
     startAuth: (creds) => ipcRenderer.invoke('lastfm:start-auth', creds),
     completeAuth: (creds) => ipcRenderer.invoke('lastfm:complete-auth', creds),

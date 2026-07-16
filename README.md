@@ -58,6 +58,20 @@ Grab `Auralis-Setup-<version>.exe` from the releases page (or build it yourself,
 run it, and pick an install directory. The installer creates Start Menu and desktop
 shortcuts. No telemetry, no accounts, no nonsense.
 
+### Auto-updates
+
+The installed app checks GitHub Releases on startup (toggle under Settings →
+About & Updates), downloads new versions in the background using differential
+blockmap updates, and offers a one-click restart — declined updates install on
+the next quit. Publishing an update is just pushing a tag:
+
+```bash
+git tag v1.3.1 && git push origin v1.3.1
+```
+
+The CI workflow builds the installer and publishes the release (including the
+`latest.yml` update manifest) automatically.
+
 ## Build from source
 
 ```bash

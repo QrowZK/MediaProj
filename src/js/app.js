@@ -83,16 +83,26 @@ function shortFmt(t) {
   return codec || '—';
 }
 
-function toast(msg, isError = false) {
+function toast(msg, isError = false, action = null) {
   const el = document.createElement('div');
   el.className = 'toast' + (isError ? ' error' : '');
   el.textContent = msg;
+  if (action) {
+    const btn = document.createElement('button');
+    btn.className = 'toast-action';
+    btn.textContent = action.label;
+    btn.addEventListener('click', () => { action.fn(); el.remove(); });
+    el.appendChild(btn);
+  }
   $('#toasts').appendChild(el);
-  setTimeout(() => {
-    el.style.transition = 'opacity 0.3s';
-    el.style.opacity = '0';
-    setTimeout(() => el.remove(), 320);
-  }, 3400);
+  if (!action) {
+    setTimeout(() => {
+      el.style.transition = 'opacity 0.3s';
+      el.style.opacity = '0';
+      setTimeout(() => el.remove(), 320);
+    }, 3400);
+  }
+  return el;
 }
 
 // ── Library derived data ─────────────────────────────────────────────────
@@ -785,15 +795,48 @@ async function renderSettings() {
       </div>
 
       <div class="settings-card">
-        <h3>About</h3>
-        <div class="desc">
-          Auralis 1.0 — a lossless-first library and player for people who hear the difference.<br><br>
-          Decoding is handled by the Chromium media engine: FLAC, WAV, AIFF, ALAC-in-MP4 is not supported,
-          MP3, AAC, OGG/Opus play natively. DSD (.dsf/.dff), APE and WavPack files are indexed and
-          catalogued with full quality metadata; native decode for these formats is on the roadmap.
+        <h3>About &amp; Updates</h3>
+        <div class="desc" id="about-version">
+          Auralis — a lossless-first library and player for people who hear the difference.
+        </div>
+        <div class="setting-row">
+          <div><div class="lbl">Automatic updates</div>
+            <div class="hint">Checks GitHub Releases on startup, downloads in the background, and offers a one-click restart. Declined updates install on next quit.</div></div>
+          <button class="toggle ${state.settings.autoUpdate !== false ? 'on' : ''}" id="toggle-autoupdate"></button>
+        </div>
+        <div style="display:flex;gap:10px;align-items:center;margin-top:12px">
+          <button class="btn" id="update-check">Check for updates</button>
+          <span id="update-status" style="font-size:12px;color:var(--text-3)"></span>
+        </div>
+        <div class="desc" style="margin-top:16px;margin-bottom:0">
+          Decoding is handled by the Chromium media engine: FLAC, WAV, AIFF, MP3, AAC and OGG/Opus
+          play natively. DSD (.dsf/.dff), APE, WavPack and ALAC files are indexed and catalogued
+          with full quality metadata; native decode for these formats is on the roadmap.
         </div>
       </div>
     </div>`;
+
+  window.auralis.updates.version().then((v) => {
+    const el = $('#about-version');
+    if (el) el.innerHTML = `Auralis <b>${esc(v)}</b> — a lossless-first library and player for people who hear the difference.`;
+  });
+
+  $('#toggle-autoupdate').addEventListener('click', (e) => {
+    const on = state.settings.autoUpdate === false;
+    state.settings.autoUpdate = on;
+    e.target.classList.toggle('on', on);
+    saveSettings();
+  });
+
+  $('#update-check').addEventListener('click', async () => {
+    const status = $('#update-status');
+    status.textContent = 'Checking…';
+    const res = await window.auralis.updates.check();
+    if (!res.supported) status.textContent = 'Updates apply to the installed app (not dev mode).';
+    else if (res.error) status.textContent = 'Check failed: ' + res.error;
+    else if (res.available) status.textContent = `Version ${res.version} found — downloading in the background…`;
+    else status.textContent = 'You’re up to date.';
+  });
 
   $('#settings-add-folder').addEventListener('click', addFolders);
   $('#settings-rescan').addEventListener('click', rescan);
@@ -1517,6 +1560,15 @@ function choosePlaylist(track) {
       close();
     }));
 }
+
+// ── Auto-update ──
+
+window.auralis.updates.onReady((info) => {
+  toast(`Auralis ${info.version} is ready to install`, false, {
+    label: 'Restart now',
+    fn: () => window.auralis.updates.install(),
+  });
+});
 
 // ── Search ──
 
