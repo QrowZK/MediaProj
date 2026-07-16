@@ -30,6 +30,15 @@ contextBridge.exposeInMainWorld('auralis', {
     info: (name) => ipcRenderer.invoke('artist:info', name),
     cachedMap: () => ipcRenderer.invoke('artist:cached-map'),
   },
+  lyrics: {
+    get: (track) => ipcRenderer.invoke('lyrics:get', track),
+  },
+  lastfm: {
+    startAuth: (creds) => ipcRenderer.invoke('lastfm:start-auth', creds),
+    completeAuth: (creds) => ipcRenderer.invoke('lastfm:complete-auth', creds),
+    nowPlaying: (creds, track) => ipcRenderer.invoke('lastfm:now-playing', creds, track),
+    scrobble: (creds, scrobble) => ipcRenderer.invoke('lastfm:scrobble', creds, scrobble),
+  },
   shell: {
     showItem: (p) => ipcRenderer.invoke('shell:show-item', p),
   },
@@ -37,6 +46,7 @@ contextBridge.exposeInMainWorld('auralis', {
     minimize: () => ipcRenderer.invoke('window:minimize'),
     maximize: () => ipcRenderer.invoke('window:maximize'),
     close: () => ipcRenderer.invoke('window:close'),
+    mini: (on) => ipcRenderer.invoke('window:mini', on),
     isMaximized: () => ipcRenderer.invoke('window:is-maximized'),
     onMaximized: (cb) => {
       const listener = (_e, v) => cb(v);

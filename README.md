@@ -34,6 +34,15 @@ brass-accented interface built for long listening sessions.
 - **ReplayGain** — track or album mode, read from your files' tags.
 - **Output device selection** — route playback straight to your DAC.
 - **Live spectrum analyzer** (log-frequency, peak-hold) and **stereo VU meters**.
+- **Lyrics on the Now Playing screen** — from `.lrc`/`.txt` side files, embedded tags, or
+  LRCLIB lookup (cached). Time-synced lyrics follow the music with the active line
+  highlighted; click a line to seek. The artwork slides over gracefully when lyrics are
+  present and recenters when they're not. Toggle in Settings.
+- **Last.fm scrobbling** — standard half-track/four-minute rule, now-playing updates,
+  and an offline queue that retries failed scrobbles. Bring your own free API key
+  (last.fm/api/account/create), connect once in the browser, done.
+- **Mini player** — a compact always-on-top window (art, transport, seek) in the spirit
+  of MusicBee's mini mode. Toggle from the player bar; pop back to full size anytime.
 - **OS media key support** via MediaSession.
 
 ### Honest notes for the discerning ear

@@ -6,6 +6,7 @@ const fs = require('fs');
 const fsp = fs.promises;
 const http = require('http');
 const https = require('https');
+const crypto = require('crypto');
 const { pathToFileURL } = require('url');
 
 // ---------------------------------------------------------------------------
@@ -256,21 +257,45 @@ async function loadArtistIndex() {
 
 // Plain Node HTTPS client with CONNECT tunneling when HTTPS_PROXY is set —
 // works on direct connections and behind corporate proxies alike.
-function httpGet(url, redirects = 3) {
+function httpRequest(url, { method = 'GET', body = null, headers = {} } = {}, redirects = 3) {
   return new Promise((resolve, reject) => {
     const target = new URL(url);
     const proxyUrl = process.env.HTTPS_PROXY || process.env.https_proxy;
-    const headers = { 'User-Agent': 'Auralis/1.1 (desktop music player)', Accept: '*/*' };
+    const allHeaders = {
+      'User-Agent': 'Auralis/1.2 (desktop music player)',
+      Accept: '*/*',
+      ...headers,
+    };
+    if (body) allHeaders['Content-Length'] = Buffer.byteLength(body);
     const onResponse = (res) => {
       if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location && redirects > 0) {
         res.resume();
-        resolve(httpGet(new URL(res.headers.location, target).toString(), redirects - 1));
+        resolve(httpRequest(new URL(res.headers.location, target).toString(),
+          { method: 'GET', headers }, redirects - 1));
         return;
       }
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
       res.on('end', () => resolve({ status: res.statusCode, buffer: Buffer.concat(chunks) }));
       res.on('error', reject);
+    };
+    const sendRequest = (socket) => {
+      const options = {
+        host: target.hostname, servername: target.hostname,
+        path: target.pathname + target.search, method, headers: allHeaders,
+      };
+      if (socket) {
+        options.agent = false;
+        options.createConnection = () => socket;
+      }
+      const req = https.request(options, (r) => {
+        if (socket) r.on('end', () => socket.destroy());
+        onResponse(r);
+      });
+      req.on('error', reject);
+      req.setTimeout(15000, () => req.destroy(new Error('timeout')));
+      if (body) req.write(body);
+      req.end();
     };
     if (proxyUrl) {
       const proxy = new URL(proxyUrl);
@@ -284,23 +309,24 @@ function httpGet(url, redirects = 3) {
           socket.destroy();
           return reject(new Error('Proxy CONNECT ' + res.statusCode));
         }
-        const req = https.request({
-          host: target.hostname, servername: target.hostname,
-          path: target.pathname + target.search, headers,
-          agent: false, createConnection: () => socket,
-        }, (r) => { r.on('end', () => socket.destroy()); onResponse(r); });
-        req.on('error', reject);
-        req.end();
+        sendRequest(socket);
       });
       connectReq.on('error', reject);
       connectReq.setTimeout(15000, () => connectReq.destroy(new Error('proxy timeout')));
       connectReq.end();
     } else {
-      const req = https.get(url, { headers }, onResponse);
-      req.on('error', reject);
-      req.setTimeout(15000, () => req.destroy(new Error('timeout')));
+      sendRequest(null);
     }
   });
+}
+
+// GETs are idempotent — retry once on a transient stall or reset.
+async function httpGet(url) {
+  try {
+    return await httpRequest(url);
+  } catch {
+    return httpRequest(url);
+  }
 }
 
 async function fetchJson(url) {
@@ -390,6 +416,149 @@ async function getCachedArtistMap() {
 }
 
 // ---------------------------------------------------------------------------
+// Last.fm scrobbling (user supplies their own API key/secret; browser auth)
+// ---------------------------------------------------------------------------
+
+const LASTFM_API = 'https://ws.audioscrobbler.com/2.0/';
+const SCROBBLE_QUEUE_FILE = () => path.join(app.getPath('userData'), 'scrobble-queue.json');
+
+function lastfmSign(params, secret) {
+  const sig = Object.keys(params).sort()
+    .filter((k) => k !== 'format' && k !== 'callback')
+    .map((k) => k + params[k]).join('') + secret;
+  return crypto.createHash('md5').update(sig, 'utf8').digest('hex');
+}
+
+async function lastfmCall(method, params, creds, { signed = true, post = false } = {}) {
+  const all = { method, api_key: creds.apiKey, ...params };
+  if (signed) all.api_sig = lastfmSign(all, creds.apiSecret);
+  all.format = 'json';
+  const form = Object.entries(all)
+    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join('&');
+  const res = post
+    ? await httpRequest(LASTFM_API, {
+        method: 'POST', body: form,
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      })
+    : await httpGet(LASTFM_API + '?' + form);
+  const json = JSON.parse(res.buffer.toString('utf8'));
+  if (json.error) throw new Error(json.message || 'Last.fm error ' + json.error);
+  return json;
+}
+
+let pendingAuthToken = null;
+
+async function lastfmStartAuth(creds) {
+  const { token } = await lastfmCall('auth.getToken', {}, creds);
+  pendingAuthToken = token;
+  shell.openExternal(
+    `https://www.last.fm/api/auth/?api_key=${encodeURIComponent(creds.apiKey)}&token=${encodeURIComponent(token)}`);
+  return true;
+}
+
+async function lastfmCompleteAuth(creds) {
+  if (!pendingAuthToken) throw new Error('No authorization in progress');
+  const res = await lastfmCall('auth.getSession', { token: pendingAuthToken }, creds);
+  pendingAuthToken = null;
+  return { sessionKey: res.session.key, username: res.session.name };
+}
+
+async function lastfmNowPlaying(creds, track) {
+  const params = { artist: track.artist, track: track.title, sk: creds.sessionKey };
+  if (track.album) params.album = track.album;
+  if (track.duration) params.duration = String(Math.round(track.duration));
+  await lastfmCall('track.updateNowPlaying', params, creds, { post: true });
+}
+
+async function lastfmScrobble(creds, scrobbles) {
+  const params = { sk: creds.sessionKey };
+  scrobbles.forEach((s, i) => {
+    params[`artist[${i}]`] = s.artist;
+    params[`track[${i}]`] = s.title;
+    params[`timestamp[${i}]`] = String(s.timestamp);
+    if (s.album) params[`album[${i}]`] = s.album;
+    if (s.duration) params[`duration[${i}]`] = String(Math.round(s.duration));
+  });
+  await lastfmCall('track.scrobble', params, creds, { post: true });
+}
+
+// Queue scrobbles on disk so offline listens are submitted later.
+async function submitScrobble(creds, scrobble) {
+  const queue = await readJson(SCROBBLE_QUEUE_FILE(), []);
+  queue.push(scrobble);
+  // Last.fm accepts up to 50 per batch
+  try {
+    await lastfmScrobble(creds, queue.slice(0, 50));
+    const rest = queue.slice(50);
+    await writeJson(SCROBBLE_QUEUE_FILE(), rest);
+    return { submitted: Math.min(queue.length, 50), queued: rest.length };
+  } catch (err) {
+    await writeJson(SCROBBLE_QUEUE_FILE(), queue.slice(-500)); // cap the backlog
+    return { submitted: 0, queued: queue.length, error: err.message };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Lyrics: side files (.lrc/.txt) → embedded tags → LRCLIB lookup
+// ---------------------------------------------------------------------------
+
+const LYRICS_CACHE_FILE = () => path.join(app.getPath('userData'), 'lyrics-cache.json');
+let lyricsCache = null;
+
+async function loadLyricsCache() {
+  if (!lyricsCache) lyricsCache = await readJson(LYRICS_CACHE_FILE(), {});
+  return lyricsCache;
+}
+
+async function getLyrics(track) {
+  // 1. Side files next to the audio: same basename, .lrc preferred over .txt
+  const base = track.path.replace(/\.[^.]+$/, '');
+  for (const ext of ['.lrc', '.txt']) {
+    try {
+      const text = await fsp.readFile(base + ext, 'utf8');
+      if (text.trim()) return { text, synced: ext === '.lrc', source: 'file' };
+    } catch { /* not there */ }
+  }
+
+  // 2. Embedded lyrics tag
+  try {
+    const mm = await loadMusicMetadata();
+    const meta = await mm.parseFile(track.path, { skipCovers: true });
+    const lyr = meta?.common?.lyrics?.[0];
+    const text = typeof lyr === 'string' ? lyr : (lyr?.text || lyr?.syncText?.map((l) => l.text).join('\n'));
+    if (text && text.trim()) {
+      return { text, synced: /\[\d{1,2}:\d{2}/.test(text), source: 'embedded' };
+    }
+  } catch { /* unparseable */ }
+
+  // 3. LRCLIB (no API key, community-run)
+  const cache = await loadLyricsCache();
+  const key = `${track.artist}::${track.title}`.toLowerCase();
+  if (cache[key] !== undefined) {
+    return cache[key] ? { ...cache[key], source: 'lrclib' } : null;
+  }
+  try {
+    const url = 'https://lrclib.net/api/search?artist_name=' +
+      encodeURIComponent(track.artist) + '&track_name=' + encodeURIComponent(track.title);
+    const res = await httpGet(url);
+    if (res.status !== 200) throw new Error('HTTP ' + res.status);
+    const hits = JSON.parse(res.buffer.toString('utf8'));
+    // Prefer a duration match (±4s), then any synced hit, then first
+    const byDuration = hits.find((h) =>
+      track.duration && h.duration && Math.abs(h.duration - track.duration) <= 4);
+    const hit = byDuration || hits.find((h) => h.syncedLyrics) || hits[0];
+    const entry = hit && (hit.syncedLyrics || hit.plainLyrics)
+      ? { text: hit.syncedLyrics || hit.plainLyrics, synced: !!hit.syncedLyrics }
+      : null;
+    cache[key] = entry;
+    await writeJson(LYRICS_CACHE_FILE(), cache);
+    return entry ? { ...entry, source: 'lrclib' } : null;
+  } catch {
+    return null; // offline — don't cache, retry next time
+  }
+}
+
+// ---------------------------------------------------------------------------
 // IPC
 // ---------------------------------------------------------------------------
 
@@ -419,6 +588,18 @@ function registerIpc() {
   ipcMain.handle('artist:info', (_e, name) => getArtistInfo(String(name)));
   ipcMain.handle('artist:cached-map', () => getCachedArtistMap());
 
+  ipcMain.handle('lyrics:get', (_e, track) => getLyrics(track));
+
+  ipcMain.handle('lastfm:start-auth', (_e, creds) => lastfmStartAuth(creds));
+  ipcMain.handle('lastfm:complete-auth', (_e, creds) => lastfmCompleteAuth(creds));
+  ipcMain.handle('lastfm:now-playing', async (_e, creds, track) => {
+    try { await lastfmNowPlaying(creds, track); return { ok: true }; }
+    catch (err) { return { ok: false, error: err.message }; }
+  });
+  ipcMain.handle('lastfm:scrobble', (_e, creds, scrobble) => submitScrobble(creds, scrobble));
+
+  ipcMain.handle('window:mini', (_e, on) => setMiniMode(on));
+
   ipcMain.handle('shell:show-item', (_e, filePath) => shell.showItemInFolder(filePath));
 
   ipcMain.handle('window:minimize', () => mainWindow?.minimize());
@@ -428,6 +609,32 @@ function registerIpc() {
   });
   ipcMain.handle('window:close', () => mainWindow?.close());
   ipcMain.handle('window:is-maximized', () => mainWindow?.isMaximized() ?? false);
+}
+
+// ---------------------------------------------------------------------------
+// Mini player mode
+// ---------------------------------------------------------------------------
+
+const MINI_SIZE = [420, 148];
+let savedBounds = null;
+
+function setMiniMode(on) {
+  if (!mainWindow) return false;
+  if (on) {
+    savedBounds = mainWindow.getBounds();
+    if (mainWindow.isMaximized()) mainWindow.unmaximize();
+    mainWindow.setMinimumSize(MINI_SIZE[0], MINI_SIZE[1]);
+    mainWindow.setSize(MINI_SIZE[0], MINI_SIZE[1]);
+    mainWindow.setAlwaysOnTop(true, 'floating');
+    mainWindow.setResizable(false);
+  } else {
+    mainWindow.setAlwaysOnTop(false);
+    mainWindow.setResizable(true);
+    mainWindow.setMinimumSize(980, 640);
+    if (savedBounds) mainWindow.setBounds(savedBounds);
+    else mainWindow.setSize(1440, 900);
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------
