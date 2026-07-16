@@ -22,6 +22,14 @@ contextBridge.exposeInMainWorld('auralis', {
     get: () => ipcRenderer.invoke('playlists:get'),
     set: (d) => ipcRenderer.invoke('playlists:set', d),
   },
+  stats: {
+    get: () => ipcRenderer.invoke('stats:get'),
+    set: (d) => ipcRenderer.invoke('stats:set', d),
+  },
+  artist: {
+    info: (name) => ipcRenderer.invoke('artist:info', name),
+    cachedMap: () => ipcRenderer.invoke('artist:cached-map'),
+  },
   shell: {
     showItem: (p) => ipcRenderer.invoke('shell:show-item', p),
   },

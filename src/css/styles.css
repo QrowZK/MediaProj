@@ -494,6 +494,60 @@ table.tracks .t-fmt { width: 120px; }
 .pill-item:hover { border-color: var(--accent-2); color: var(--accent); background: var(--accent-soft); }
 .pill-item .cnt { color: var(--text-3); font-size: 11.5px; margin-left: 7px; font-family: var(--mono); }
 
+/* ── Artist detail hero ── */
+.artist-hero {
+  display: flex;
+  gap: 30px;
+  align-items: flex-start;
+  margin-bottom: 30px;
+}
+.artist-portrait {
+  width: 200px; height: 200px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  overflow: hidden;
+  display: grid;
+  place-items: center;
+  font-size: 64px;
+  font-weight: 700;
+  color: var(--accent);
+  background: linear-gradient(145deg, var(--bg-3), var(--bg-1));
+  border: 1px solid var(--line-strong);
+  box-shadow: var(--shadow-card);
+}
+.artist-portrait.has-photo { border-color: rgba(232, 180, 90, 0.35); }
+.artist-portrait img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.artist-hero-meta { min-width: 0; padding-top: 8px; }
+.artist-bio {
+  margin-top: 14px;
+  max-width: 640px;
+  font-size: 13.5px;
+  line-height: 1.65;
+  color: var(--text-2);
+}
+.artist-bio p { display: inline; }
+.bio-loading { color: var(--text-3); font-size: 12.5px; font-style: italic; }
+.bio-more {
+  color: var(--accent);
+  font-size: 12.5px;
+  font-weight: 600;
+  margin-left: 6px;
+}
+.bio-more:hover { text-decoration: underline; }
+.bio-source {
+  display: inline-block;
+  margin-left: 10px;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  padding: 1px 6px;
+  vertical-align: 1px;
+}
+
 .artist-row {
   display: flex;
   align-items: center;
