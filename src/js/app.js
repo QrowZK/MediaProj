@@ -3,6 +3,7 @@
 // ═══════════════════════════════════════════════════════════════════════
 
 import { AudioEngine, EQ_FREQUENCIES, EQ_PRESETS } from './player.js';
+import { NativeEngineProxy } from './native-player.js';
 import { SpectrumVisualizer, VuMeter } from './visualizer.js';
 
 const $ = (sel) => document.querySelector(sel);
@@ -27,10 +28,49 @@ const state = {
   sortDir: 1,
 };
 
-const engine = new AudioEngine();
+const webEngine = new AudioEngine();
+let nativeEngine = null;
+let engine = webEngine;
 const spectrum = new SpectrumVisualizer($('#np-spectrum'), engine);
 const vu = new VuMeter($('#vu-meter'), engine);
 vu.start();
+
+function attachEngineCallbacks(e) {
+  e.peekNext = enginePeekNext;
+  e.onTrackEnd = engineOnTrackEnd;
+  e.onTrackStarted = (track) => onTrackStarted(track);
+  e.onError = engineOnError;
+  e.onTimeUpdate = engineOnTimeUpdate;
+}
+
+async function switchEngine(useNative) {
+  const playingTrack = engine.currentTrack;
+  const pos = engine.currentTime;
+  engine.pause();
+  if (useNative) {
+    if (!nativeEngine) nativeEngine = new NativeEngineProxy();
+    engine = nativeEngine;
+  } else {
+    engine = webEngine;
+  }
+  attachEngineCallbacks(engine);
+  spectrum.engine = engine;
+  spectrum.buffer = new Uint8Array(engine.analyser.frequencyBinCount);
+  vu.engine = engine;
+  // carry DSP state over
+  engine.setVolume(webEngine.volume);
+  engine.applyEqGains([...webEngine.eqGains]);
+  engine.setEqEnabled(webEngine.eqEnabled);
+  engine.setReplayGainMode(webEngine.replayGainMode);
+  engine.setSpeakerCorrection?.(correctionConfig());
+  if (playingTrack) {
+    const ok = await engine.play(playingTrack);
+    if (ok) {
+      onTrackStarted(playingTrack);
+      if (pos > 1) engine.seek(pos);
+    }
+  }
+}
 
 // ── Utilities ────────────────────────────────────────────────────────────
 
@@ -795,6 +835,58 @@ async function renderSettings() {
       </div>
 
       <div class="settings-card">
+        <h3>Output Engine</h3>
+        <div class="desc">
+          <b>Standard</b> plays through the Chromium/Web Audio pipeline (32-bit float DSP).
+          <b>Native Direct Output</b> decodes with the bundled FFmpeg and streams straight to a
+          host audio API — <b>ASIO</b> (direct DAC communication, bypasses the Windows mixer),
+          <b>WASAPI</b>, or <b>DirectSound</b> — with a 64-bit float DSP chain, or a
+          <b>bit-perfect</b> path that bypasses all DSP and software volume entirely.
+        </div>
+        <div class="setting-row" style="padding-top:0">
+          <div><div class="lbl">Engine</div></div>
+          <select class="styled" style="width:280px" id="out-engine">
+            <option value="standard" ${!state.settings.nativeOutput?.enabled ? 'selected' : ''}>Standard (Web Audio)</option>
+            <option value="native" ${state.settings.nativeOutput?.enabled ? 'selected' : ''}>Native Direct Output</option>
+          </select>
+        </div>
+        <div id="native-rows" class="${state.settings.nativeOutput?.enabled ? '' : 'hidden'}">
+          <div class="setting-row">
+            <div><div class="lbl">Host API</div><div class="hint">ASIO appears when a device driver provides it.</div></div>
+            <select class="styled" style="width:280px" id="native-api"><option value="default">System default</option></select>
+          </div>
+          <div class="setting-row">
+            <div><div class="lbl">Device</div></div>
+            <select class="styled" style="width:280px" id="native-device"><option value="-1">Default output</option></select>
+          </div>
+          <div class="setting-row">
+            <div><div class="lbl">Bit-perfect mode</div>
+              <div class="hint">Source samples go to the driver untouched: no EQ, no ReplayGain, no correction, no software volume. Use your DAC's volume control.</div></div>
+            <button class="toggle ${state.settings.nativeOutput?.bitPerfect ? 'on' : ''}" id="toggle-bitperfect"></button>
+          </div>
+          <div class="setting-row">
+            <div><div class="lbl">Buffer size</div><div class="hint">Frames per buffer. Smaller = lower latency, larger = safer.</div></div>
+            <select class="styled" style="width:160px" id="native-buffer">
+              ${[128, 256, 512, 1024, 2048].map((b) => `<option value="${b}" ${(state.settings.nativeOutput?.bufferSize || 512) === b ? 'selected' : ''}>${b}</option>`).join('')}
+            </select>
+          </div>
+          <div class="hint" id="native-status" style="padding-top:8px"></div>
+        </div>
+      </div>
+
+      <div class="settings-card">
+        <h3>Speaker Correction
+          <button class="toggle ${state.settings.speakerCorrection?.enabled ? 'on' : ''}" id="toggle-correction" style="margin-left:auto"></button>
+        </h3>
+        <div class="desc">
+          JRiver-style room correction: per-channel level trim, distance delay, polarity, and a
+          parametric EQ bank per speaker. Applied in the active engine's DSP chain
+          (64-bit float on the native path). Disabled automatically in bit-perfect mode.
+        </div>
+        <div id="correction-editor"></div>
+      </div>
+
+      <div class="settings-card">
         <h3>About &amp; Updates</h3>
         <div class="desc" id="about-version">
           Auralis — a lossless-first library and player for people who hear the difference.
@@ -837,6 +929,106 @@ async function renderSettings() {
     else if (res.available) status.textContent = `Version ${res.version} found — downloading in the background…`;
     else status.textContent = 'You’re up to date.';
   });
+
+  // ── Output engine ──
+
+  const no = () => state.settings.nativeOutput || (state.settings.nativeOutput = {
+    enabled: false, api: 'default', deviceId: -1, bitPerfect: false, bufferSize: 512,
+  });
+
+  async function populateNativeSelectors() {
+    const available = await window.auralis.native.available();
+    const statusEl = $('#native-status');
+    if (!available) {
+      statusEl.textContent = 'Native backend not available on this install.';
+      return;
+    }
+    const apis = await window.auralis.native.apis();
+    const apiSel = $('#native-api');
+    apiSel.innerHTML = '<option value="default">System default</option>' +
+      apis.map((a) => `<option value="${a.id}" ${String(no().api) === String(a.id) ? 'selected' : ''}>${esc(a.label)}</option>`).join('');
+    await populateNativeDevices();
+    statusEl.textContent = apis.length
+      ? `Available APIs: ${apis.map((a) => a.label).join(' · ')}`
+      : 'No output devices found for any host API.';
+  }
+
+  async function populateNativeDevices() {
+    const apiId = no().api === 'default' ? undefined : Number(no().api);
+    const devices = await window.auralis.native.devices(apiId);
+    $('#native-device').innerHTML = '<option value="-1">Default output</option>' +
+      devices.map((d) => `<option value="${d.id}" ${no().deviceId === d.id ? 'selected' : ''}>${esc(d.name)}${d.isDefault ? ' (default)' : ''}</option>`).join('');
+  }
+
+  async function pushNativeOutputConfig() {
+    await window.auralis.native.config({
+      api: no().api, deviceId: no().deviceId,
+      bitPerfect: no().bitPerfect, bufferSize: no().bufferSize,
+    });
+  }
+
+  if (state.settings.nativeOutput?.enabled) populateNativeSelectors();
+
+  $('#out-engine').addEventListener('change', async (e) => {
+    const useNative = e.target.value === 'native';
+    if (useNative && !(await window.auralis.native.available())) {
+      toast('Native output backend is not available on this install', true);
+      e.target.value = 'standard';
+      return;
+    }
+    no().enabled = useNative;
+    saveSettings();
+    $('#native-rows').classList.toggle('hidden', !useNative);
+    if (useNative) {
+      await populateNativeSelectors();
+      await pushNativeOutputConfig();
+    }
+    await switchEngine(useNative);
+    toast(useNative ? 'Native direct output engaged' : 'Standard engine engaged');
+  });
+
+  $('#native-api').addEventListener('change', async (e) => {
+    no().api = e.target.value;
+    no().deviceId = -1;
+    saveSettings();
+    await populateNativeDevices();
+    await pushNativeOutputConfig();
+  });
+
+  $('#native-device').addEventListener('change', async (e) => {
+    no().deviceId = Number(e.target.value);
+    saveSettings();
+    await pushNativeOutputConfig();
+  });
+
+  $('#toggle-bitperfect').addEventListener('click', async (e) => {
+    no().bitPerfect = !no().bitPerfect;
+    e.target.classList.toggle('on', no().bitPerfect);
+    saveSettings();
+    await pushNativeOutputConfig();
+    toast(no().bitPerfect
+      ? 'Bit-perfect: DSP and software volume bypassed'
+      : 'Bit-perfect off — DSP chain active');
+  });
+
+  $('#native-buffer').addEventListener('change', async (e) => {
+    no().bufferSize = Number(e.target.value);
+    saveSettings();
+    await pushNativeOutputConfig();
+  });
+
+  // ── Speaker correction ──
+
+  $('#toggle-correction').addEventListener('click', (e) => {
+    const sc = correctionSettings();
+    sc.enabled = !sc.enabled;
+    e.target.classList.toggle('on', sc.enabled);
+    saveSettings();
+    applyCorrection();
+    renderCorrectionEditor();
+  });
+
+  renderCorrectionEditor();
 
   $('#settings-add-folder').addEventListener('click', addFolders);
   $('#settings-rescan').addEventListener('click', rescan);
@@ -987,6 +1179,108 @@ async function renderSettings() {
   });
 }
 
+// ── Speaker correction config ──
+
+function correctionSettings() {
+  if (!state.settings.speakerCorrection) {
+    state.settings.speakerCorrection = {
+      enabled: false,
+      channels: [
+        { gain: 0, delayMs: 0, invert: false, peq: [] },
+        { gain: 0, delayMs: 0, invert: false, peq: [] },
+      ],
+    };
+  }
+  return state.settings.speakerCorrection;
+}
+
+function correctionConfig() {
+  const sc = correctionSettings();
+  return { enabled: sc.enabled, channels: sc.channels };
+}
+
+let correctionApplyTimer = null;
+function applyCorrection() {
+  clearTimeout(correctionApplyTimer);
+  correctionApplyTimer = setTimeout(() => {
+    engine.setSpeakerCorrection?.(correctionConfig());
+    if (engine !== webEngine) webEngine.setSpeakerCorrection(correctionConfig());
+  }, 150);
+}
+
+function renderCorrectionEditor() {
+  const root = $('#correction-editor');
+  if (!root) return;
+  const sc = correctionSettings();
+  if (!sc.enabled) { root.innerHTML = ''; return; }
+  const names = ['Left', 'Right'];
+  root.innerHTML = `
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+      ${sc.channels.map((ch, i) => `
+        <div class="corr-ch" data-ch="${i}">
+          <div class="corr-title">${names[i]}
+            <button class="corr-invert ${ch.invert ? 'on' : ''}" data-ch="${i}" title="Polarity">Ø</button>
+          </div>
+          <label class="corr-row">Level <input type="number" class="lf-input corr-in" data-ch="${i}" data-k="gain" min="-24" max="24" step="0.5" value="${ch.gain || 0}" /> dB</label>
+          <label class="corr-row">Delay <input type="number" class="lf-input corr-in" data-ch="${i}" data-k="delayMs" min="0" max="100" step="0.01" value="${ch.delayMs || 0}" /> ms</label>
+          <div class="corr-peq">
+            ${(ch.peq || []).map((b, bi) => `
+              <div class="corr-band" data-ch="${i}" data-band="${bi}">
+                <input type="number" class="lf-input corr-band-in" data-k="freq" placeholder="Hz" min="10" max="24000" value="${b.freq || ''}" />
+                <input type="number" class="lf-input corr-band-in" data-k="gain" placeholder="dB" min="-18" max="18" step="0.5" value="${b.gain || 0}" />
+                <input type="number" class="lf-input corr-band-in" data-k="q" placeholder="Q" min="0.1" max="20" step="0.1" value="${b.q || 1}" />
+                <button class="corr-band-rm" title="Remove band">✕</button>
+              </div>`).join('')}
+            <button class="btn corr-add" data-ch="${i}" ${(ch.peq || []).length >= 8 ? 'disabled' : ''}>+ PEQ band</button>
+          </div>
+        </div>`).join('')}
+    </div>`;
+
+  root.querySelectorAll('.corr-invert').forEach((b) =>
+    b.addEventListener('click', () => {
+      const ch = sc.channels[Number(b.dataset.ch)];
+      ch.invert = !ch.invert;
+      b.classList.toggle('on', ch.invert);
+      saveSettingsDebounced();
+      applyCorrection();
+    }));
+
+  root.querySelectorAll('.corr-in').forEach((inp) =>
+    inp.addEventListener('input', () => {
+      sc.channels[Number(inp.dataset.ch)][inp.dataset.k] = Number(inp.value) || 0;
+      saveSettingsDebounced();
+      applyCorrection();
+    }));
+
+  root.querySelectorAll('.corr-band-in').forEach((inp) =>
+    inp.addEventListener('input', () => {
+      const wrap = inp.closest('.corr-band');
+      const band = sc.channels[Number(wrap.dataset.ch)].peq[Number(wrap.dataset.band)];
+      band[inp.dataset.k] = Number(inp.value) || 0;
+      saveSettingsDebounced();
+      applyCorrection();
+    }));
+
+  root.querySelectorAll('.corr-band-rm').forEach((btn) =>
+    btn.addEventListener('click', () => {
+      const wrap = btn.closest('.corr-band');
+      sc.channels[Number(wrap.dataset.ch)].peq.splice(Number(wrap.dataset.band), 1);
+      saveSettingsDebounced();
+      applyCorrection();
+      renderCorrectionEditor();
+    }));
+
+  root.querySelectorAll('.corr-add').forEach((btn) =>
+    btn.addEventListener('click', () => {
+      const ch = sc.channels[Number(btn.dataset.ch)];
+      ch.peq = ch.peq || [];
+      ch.peq.push({ freq: 1000, gain: 0, q: 1.4 });
+      saveSettingsDebounced();
+      applyCorrection();
+      renderCorrectionEditor();
+    }));
+}
+
 let settingsSaveTimer = null;
 function saveSettingsDebounced() {
   clearTimeout(settingsSaveTimer);
@@ -1085,21 +1379,19 @@ function nextIndex(forEnd = false) {
   return next;
 }
 
-engine.peekNext = () => {
+function enginePeekNext() {
   const idx = nextIndex(true);
   return idx >= 0 ? state.queue[idx] : null;
-};
+}
 
-engine.onTrackEnd = () => {
+function engineOnTrackEnd() {
   const idx = nextIndex(true);
   if (idx < 0) { updatePlayButton(false); return null; }
   state.queueIndex = idx;
   return state.queue[idx];
-};
+}
 
-engine.onTrackStarted = (track) => onTrackStarted(track);
-
-engine.onError = (track, msg) => {
+function engineOnError(track, msg) {
   toast(`${track ? `“${track.title}” — ` : ''}${msg}`, true);
   // auto-advance past undecodable file
   const idx = nextIndex();
@@ -1107,7 +1399,7 @@ engine.onError = (track, msg) => {
     state.queueIndex = idx;
     startTrack(state.queue[idx]);
   }
-};
+}
 
 function onTrackStarted(track) {
   playCountedFor = null;
@@ -1282,7 +1574,7 @@ async function sendScrobble(track) {
   } catch { /* queued in main */ }
 }
 
-engine.onTimeUpdate = (time, duration) => {
+function engineOnTimeUpdate(time, duration) {
   countPlayIfEligible(time, duration);
   syncLyrics(time);
   updateMiniProgress(time, duration);
@@ -1293,7 +1585,9 @@ engine.onTimeUpdate = (time, duration) => {
   $('#seek-buffer').style.width = (engine.buffered * 100) + '%';
   $('#time-elapsed').textContent = fmtTime(time);
   if (duration) $('#time-total').textContent = fmtTime(duration);
-};
+}
+
+attachEngineCallbacks(engine);
 
 function seekFromEvent(e) {
   const rect = seekBar.getBoundingClientRect();
@@ -1682,6 +1976,19 @@ $$('.nav-item[data-view]').forEach((btn) =>
   if (settings.replayGain) engine.setReplayGainMode(settings.replayGain);
   if (settings.outputDevice) {
     engine.setOutputDevice(settings.outputDevice).catch(() => {});
+  }
+  engine.setSpeakerCorrection?.(correctionConfig());
+  if (settings.nativeOutput?.enabled) {
+    const available = await window.auralis.native.available().catch(() => false);
+    if (available) {
+      await window.auralis.native.config({
+        api: settings.nativeOutput.api ?? 'default',
+        deviceId: settings.nativeOutput.deviceId ?? -1,
+        bitPerfect: !!settings.nativeOutput.bitPerfect,
+        bufferSize: settings.nativeOutput.bufferSize || 512,
+      });
+      await switchEngine(true);
+    }
   }
   updateEqButton();
   updateTransportUi();

@@ -65,8 +65,17 @@ export class AudioEngine {
       src.connect(this.sourceGains[i]);
       this.sourceGains[i].connect(eqInput);
     });
+    // Speaker correction slot (JRiver-style): rebuilt on config change.
+    // Chain: eqOutput → [correction subgraph] → preamp
+    this.correctionInput = this.ctx.createGain();
+    this.correctionOutput = this.ctx.createGain();
+    this.correctionNodes = [];
+    this.correction = null; // active config
+
     const eqOutput = this.eqNodes[this.eqNodes.length - 1];
-    eqOutput.connect(this.preamp);
+    eqOutput.connect(this.correctionInput);
+    this.correctionInput.connect(this.correctionOutput); // passthrough until configured
+    this.correctionOutput.connect(this.preamp);
     this.preamp.connect(this.analyser);
     this.analyser.connect(this.masterGain);
     this.analyser.connect(this.splitter);
@@ -234,6 +243,71 @@ export class AudioEngine {
   setReplayGainMode(mode) {
     this.replayGainMode = mode;
     if (this.currentTrack) this._applyReplayGain(this.sourceGains[this.active], this.currentTrack);
+  }
+
+  // ── Speaker correction (JRiver-style room correction) ──
+  // config: { enabled, channels: [{gain, delayMs, invert, peq:[{freq,gain,q}]}, ...],
+  //           irUrl: optional impulse-response WAV (auralis:// url) }
+  async setSpeakerCorrection(config) {
+    this.correction = config;
+    // tear down previous subgraph
+    this.correctionInput.disconnect();
+    this.correctionNodes.forEach((n) => { try { n.disconnect(); } catch { /* already */ } });
+    this.correctionNodes = [];
+
+    if (!config || !config.enabled) {
+      this.correctionInput.connect(this.correctionOutput);
+      return;
+    }
+
+    const ctx = this.ctx;
+    const chConfigs = [config.channels?.[0] || {}, config.channels?.[1] || {}];
+    const splitter = ctx.createChannelSplitter(2);
+    const merger = ctx.createChannelMerger(2);
+    this.correctionNodes.push(splitter, merger);
+    this.correctionInput.connect(splitter);
+
+    chConfigs.forEach((ch, i) => {
+      let head = null, tail = null;
+      const push = (node) => {
+        this.correctionNodes.push(node);
+        if (tail) tail.connect(node); else head = node;
+        tail = node;
+      };
+      const delay = ctx.createDelay(1);
+      delay.delayTime.value = Math.max(0, (ch.delayMs || 0) / 1000);
+      push(delay);
+      const gain = ctx.createGain();
+      const linear = Math.pow(10, (ch.gain || 0) / 20);
+      gain.gain.value = ch.invert ? -linear : linear;
+      push(gain);
+      for (const band of (ch.peq || [])) {
+        if (!band.freq) continue;
+        const bq = ctx.createBiquadFilter();
+        bq.type = 'peaking';
+        bq.frequency.value = band.freq;
+        bq.gain.value = band.gain || 0;
+        bq.Q.value = band.q || 1;
+        push(bq);
+      }
+      splitter.connect(head, i);
+      tail.connect(merger, 0, i);
+    });
+
+    let output = merger;
+    if (config.irUrl) {
+      try {
+        const res = await fetch(config.irUrl);
+        const buf = await this.ctx.decodeAudioData(await res.arrayBuffer());
+        const conv = ctx.createConvolver();
+        conv.normalize = true;
+        conv.buffer = buf;
+        this.correctionNodes.push(conv);
+        merger.connect(conv);
+        output = conv;
+      } catch { /* bad IR file — skip convolution */ }
+    }
+    output.connect(this.correctionOutput);
   }
 
   async setOutputDevice(deviceId) {

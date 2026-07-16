@@ -655,6 +655,39 @@ function registerIpc() {
 }
 
 // ---------------------------------------------------------------------------
+// Native output engine (ASIO / WASAPI / DirectSound via RtAudio + ffmpeg)
+// ---------------------------------------------------------------------------
+
+const { NativeAudioEngine } = require('./native-engine');
+let nativeEngine = null;
+
+function getNativeEngine() {
+  if (!nativeEngine) {
+    nativeEngine = new NativeAudioEngine((channel, payload) => {
+      mainWindow?.webContents.send(channel, payload);
+    });
+  }
+  return nativeEngine;
+}
+
+function registerNativeIpc() {
+  ipcMain.handle('native:available', () => getNativeEngine().available);
+  ipcMain.handle('native:apis', () => getNativeEngine().listApis());
+  ipcMain.handle('native:devices', (_e, apiId) => getNativeEngine().listDevices(apiId));
+  ipcMain.handle('native:config', (_e, partial) => getNativeEngine().setConfig(partial));
+  ipcMain.handle('native:play', async (_e, track, startAt) => {
+    try { await getNativeEngine().play(track, startAt || 0); return { ok: true }; }
+    catch (err) { return { ok: false, error: err.message }; }
+  });
+  ipcMain.handle('native:pause', () => getNativeEngine().pause());
+  ipcMain.handle('native:resume', () => getNativeEngine().resume());
+  ipcMain.handle('native:seek', (_e, time) => getNativeEngine().seek(time));
+  ipcMain.handle('native:set-next', (_e, track) => getNativeEngine().setNext(track));
+  ipcMain.handle('native:stop', () => getNativeEngine().stopAll());
+  ipcMain.handle('native:position', () => getNativeEngine().getPosition());
+}
+
+// ---------------------------------------------------------------------------
 // Auto-update (GitHub Releases via electron-updater)
 // ---------------------------------------------------------------------------
 
@@ -787,6 +820,7 @@ app.whenReady().then(async () => {
     await scanFolders([process.env.AURALIS_SCAN_DIR]);
   }
   setupAutoUpdater();
+  registerNativeIpc();
   createWindow();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
