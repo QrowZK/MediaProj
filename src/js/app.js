@@ -14,6 +14,8 @@ const state = {
   library: { folders: [], tracks: [] },
   playlists: [],
   settings: {},
+  stats: { plays: {}, lastPlayed: {} },
+  artistCache: {},
   view: 'albums',
   viewArg: null,
   search: '',
@@ -149,6 +151,7 @@ function render() {
     albums: renderAlbums, album: renderAlbumDetail, artists: renderArtists,
     artist: renderArtistDetail, tracks: renderTracksView, genres: renderGenres,
     genre: renderGenreDetail, playlist: renderPlaylist, settings: renderSettings,
+    mostplayed: renderMostPlayed,
   };
   (views[state.view] || renderAlbums)();
   renderSidebarPlaylists();
@@ -288,18 +291,20 @@ function trackTable(tracks, opts = {}) {
         <th ${opts.sortable ? 'data-sort="title"' : ''}>Title${sortArrow('title', opts)}</th>
         <th ${opts.sortable ? 'data-sort="artist"' : ''}>Artist${sortArrow('artist', opts)}</th>
         <th ${opts.sortable ? 'data-sort="album"' : ''}>Album${sortArrow('album', opts)}</th>
+        ${opts.extraCol ? `<th class="t-dur">${esc(opts.extraCol.header)}</th>` : ''}
         <th class="t-fmt" ${opts.sortable ? 'data-sort="quality"' : ''}>Quality${sortArrow('quality', opts)}</th>
         <th class="t-dur" ${opts.sortable ? 'data-sort="duration"' : ''}>⏱${sortArrow('duration', opts)}</th>
       </tr></thead>
       <tbody>
         ${tracks.map((t, i) => `
           <tr data-idx="${i}" data-id="${t.id}" class="${t.id === currentId ? 'playing' : ''}">
-            <td class="t-num">${t.id === currentId
+            <td class="t-num" data-num="${opts.numbers ? (t.trackNo ?? i + 1) : i + 1}">${t.id === currentId
               ? '<span class="eq-bars"><i></i><i></i><i></i></span>'
               : (opts.numbers ? (t.trackNo ?? i + 1) : i + 1)}</td>
             <td class="t-title">${esc(t.title)}</td>
             <td>${esc(t.artist)}</td>
             <td>${esc(t.album)}</td>
+            ${opts.extraCol ? `<td class="t-dur">${esc(String(opts.extraCol.value(t)))}</td>` : ''}
             <td class="t-fmt"><span class="badge ${qualityBadgeClass(t)}">${esc(shortFmt(t))}</span></td>
             <td class="t-dur">${fmtTime(t.duration)}</td>
           </tr>`).join('')}
@@ -370,12 +375,52 @@ function renderTracksView() {
   bindTrackTable(shown);
 }
 
+// ── Most Played ──
+
+const MOST_PLAYED_LIMIT = 25;
+
+function renderMostPlayed() {
+  const plays = state.stats.plays || {};
+  const ranked = state.library.tracks
+    .filter((t) => plays[t.id] > 0)
+    .sort((a, b) => (plays[b.id] || 0) - (plays[a.id] || 0) ||
+                    (state.stats.lastPlayed?.[b.id] || 0) - (state.stats.lastPlayed?.[a.id] || 0))
+    .slice(0, MOST_PLAYED_LIMIT);
+  if (!ranked.length) {
+    content.innerHTML = `
+      <div class="view-header">
+        <span class="view-title">Most Played</span>
+        <span class="view-sub">your top ${MOST_PLAYED_LIMIT}</span>
+      </div>
+      <div class="empty-state" style="height:60%">
+        <div class="glyph">
+          <svg viewBox="0 0 24 24" width="38" height="38"><path d="M12 3.5l2.6 5.3 5.9.9-4.3 4.1 1 5.8L12 16.9l-5.2 2.7 1-5.8-4.3-4.1 5.9-.9z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
+        </div>
+        <h2>Nothing here yet</h2>
+        <p>Auralis counts a play once you're halfway through a track (or four minutes in).
+           Your ${MOST_PLAYED_LIMIT} most-played tracks will gather here automatically.</p>
+      </div>`;
+    return;
+  }
+  content.innerHTML = `
+    <div class="view-header">
+      <span class="view-title">Most Played</span>
+      <span class="view-sub">your top ${ranked.length}</span>
+      <span class="spacer"></span>
+      <button class="btn primary" id="mp-play">Play</button>
+    </div>
+    ${trackTable(ranked, { extraCol: { header: 'Plays', value: (t) => plays[t.id] || 0 } })}`;
+  $('#mp-play').addEventListener('click', () => playTracks(ranked, 0));
+  bindTrackTable(ranked);
+}
+
 // ── Artists ──
 
-function renderArtists() {
+async function renderArtists() {
   if (!state.library.tracks.length) {
     content.innerHTML = emptyLibraryMarkup(); bindEmptyCta(); return;
   }
+  state.artistCache = await window.auralis.artist.cachedMap().catch(() => state.artistCache);
   const map = new Map();
   for (const t of filteredTracks()) {
     const key = t.albumArtist;
@@ -391,14 +436,17 @@ function renderArtists() {
       <span class="view-title">Artists</span>
       <span class="view-sub">${artists.length} artists</span>
     </div>
-    ${artists.map((a) => `
+    ${artists.map((a) => {
+      const photo = state.artistCache[a.name.toLowerCase()]?.img || a.art;
+      return `
       <div class="artist-row" data-name="${esc(a.name)}">
-        <div class="artist-avatar">${a.art ? `<img src="${esc(a.art)}" loading="lazy" alt=""/>` : esc(a.name.charAt(0).toUpperCase())}</div>
+        <div class="artist-avatar">${photo ? `<img src="${esc(photo)}" loading="lazy" alt=""/>` : esc(a.name.charAt(0).toUpperCase())}</div>
         <div class="meta">
           <div class="name">${esc(a.name)}</div>
           <div class="sub">${a.albums.size} album${a.albums.size !== 1 ? 's' : ''} · ${a.tracks.length} tracks</div>
         </div>
-      </div>`).join('')}`;
+      </div>`;
+    }).join('')}`;
   content.querySelectorAll('.artist-row').forEach((row) =>
     row.addEventListener('click', () => go('artist', row.dataset.name)));
 }
@@ -413,11 +461,20 @@ function renderArtistDetail() {
       <svg viewBox="0 0 24 24" width="15" height="15"><path d="M15 5l-7 7 7 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
       Artists
     </button>
-    <div class="view-header">
-      <span class="view-title">${esc(name)}</span>
-      <span class="view-sub">${albums.length} albums · ${tracks.length} tracks</span>
-      <span class="spacer"></span>
-      <button class="btn primary" id="artist-play">Play All</button>
+    <div class="artist-hero" id="artist-hero">
+      <div class="artist-portrait" id="artist-portrait">${esc(name.charAt(0).toUpperCase())}</div>
+      <div class="artist-hero-meta">
+        <div class="hero-kicker">Artist</div>
+        <div class="hero-title">${esc(name)}</div>
+        <div class="hero-sub">${albums.length} album${albums.length !== 1 ? 's' : ''} · ${tracks.length} tracks · ${fmtLongTime(tracks.reduce((s, t) => s + (t.duration || 0), 0))}</div>
+        <div class="artist-bio" id="artist-bio"></div>
+        <div class="hero-actions" style="margin-top:14px">
+          <button class="btn primary" id="artist-play">
+            <svg viewBox="0 0 24 24" width="15" height="15"><path d="M8 5v14l11-7z" fill="currentColor"/></svg>
+            Play All
+          </button>
+        </div>
+      </div>
     </div>
     <div class="album-grid">
       ${albums.map((a) => `
@@ -443,6 +500,44 @@ function renderArtistDetail() {
       const album = albums.find((a) => a.key === btn.dataset.play);
       if (album) playTracks(album.tracks, 0);
     }));
+
+  loadArtistProfile(name);
+}
+
+// Fetch photo + biography (Deezer / Wikipedia) and hydrate the artist hero.
+async function loadArtistProfile(name) {
+  if (state.settings.onlineArtistInfo === false) return;
+  const bioEl = $('#artist-bio');
+  if (bioEl) bioEl.innerHTML = '<span class="bio-loading">Looking up artist…</span>';
+  let info = null;
+  try {
+    info = await window.auralis.artist.info(name);
+  } catch { /* offline */ }
+  // View may have changed while we were fetching
+  if (state.view !== 'artist' || state.viewArg !== name) return;
+  const portrait = $('#artist-portrait');
+  const bio = $('#artist-bio');
+  if (!portrait || !bio) return;
+  if (info?.img) {
+    portrait.innerHTML = `<img src="${esc(info.img)}" alt=""/>`;
+    portrait.classList.add('has-photo');
+  }
+  if (info?.bio) {
+    const full = info.bio;
+    const short = full.length > 340 ? full.slice(0, 340).replace(/\s+\S*$/, '') + '…' : full;
+    bio.innerHTML = `
+      <p id="bio-text">${esc(short)}</p>
+      ${full.length > short.length ? '<button class="bio-more" id="bio-more">Read more</button>' : ''}
+      ${info.url ? `<span class="bio-source">Wikipedia</span>` : ''}`;
+    let expanded = false;
+    $('#bio-more')?.addEventListener('click', () => {
+      expanded = !expanded;
+      $('#bio-text').textContent = expanded ? full : short;
+      $('#bio-more').textContent = expanded ? 'Show less' : 'Read more';
+    });
+  } else {
+    bio.innerHTML = '';
+  }
 }
 
 // ── Genres ──
@@ -615,6 +710,11 @@ async function renderSettings() {
           <button class="toggle ${engine.gapless ? 'on' : ''}" id="toggle-gapless"></button>
         </div>
         <div class="setting-row">
+          <div><div class="lbl">Online artist info</div>
+            <div class="hint">Fetches artist photos (Deezer) and biographies (Wikipedia) for artist pages. Results are cached locally.</div></div>
+          <button class="toggle ${state.settings.onlineArtistInfo !== false ? 'on' : ''}" id="toggle-artistinfo"></button>
+        </div>
+        <div class="setting-row">
           <div><div class="lbl">ReplayGain</div>
             <div class="hint">Volume-matches tracks using ReplayGain tags in your files.</div></div>
           <select class="styled" style="width:160px" id="rg-mode">
@@ -677,6 +777,13 @@ async function renderSettings() {
     } catch {
       toast('Could not switch output device', true);
     }
+  });
+
+  $('#toggle-artistinfo').addEventListener('click', (e) => {
+    const on = state.settings.onlineArtistInfo === false;
+    state.settings.onlineArtistInfo = on;
+    e.target.classList.toggle('on', on);
+    saveSettings();
   });
 
   $('#toggle-gapless').addEventListener('click', (e) => {
@@ -867,6 +974,7 @@ engine.onError = (track, msg) => {
 };
 
 function onTrackStarted(track) {
+  playCountedFor = null;
   updatePlayButton(true);
   $('#pb-title').textContent = track.title;
   $('#pb-artist').textContent = `${track.artist} — ${track.album}`;
@@ -900,7 +1008,11 @@ function onTrackStarted(track) {
 
   renderQueue();
   // refresh playing-row highlight without full rerender
-  content.querySelectorAll('tr.playing').forEach((r) => r.classList.remove('playing'));
+  content.querySelectorAll('tr.playing').forEach((r) => {
+    r.classList.remove('playing');
+    const num = r.querySelector('.t-num');
+    if (num?.dataset.num) num.textContent = num.dataset.num;
+  });
   const row = content.querySelector(`tr[data-id="${track.id}"]`);
   if (row) {
     row.classList.add('playing');
@@ -980,7 +1092,23 @@ if ('mediaSession' in navigator) {
 const seekBar = $('#seek-bar');
 let seeking = false;
 
+// ── Play counting (a play = half the track, or 4 minutes, whichever first) ──
+let playCountedFor = null;
+let statsSaveTimer = null;
+
+function countPlayIfEligible(time, duration) {
+  const track = engine.currentTrack;
+  if (!track || playCountedFor === track.id || !duration) return;
+  if (time < Math.min(duration * 0.5, 240)) return;
+  playCountedFor = track.id;
+  state.stats.plays[track.id] = (state.stats.plays[track.id] || 0) + 1;
+  state.stats.lastPlayed[track.id] = Date.now();
+  clearTimeout(statsSaveTimer);
+  statsSaveTimer = setTimeout(() => window.auralis.stats.set(state.stats), 800);
+}
+
 engine.onTimeUpdate = (time, duration) => {
+  countPlayIfEligible(time, duration);
   if (seeking) return;
   const pct = duration ? (time / duration) * 100 : 0;
   $('#seek-fill').style.width = pct + '%';
@@ -1205,14 +1333,16 @@ $$('.nav-item[data-view]').forEach((btn) =>
 // ── Boot ────────────────────────────────────────────────────────────────
 
 (async function boot() {
-  const [lib, pls, settings] = await Promise.all([
+  const [lib, pls, settings, stats] = await Promise.all([
     window.auralis.library.get(),
     window.auralis.playlists.get(),
     window.auralis.settings.get(),
+    window.auralis.stats.get(),
   ]);
   state.library = lib;
   state.playlists = pls.playlists || [];
   state.settings = settings || {};
+  state.stats = { plays: {}, lastPlayed: {}, ...stats };
 
   // restore settings
   if (settings.volume != null) {

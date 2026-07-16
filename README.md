@@ -19,6 +19,12 @@ brass-accented interface built for long listening sessions.
 - **Fast incremental scans** — only changed files are re-read on rescan.
 - **Albums · Artists · Tracks · Genres** views, global search (`Ctrl F`), sortable columns,
   playlists, play queue with drag-free "Play Next / Add to Queue".
+- **Most Played** — a built-in smart collection of your top 25 tracks. A play is counted
+  once you're halfway through a track (or four minutes in), scrobble-style.
+- **Artist profiles** — artist pages show a photo (Deezer) and a biography snippet
+  (Wikipedia) with a Read-more expander, fetched on demand and cached locally.
+  Toggle off under Settings → Audio Output → "Online artist info" if you prefer
+  a fully offline player.
 
 ### Playback engine
 - **Gapless playback** — the next track is pre-buffered and handed off without silence.

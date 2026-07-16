@@ -4,6 +4,8 @@ const { app, BrowserWindow, ipcMain, dialog, protocol, net, shell, Menu } = requ
 const path = require('path');
 const fs = require('fs');
 const fsp = fs.promises;
+const http = require('http');
+const https = require('https');
 const { pathToFileURL } = require('url');
 
 // ---------------------------------------------------------------------------
@@ -22,6 +24,8 @@ const LOSSLESS_EXTENSIONS = new Set([
 const LIBRARY_FILE = () => path.join(app.getPath('userData'), 'library.json');
 const SETTINGS_FILE = () => path.join(app.getPath('userData'), 'settings.json');
 const PLAYLISTS_FILE = () => path.join(app.getPath('userData'), 'playlists.json');
+const STATS_FILE = () => path.join(app.getPath('userData'), 'stats.json');
+const ARTIST_INFO_FILE = () => path.join(app.getPath('userData'), 'artist-info.json');
 const ART_CACHE_DIR = () => path.join(app.getPath('userData'), 'art-cache');
 
 let mainWindow = null;
@@ -240,6 +244,152 @@ async function scanFolders(folders) {
 }
 
 // ---------------------------------------------------------------------------
+// Online artist info (photo via Deezer, biography via Wikipedia)
+// ---------------------------------------------------------------------------
+
+let artistIndex = null;
+
+async function loadArtistIndex() {
+  if (!artistIndex) artistIndex = await readJson(ARTIST_INFO_FILE(), {});
+  return artistIndex;
+}
+
+// Plain Node HTTPS client with CONNECT tunneling when HTTPS_PROXY is set —
+// works on direct connections and behind corporate proxies alike.
+function httpGet(url, redirects = 3) {
+  return new Promise((resolve, reject) => {
+    const target = new URL(url);
+    const proxyUrl = process.env.HTTPS_PROXY || process.env.https_proxy;
+    const headers = { 'User-Agent': 'Auralis/1.1 (desktop music player)', Accept: '*/*' };
+    const onResponse = (res) => {
+      if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location && redirects > 0) {
+        res.resume();
+        resolve(httpGet(new URL(res.headers.location, target).toString(), redirects - 1));
+        return;
+      }
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve({ status: res.statusCode, buffer: Buffer.concat(chunks) }));
+      res.on('error', reject);
+    };
+    if (proxyUrl) {
+      const proxy = new URL(proxyUrl);
+      const connectReq = http.request({
+        host: proxy.hostname, port: proxy.port, method: 'CONNECT',
+        path: `${target.hostname}:443`,
+      });
+      connectReq.on('connect', (res, socket) => {
+        socket.on('error', () => {}); // tunnel teardown after response is fine
+        if (res.statusCode !== 200) {
+          socket.destroy();
+          return reject(new Error('Proxy CONNECT ' + res.statusCode));
+        }
+        const req = https.request({
+          host: target.hostname, servername: target.hostname,
+          path: target.pathname + target.search, headers,
+          agent: false, createConnection: () => socket,
+        }, (r) => { r.on('end', () => socket.destroy()); onResponse(r); });
+        req.on('error', reject);
+        req.end();
+      });
+      connectReq.on('error', reject);
+      connectReq.setTimeout(15000, () => connectReq.destroy(new Error('proxy timeout')));
+      connectReq.end();
+    } else {
+      const req = https.get(url, { headers }, onResponse);
+      req.on('error', reject);
+      req.setTimeout(15000, () => req.destroy(new Error('timeout')));
+    }
+  });
+}
+
+async function fetchJson(url) {
+  const res = await httpGet(url);
+  if (res.status !== 200) throw new Error('HTTP ' + res.status);
+  return JSON.parse(res.buffer.toString('utf8'));
+}
+
+async function downloadImage(url, file) {
+  const res = await httpGet(url);
+  if (res.status !== 200 || !res.buffer.length) return false;
+  await fsp.mkdir(ART_CACHE_DIR(), { recursive: true });
+  await fsp.writeFile(file, res.buffer);
+  return true;
+}
+
+const MUSIC_DESC = /band|singer|musician|rapper|composer|songwriter|artist|duo|group|producer|violinist|pianist|guitarist|orchestra|ensemble|dj/i;
+
+async function getArtistInfo(name) {
+  const key = name.trim().toLowerCase();
+  if (!key || key === 'unknown artist') return null;
+  const index = await loadArtistIndex();
+  const cached = index[key];
+  if (cached) {
+    return { ...cached, img: cached.imgFile ? toMediaUrl(cached.imgFile) : null };
+  }
+
+  const info = { bio: null, url: null, imgFile: null, ts: Date.now() };
+  let deezerOk = false;
+  let wikiOk = false;
+
+  // Photo: Deezer artist search (no API key required)
+  try {
+    const dz = await fetchJson(
+      'https://api.deezer.com/search/artist?q=' + encodeURIComponent(name) + '&limit=1');
+    deezerOk = true;
+    const hit = dz?.data?.[0];
+    const imgUrl = hit?.picture_xl || hit?.picture_big;
+    if (imgUrl) {
+      const file = path.join(ART_CACHE_DIR(), 'artist-' + hashString(key) + '.jpg');
+      if (await downloadImage(imgUrl, file)) info.imgFile = file;
+    }
+  } catch { /* offline or blocked — degrade gracefully */ }
+
+  // Biography: Wikipedia — search first so bands with ambiguous names resolve
+  try {
+    const search = await fetchJson(
+      'https://en.wikipedia.org/w/rest.php/v1/search/title?q=' +
+      encodeURIComponent(name) + '&limit=5');
+    wikiOk = true;
+    const pages = search?.pages || [];
+    const page = pages.find((p) => MUSIC_DESC.test(p.description || '')) || pages[0];
+    if (page) {
+      const sum = await fetchJson(
+        'https://en.wikipedia.org/api/rest_v1/page/summary/' +
+        encodeURIComponent(page.key) + '?redirect=true');
+      if (sum?.extract && sum.type !== 'disambiguation') {
+        info.bio = sum.extract;
+        info.url = sum.content_urls?.desktop?.page || null;
+        if (!info.imgFile && sum.originalimage?.source) {
+          const file = path.join(ART_CACHE_DIR(), 'artist-' + hashString(key) + '.jpg');
+          if (await downloadImage(sum.originalimage.source, file)) info.imgFile = file;
+        }
+      }
+    }
+  } catch { /* offline or blocked — degrade gracefully */ }
+
+  // Cache the result (including "nothing found") only if the services answered,
+  // so a temporary network failure doesn't stick.
+  if (deezerOk || wikiOk) {
+    index[key] = info;
+    await writeJson(ARTIST_INFO_FILE(), index);
+  }
+  return { ...info, img: info.imgFile ? toMediaUrl(info.imgFile) : null };
+}
+
+async function getCachedArtistMap() {
+  const index = await loadArtistIndex();
+  const out = {};
+  for (const [key, info] of Object.entries(index)) {
+    out[key] = {
+      img: info.imgFile ? toMediaUrl(info.imgFile) : null,
+      hasBio: !!info.bio,
+    };
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // IPC
 // ---------------------------------------------------------------------------
 
@@ -262,6 +412,12 @@ function registerIpc() {
 
   ipcMain.handle('playlists:get', () => readJson(PLAYLISTS_FILE(), { playlists: [] }));
   ipcMain.handle('playlists:set', async (_e, data) => writeJson(PLAYLISTS_FILE(), data));
+
+  ipcMain.handle('stats:get', () => readJson(STATS_FILE(), { plays: {}, lastPlayed: {} }));
+  ipcMain.handle('stats:set', async (_e, data) => writeJson(STATS_FILE(), data));
+
+  ipcMain.handle('artist:info', (_e, name) => getArtistInfo(String(name)));
+  ipcMain.handle('artist:cached-map', () => getCachedArtistMap());
 
   ipcMain.handle('shell:show-item', (_e, filePath) => shell.showItemInFolder(filePath));
 
@@ -319,6 +475,11 @@ function createWindow() {
 }
 
 Menu.setApplicationMenu(null);
+
+// Honor environment proxies (corporate networks, sandboxes). Chromium picks up
+// OS-level proxy settings natively; env vars need to be forwarded explicitly.
+const envProxy = process.env.HTTPS_PROXY || process.env.https_proxy;
+if (envProxy) app.commandLine.appendSwitch('proxy-server', envProxy);
 
 app.whenReady().then(async () => {
   registerAuralisProtocol();
