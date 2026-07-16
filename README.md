@@ -45,12 +45,32 @@ brass-accented interface built for long listening sessions.
   of MusicBee's mini mode. Toggle from the player bar; pop back to full size anytime.
 - **OS media key support** via MediaSession.
 
+### Native Direct Output (Settings → Output Engine)
+- **Direct host-API output** via RtAudio: **ASIO** (direct DAC communication — bypasses
+  the Windows mixer entirely), **WASAPI**, and **DirectSound**, with device and buffer-size
+  selection.
+- **FFmpeg decode** — the native path decodes *everything* the library indexes: FLAC, ALAC,
+  APE, WavPack, DSD (converted to 176.4 kHz PCM), WAV/AIFF, MP3 (with LAME encoder-delay/
+  padding trim for true gapless), AAC, OGG, Opus.
+- **64-bit float DSP chain** — ReplayGain, EQ, and speaker correction are computed in
+  double precision before a single 32-bit float quantization at the output.
+- **Bit-perfect mode** — source samples go to the driver untouched as 32-bit integer PCM
+  (verified bit-exact): no DSP, no dither, no software volume. Use your DAC's volume.
+- **Gapless** — decode-ahead into a continuous device stream.
+
+### Speaker correction (Settings → Speaker Correction)
+JRiver-style room correction, per channel: level trim, distance delay (ms), polarity
+invert, and up to 8 parametric EQ bands per speaker. Runs in the active engine's DSP
+chain — 64-bit float on the native path, Web Audio nodes on the standard path — and is
+bypassed automatically in bit-perfect mode.
+
 ### Honest notes for the discerning ear
-Decoding is performed by the Chromium media engine (FLAC / WAV / AIFF / MP3 / AAC /
-OGG / Opus natively). DSD, APE, and WavPack files are fully indexed and catalogued;
-native decode for those formats — and WASAPI exclusive / bit-perfect output — is on
-the roadmap and would come via a native decode backend. The Web Audio pipeline runs
-at the output device's shared-mode rate.
+The **Standard** engine decodes via Chromium (FLAC / WAV / AIFF / MP3 / AAC / OGG / Opus)
+and runs at the output device's shared-mode rate; use **Native Direct Output** for the
+full format list and direct API access. **WASAPI exclusive mode** is not yet wired —
+RtAudio's WASAPI backend is shared-mode; for a bit-perfect exclusive path today, use
+**ASIO** (every serious DAC ships an ASIO driver, and ASIO bypasses the mixer by design).
+WaveOut/MME is superseded by DirectSound and intentionally not offered.
 
 ## Install (Windows)
 

@@ -33,6 +33,27 @@ contextBridge.exposeInMainWorld('auralis', {
   lyrics: {
     get: (track) => ipcRenderer.invoke('lyrics:get', track),
   },
+  native: {
+    available: () => ipcRenderer.invoke('native:available'),
+    apis: () => ipcRenderer.invoke('native:apis'),
+    devices: (apiId) => ipcRenderer.invoke('native:devices', apiId),
+    config: (partial) => ipcRenderer.invoke('native:config', partial),
+    play: (track, startAt) => ipcRenderer.invoke('native:play', track, startAt),
+    pause: () => ipcRenderer.invoke('native:pause'),
+    resume: () => ipcRenderer.invoke('native:resume'),
+    seek: (time) => ipcRenderer.invoke('native:seek', time),
+    setNext: (track) => ipcRenderer.invoke('native:set-next', track),
+    stop: () => ipcRenderer.invoke('native:stop'),
+    position: () => ipcRenderer.invoke('native:position'),
+    on: (channel, cb) => {
+      const allowed = ['native:progress', 'native:track-ended', 'native:track-changed',
+                       'native:state', 'native:error', 'native:viz'];
+      if (!allowed.includes(channel)) return () => {};
+      const listener = (_e, data) => cb(data);
+      ipcRenderer.on(channel, listener);
+      return () => ipcRenderer.removeListener(channel, listener);
+    },
+  },
   updates: {
     check: () => ipcRenderer.invoke('update:check'),
     install: () => ipcRenderer.invoke('update:install'),

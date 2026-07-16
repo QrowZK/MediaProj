@@ -619,6 +619,47 @@ table.tracks .t-fmt { width: 120px; }
 }
 .lf-input:focus { border-color: var(--accent-2); }
 
+/* ── Speaker correction editor ── */
+.corr-ch {
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 14px;
+}
+.corr-title {
+  font-size: 12px;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-bottom: 10px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.corr-invert {
+  width: 26px; height: 26px;
+  border-radius: 6px;
+  border: 1px solid var(--line-strong);
+  color: var(--text-3);
+  font-size: 14px;
+}
+.corr-invert.on { color: var(--danger); border-color: var(--danger); background: rgba(224,108,108,0.1); }
+.corr-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-2);
+  margin-bottom: 8px;
+}
+.corr-row input { width: 90px; }
+.corr-peq { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+.corr-band { display: grid; grid-template-columns: 1fr 1fr 1fr 28px; gap: 6px; align-items: center; }
+.corr-band-rm { color: var(--text-3); border-radius: 5px; }
+.corr-band-rm:hover { color: var(--danger); }
+.corr-add { align-self: flex-start; padding: 5px 12px; font-size: 12px; }
+
 select.styled {
   width: 100%;
   background: var(--bg-2);
