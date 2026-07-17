@@ -57,13 +57,26 @@ const RTAUDIO_FLAGS = {
 // audify's RtAudio constructor does info[0].As<Number>() whenever ANY argument
 // is present, so `new RtAudio(undefined)` throws "A number was expected".
 // Only pass the api when it is a real number; otherwise call with no arguments
-// so the default host API is chosen.
+// so the default host API is chosen. If the requested API has no output
+// devices (stale saved id, driver removed, API not compiled in), fall back to
+// the default host API rather than failing every subsequent call.
 function makeRtAudio(api) {
   const n = Number(api);
-  return (api === undefined || api === null || api === 'default' || Number.isNaN(n))
-    ? new audify.RtAudio()
-    : new audify.RtAudio(n);
+  const wantSpecific = !(api === undefined || api === null || api === 'default' || Number.isNaN(n));
+  if (wantSpecific) {
+    try {
+      const rt = new audify.RtAudio(n);
+      if (rt.getDevices().some((d) => d.outputChannels > 0)) return rt;
+    } catch { /* fall through to default */ }
+  }
+  return new audify.RtAudio();
 }
+
+// RtAudio reports warnings (type 0/1) through the same stream error callback
+// as real failures — "no open stream to close!", "no compiled support for
+// specified API", underrun notices. Those must never surface as user-facing
+// errors.
+const RTAUDIO_WARNING_TYPES = new Set([0, 1]);
 
 // ── float64 biquad (RBJ cookbook), direct form II transposed ─────────────
 
@@ -332,9 +345,11 @@ class NativeAudioEngine {
   setConfig(partial) {
     const wasOutput = this._outputKey();
     Object.assign(this.config, partial);
-    if (this.rt && !this.config.bitPerfect) {
-      this.rt.outputVolume = Math.pow(this.config.volume, 2);
-    }
+    try {
+      if (this.rt?.isStreamOpen() && !this.config.bitPerfect) {
+        this.rt.outputVolume = Math.pow(this.config.volume, 2);
+      }
+    } catch { /* stream mid-teardown */ }
     if (wasOutput !== this._outputKey() && this.currentTrack) {
       // output target / pipeline topology changed mid-play: restart in place
       const pos = this.getPosition();
@@ -460,7 +475,21 @@ class NativeAudioEngine {
       this.stream.channels !== plan.channels ||
       this.stream.format !== plan.format ||
       this.stream.backend !== (useWex ? 'wasapi-ex' : 'rtaudio');
-    if (needOpen) this._openStream(plan, useWex);
+    if (needOpen) {
+      try {
+        this._openStream(plan, useWex);
+      } catch (err) {
+        if (!useWex) throw err;
+        // exclusive mode refused (format/rate/device busy) → shared fallback
+        this.emit('native:error', {
+          message: `Exclusive mode unavailable (${err.message}) — using shared output`,
+        });
+        if (plan.format !== 'f32' && plan.mode === 'dsp' && (this.config.outputFormat || 'f32') === 'f32') {
+          plan.format = 'f32'; // undo the exclusive-only int coercion
+        }
+        this._openStream(plan, false);
+      }
+    }
 
     this._buildDsp(plan.outRate, plan.channels);
     // The exclusive addon may negotiate a different wire format than requested
@@ -522,7 +551,10 @@ class NativeAudioEngine {
       null,
       () => this._pump(),
       flags,
-      (type, msg) => this.emit('native:error', { message: `${type}: ${msg}` }),
+      (type, msg) => {
+        if (RTAUDIO_WARNING_TYPES.has(type)) return; // warnings are not errors
+        this.emit('native:error', { message: msg });
+      },
     );
     this.rt.outputVolume = plan.mode !== 'dsp' ? 1 : Math.pow(c.volume, 2);
     this.stream = {
@@ -549,7 +581,8 @@ class NativeAudioEngine {
       clearInterval(this.wexPump); this.wexPump = null;
       try { wasapiEx.stop(this.wexHandle); } catch { /* fine */ }
     } else if (this.rt) {
-      try { this.rt.stop(); } catch { /* fine */ }
+      // guard: RtAudio warns "no open stream" through the error callback
+      try { if (this.rt.isStreamOpen() && this.rt.isStreamRunning()) this.rt.stop(); } catch { /* fine */ }
     }
   }
 
@@ -560,7 +593,7 @@ class NativeAudioEngine {
       this.wexHandle = null;
     }
     if (this.rt) {
-      try { this.rt.closeStream(); } catch { /* fine */ }
+      try { if (this.rt.isStreamOpen()) this.rt.closeStream(); } catch { /* fine */ }
       this.rt = null;
     }
     this.stream = null;
@@ -938,7 +971,7 @@ class NativeAudioEngine {
       try { d.kill('SIGKILL'); } catch { /* gone */ }
     }
     if (this.dop) { this.dop.cancelled = true; this.dop = null; }
-    if (this.rt) { try { this.rt.clearOutputQueue(); } catch { /* fine */ } }
+    if (this.rt) { try { if (this.rt.isStreamOpen()) this.rt.clearOutputQueue(); } catch { /* fine */ } }
     if (this.stream?.backend === 'wasapi-ex' && this.wexHandle != null) {
       try { wasapiEx.clear(this.wexHandle); } catch { /* fine */ }
     }

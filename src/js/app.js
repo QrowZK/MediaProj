@@ -1255,6 +1255,12 @@ async function renderSettings() {
       return;
     }
     const apis = await window.auralis.native.apis();
+    // a saved API that no longer exists on this machine snaps back to default
+    if (no().api !== 'default' && !apis.some((a) => String(a.id) === String(no().api))) {
+      no().api = 'default';
+      no().deviceId = -1;
+      saveSettings();
+    }
     const apiSel = $('#native-api');
     apiSel.innerHTML = '<option value="default">System default</option>' +
       apis.map((a) => `<option value="${a.id}" ${String(no().api) === String(a.id) ? 'selected' : ''}>${esc(a.label)}</option>`).join('');
@@ -1805,8 +1811,15 @@ function engineOnTrackEnd() {
   return state.queue[idx];
 }
 
+let lastErrorToast = { msg: '', at: 0 };
+
 function engineOnError(track, msg) {
-  toast(`${track ? `“${track.title}” — ` : ''}${msg}`, true);
+  // identical errors within a short window collapse into one toast
+  const now = Date.now();
+  if (msg !== lastErrorToast.msg || now - lastErrorToast.at > 8000) {
+    toast(`${track ? `“${track.title}” — ` : ''}${msg}`, true);
+  }
+  lastErrorToast = { msg, at: now };
   // auto-advance past undecodable file
   const idx = nextIndex();
   if (idx >= 0 && idx !== state.queueIndex) {
