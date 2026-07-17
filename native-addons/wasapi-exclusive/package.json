@@ -1,0 +1,14 @@
+{
+  "name": "auralis-wasapi-exclusive",
+  "version": "1.0.0",
+  "description": "Minimal WASAPI exclusive-mode render backend for Auralis (Windows only)",
+  "main": "index.js",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "build": "node-gyp rebuild"
+  },
+  "dependencies": {
+    "node-addon-api": "^8.5.0"
+  }
+}

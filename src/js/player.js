@@ -330,6 +330,39 @@ export class AudioEngine {
     return buffer;
   }
 
+  // Signal path descriptor for the UI indicator (standard engine)
+  getSignalPath() {
+    const t = this.currentTrack;
+    if (!t) return null;
+    const stages = [];
+    stages.push({
+      kind: 'source', quality: t.lossless || t.dsd ? 'lossless' : 'lossy',
+      label: t.codec || 'PCM',
+      detail: `${t.bitsPerSample || 16}-bit / ${((t.sampleRate || 44100) / 1000)} kHz` +
+              (t.lossless ? '' : ` · ${t.bitrate || '?'} kbps lossy`),
+    });
+    stages.push({ kind: 'decode', quality: 'lossless', label: 'Chromium decode', detail: '32-bit float' });
+    if (this.replayGainMode !== 'off') {
+      stages.push({ kind: 'dsp', quality: 'enhanced', label: 'ReplayGain', detail: this.replayGainMode + ' gain' });
+    }
+    if (this.eqEnabled && this.eqGains.some((g) => g !== 0)) {
+      stages.push({ kind: 'dsp', quality: 'enhanced', label: 'Parametric EQ',
+        detail: `${this.eqGains.filter((g) => g !== 0).length} bands · 32-bit float` });
+    }
+    if (this.correction?.enabled) {
+      const parts = ['level/delay/PEQ'];
+      if (this.correction.irUrl) parts.push('convolution');
+      stages.push({ kind: 'dsp', quality: 'enhanced', label: 'Speaker correction', detail: parts.join(' + ') });
+    }
+    stages.push({ kind: 'dsp', quality: 'enhanced', label: 'Volume', detail: `${Math.round(this.volume * 100)}%` });
+    stages.push({
+      kind: 'output', quality: 'lossless', label: 'System output (shared)',
+      detail: `32-bit float @ ${(this.ctx.sampleRate / 1000)} kHz · OS mixer`,
+    });
+    const overall = stages.some((s) => s.quality === 'lossy') ? 'lossy' : 'lossless';
+    return { stages, overall, engine: 'standard' };
+  }
+
   getVuLevels() {
     const levels = [0, 0];
     const buf = new Float32Array(this.vuAnalysers[0].fftSize);

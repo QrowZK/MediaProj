@@ -33,8 +33,13 @@ contextBridge.exposeInMainWorld('auralis', {
   lyrics: {
     get: (track) => ipcRenderer.invoke('lyrics:get', track),
   },
+  dsp: {
+    chooseIr: () => ipcRenderer.invoke('dsp:choose-ir'),
+  },
   native: {
     available: () => ipcRenderer.invoke('native:available'),
+    capabilities: () => ipcRenderer.invoke('native:capabilities'),
+    signalPath: () => ipcRenderer.invoke('native:signal-path'),
     apis: () => ipcRenderer.invoke('native:apis'),
     devices: (apiId) => ipcRenderer.invoke('native:devices', apiId),
     config: (partial) => ipcRenderer.invoke('native:config', partial),
@@ -47,7 +52,7 @@ contextBridge.exposeInMainWorld('auralis', {
     position: () => ipcRenderer.invoke('native:position'),
     on: (channel, cb) => {
       const allowed = ['native:progress', 'native:track-ended', 'native:track-changed',
-                       'native:state', 'native:error', 'native:viz'];
+                       'native:state', 'native:error', 'native:viz', 'native:signal-path'];
       if (!allowed.includes(channel)) return () => {};
       const listener = (_e, data) => cb(data);
       ipcRenderer.on(channel, listener);

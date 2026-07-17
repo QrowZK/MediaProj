@@ -21,6 +21,11 @@ brass-accented interface built for long listening sessions.
   playlists, play queue with drag-free "Play Next / Add to Queue".
 - **Most Played** — a built-in smart collection of your top 25 tracks. A play is counted
   once you're halfway through a track (or four minutes in), scrobble-style.
+- **Smart playlists** — rules-based auto-updating playlists (match all/any of: artist,
+  album, genre, year, rating, play count, days since played/added, sample rate, length,
+  lossless) with sort and limit. Build them from the ⚡ button in the sidebar.
+- **Ratings** — five-star ratings on every track row (click to rate, click again to clear),
+  sortable and usable in smart-playlist rules.
 - **Artist profiles** — artist pages show a photo (Deezer) and a biography snippet
   (Wikipedia) with a Read-more expander, fetched on demand and cached locally.
   Toggle off under Settings → Audio Output → "Online artist info" if you prefer
@@ -45,6 +50,19 @@ brass-accented interface built for long listening sessions.
   of MusicBee's mini mode. Toggle from the player bar; pop back to full size anytime.
 - **OS media key support** via MediaSession.
 
+### Signal path indicator
+Click the quality badge in the player bar for a Roon-style stage-by-stage readout of
+exactly what is happening to the stream — source format, decoder, every active DSP
+stage, quantization/dither, and the output device — with a bit-perfect / lossless /
+lossy verdict light.
+
+### Resampling & Dither (Settings)
+- **SoX resampler (soxr)** sample-rate conversion on the native path — fixed output
+  rates 44.1–384 kHz at selectable precision (20/28/33-bit).
+- **Output format selection** (32-bit float, or 32/24/16-bit integer) with **TPDF
+  dither** and optional **2nd-order noise shaping** applied once at the final
+  quantization (measured: ~20 dB lower in-band quantization noise vs. flat dither).
+
 ### Native Direct Output (Settings → Output Engine)
 - **Direct host-API output** via RtAudio: **ASIO** (direct DAC communication — bypasses
   the Windows mixer entirely), **WASAPI**, and **DirectSound**, with device and buffer-size
@@ -56,6 +74,12 @@ brass-accented interface built for long listening sessions.
   double precision before a single 32-bit float quantization at the output.
 - **Bit-perfect mode** — source samples go to the driver untouched as 32-bit integer PCM
   (verified bit-exact): no DSP, no dither, no software volume. Use your DAC's volume.
+- **WASAPI Exclusive mode** — a dedicated native module takes exclusive-mode control of the
+  endpoint (event-driven, format-negotiated), bypassing the Windows mixer and session volume
+  entirely. Falls back to the shared path if the device refuses the format.
+- **Native DSD over PCM (DoP)** — DSF files can play as the untouched 1-bit DSD stream
+  wrapped in marker-framed PCM for DoP-aware DACs (Settings → DSD playback). PCM conversion
+  remains the compatible default.
 - **Gapless** — decode-ahead into a continuous device stream.
 
 ### Speaker correction (Settings → Speaker Correction)

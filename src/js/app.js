@@ -341,6 +341,7 @@ function trackTable(tracks, opts = {}) {
         <th ${opts.sortable ? 'data-sort="title"' : ''}>Title${sortArrow('title', opts)}</th>
         <th ${opts.sortable ? 'data-sort="artist"' : ''}>Artist${sortArrow('artist', opts)}</th>
         <th ${opts.sortable ? 'data-sort="album"' : ''}>Album${sortArrow('album', opts)}</th>
+        <th class="t-rating" ${opts.sortable ? 'data-sort="rating"' : ''}>Rating${sortArrow('rating', opts)}</th>
         ${opts.extraCol ? `<th class="t-dur">${esc(opts.extraCol.header)}</th>` : ''}
         <th class="t-fmt" ${opts.sortable ? 'data-sort="quality"' : ''}>Quality${sortArrow('quality', opts)}</th>
         <th class="t-dur" ${opts.sortable ? 'data-sort="duration"' : ''}>⏱${sortArrow('duration', opts)}</th>
@@ -354,6 +355,7 @@ function trackTable(tracks, opts = {}) {
             <td class="t-title">${esc(t.title)}</td>
             <td>${esc(t.artist)}</td>
             <td>${esc(t.album)}</td>
+            <td class="t-rating">${starMarkup(t.id)}</td>
             ${opts.extraCol ? `<td class="t-dur">${esc(String(opts.extraCol.value(t)))}</td>` : ''}
             <td class="t-fmt"><span class="badge ${qualityBadgeClass(t)}">${esc(shortFmt(t))}</span></td>
             <td class="t-dur">${fmtTime(t.duration)}</td>
@@ -367,14 +369,51 @@ function sortArrow(key, opts) {
   return `<span class="sort-arrow">${state.sortDir > 0 ? '▲' : '▼'}</span>`;
 }
 
+// ── Ratings ──
+
+function starMarkup(trackId) {
+  const r = state.stats.ratings?.[trackId] || 0;
+  let html = `<span class="stars" data-id="${trackId}">`;
+  for (let i = 1; i <= 5; i++) {
+    html += `<span class="star ${i <= r ? 'on' : ''}" data-v="${i}">★</span>`;
+  }
+  return html + '</span>';
+}
+
+function setRating(trackId, value) {
+  if (!state.stats.ratings) state.stats.ratings = {};
+  // clicking the current rating clears it
+  const next = state.stats.ratings[trackId] === value ? 0 : value;
+  if (next === 0) delete state.stats.ratings[trackId];
+  else state.stats.ratings[trackId] = next;
+  window.auralis.stats.set(state.stats);
+  content.querySelectorAll(`.stars[data-id="${trackId}"]`).forEach((el) => {
+    el.querySelectorAll('.star').forEach((s) =>
+      s.classList.toggle('on', Number(s.dataset.v) <= (state.stats.ratings[trackId] || 0)));
+  });
+}
+
+function bindStars(root) {
+  root.querySelectorAll('.stars .star').forEach((star) =>
+    star.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const wrap = star.closest('.stars');
+      setRating(wrap.dataset.id, Number(star.dataset.v));
+    }));
+}
+
 function bindTrackTable(tracks) {
   content.querySelectorAll('tbody tr').forEach((row) => {
-    row.addEventListener('dblclick', () => playTracks(tracks, Number(row.dataset.idx)));
+    row.addEventListener('dblclick', (e) => {
+      if (e.target.closest('.stars')) return;
+      playTracks(tracks, Number(row.dataset.idx));
+    });
     row.addEventListener('contextmenu', (e) => {
       e.preventDefault();
       openTrackMenu(e, tracks, Number(row.dataset.idx));
     });
   });
+  bindStars(content);
   content.querySelectorAll('th[data-sort]').forEach((th) => {
     th.addEventListener('click', () => {
       const key = th.dataset.sort;
@@ -395,6 +434,7 @@ function sortTracks(tracks) {
       case 'artist': return t.artist.toLowerCase();
       case 'album': return t.album.toLowerCase();
       case 'duration': return t.duration || 0;
+      case 'rating': return state.stats.ratings?.[t.id] || 0;
       case 'quality': return (t.sampleRate || 0) * ((t.bitsPerSample || 16));
       default: return t.title.toLowerCase();
     }
@@ -641,17 +681,208 @@ function renderGenreDetail() {
 function renderSidebarPlaylists() {
   $('#playlist-nav').innerHTML = state.playlists.map((p) => `
     <button class="nav-item ${state.view === 'playlist' && state.viewArg === p.id ? 'active' : ''}" data-pl="${esc(p.id)}">
-      <svg viewBox="0 0 24 24"><path d="M4 6h16M4 11h10M4 16h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M17 13v7M17 20l3.5-2.2L17 15.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      ${p.smart
+        ? '<svg viewBox="0 0 24 24"><path d="M13 3L5 13.5h5L10 21l8-10.5h-5z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>'
+        : '<svg viewBox="0 0 24 24"><path d="M4 6h16M4 11h10M4 16h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M17 13v7M17 20l3.5-2.2L17 15.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>'}
       <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(p.name)}</span>
-      <span class="pl-count">${p.trackIds.length}</span>
+      <span class="pl-count">${p.smart ? evaluateSmartPlaylist(p).length : p.trackIds.length}</span>
     </button>`).join('');
   $('#playlist-nav').querySelectorAll('[data-pl]').forEach((b) =>
     b.addEventListener('click', () => go('playlist', b.dataset.pl)));
 }
 
 function playlistTracks(p) {
+  if (p.smart) return evaluateSmartPlaylist(p);
   const byId = new Map(state.library.tracks.map((t) => [t.id, t]));
   return p.trackIds.map((id) => byId.get(id)).filter(Boolean);
+}
+
+// ── Smart playlists ──
+
+const SMART_FIELDS = {
+  title:    { label: 'Title', type: 'text', get: (t) => t.title },
+  artist:   { label: 'Artist', type: 'text', get: (t) => t.artist },
+  album:    { label: 'Album', type: 'text', get: (t) => t.album },
+  genre:    { label: 'Genre', type: 'text', get: (t) => t.genre || '' },
+  year:     { label: 'Year', type: 'number', get: (t) => t.year || 0 },
+  rating:   { label: 'Rating', type: 'number', get: (t) => state.stats.ratings?.[t.id] || 0 },
+  plays:    { label: 'Play count', type: 'number', get: (t) => state.stats.plays?.[t.id] || 0 },
+  lastPlayedDays: { label: 'Days since played', type: 'number',
+    get: (t) => state.stats.lastPlayed?.[t.id] ? (Date.now() - state.stats.lastPlayed[t.id]) / 86400000 : Infinity },
+  addedDays: { label: 'Days since added', type: 'number',
+    get: (t) => t.added ? (Date.now() - t.added) / 86400000 : Infinity },
+  sampleRate: { label: 'Sample rate (kHz)', type: 'number', get: (t) => (t.sampleRate || 0) / 1000 },
+  duration: { label: 'Length (seconds)', type: 'number', get: (t) => t.duration || 0 },
+  lossless: { label: 'Lossless', type: 'bool', get: (t) => !!(t.lossless || t.dsd) },
+};
+
+const SMART_OPS = {
+  text:   [['contains', 'contains'], ['ncontains', "doesn't contain"], ['is', 'is'], ['isnot', 'is not']],
+  number: [['gte', '≥'], ['lte', '≤'], ['is', '=']],
+  bool:   [['is', 'is']],
+};
+
+function smartConditionMatch(track, cond) {
+  const field = SMART_FIELDS[cond.field];
+  if (!field) return true;
+  const v = field.get(track);
+  if (field.type === 'text') {
+    const a = String(v).toLowerCase();
+    const b = String(cond.value ?? '').toLowerCase();
+    switch (cond.op) {
+      case 'contains': return a.includes(b);
+      case 'ncontains': return !a.includes(b);
+      case 'is': return a === b;
+      case 'isnot': return a !== b;
+      default: return true;
+    }
+  }
+  if (field.type === 'bool') {
+    return v === (cond.value === true || cond.value === 'true');
+  }
+  const n = Number(cond.value) || 0;
+  switch (cond.op) {
+    case 'gte': return v >= n;
+    case 'lte': return v <= n;
+    case 'is': return v === n;
+    default: return true;
+  }
+}
+
+function evaluateSmartPlaylist(p) {
+  const rules = p.rules || {};
+  const conds = (rules.conditions || []).filter((c) => c.field);
+  let tracks = state.library.tracks.filter((t) =>
+    conds.length === 0 ||
+    (rules.match === 'any' ? conds.some((c) => smartConditionMatch(t, c))
+                           : conds.every((c) => smartConditionMatch(t, c))));
+  const sort = rules.sort || { key: 'artist', dir: 1 };
+  const field = SMART_FIELDS[sort.key];
+  if (field) {
+    tracks = [...tracks].sort((a, b) => {
+      const va = field.get(a), vb = field.get(b);
+      return (va < vb ? -1 : va > vb ? 1 : 0) * (sort.dir || 1);
+    });
+  }
+  if (rules.limit > 0) tracks = tracks.slice(0, rules.limit);
+  return tracks;
+}
+
+function openSmartPlaylistBuilder(existing = null) {
+  const root = $('#modal-root');
+  const rules = existing?.rules
+    ? JSON.parse(JSON.stringify(existing.rules))
+    : { match: 'all', conditions: [{ field: 'genre', op: 'contains', value: '' }], sort: { key: 'artist', dir: 1 }, limit: 0 };
+
+  let nameDraft = existing?.name || '';
+  const draw = () => {
+    root.innerHTML = `
+      <div class="modal" style="width:560px">
+        <h3>${existing ? 'Edit Smart Playlist' : 'New Smart Playlist'}</h3>
+        <input type="text" id="sp-name" placeholder="Playlist name…" value="${esc(nameDraft)}" />
+        <div class="sp-rules">
+          <div class="sp-match">Match
+            <select class="styled" id="sp-match" style="width:90px">
+              <option value="all" ${rules.match === 'all' ? 'selected' : ''}>all</option>
+              <option value="any" ${rules.match === 'any' ? 'selected' : ''}>any</option>
+            </select>
+            of the following:
+          </div>
+          <div id="sp-conds">
+            ${rules.conditions.map((c, i) => {
+              const type = SMART_FIELDS[c.field]?.type || 'text';
+              return `
+              <div class="sp-cond" data-i="${i}">
+                <select class="styled sp-field">
+                  ${Object.entries(SMART_FIELDS).map(([k, f]) => `<option value="${k}" ${c.field === k ? 'selected' : ''}>${f.label}</option>`).join('')}
+                </select>
+                <select class="styled sp-op">
+                  ${SMART_OPS[type].map(([v, l]) => `<option value="${v}" ${c.op === v ? 'selected' : ''}>${l}</option>`).join('')}
+                </select>
+                ${type === 'bool'
+                  ? `<select class="styled sp-val"><option value="true" ${String(c.value) !== 'false' ? 'selected' : ''}>yes</option><option value="false" ${String(c.value) === 'false' ? 'selected' : ''}>no</option></select>`
+                  : `<input type="${type === 'number' ? 'number' : 'text'}" class="lf-input sp-val" value="${esc(String(c.value ?? ''))}" />`}
+                <button class="corr-band-rm sp-rm" title="Remove">✕</button>
+              </div>`;
+            }).join('')}
+          </div>
+          <button class="btn" id="sp-add" style="margin-top:4px">+ condition</button>
+          <div class="sp-match" style="margin-top:14px">
+            Sort by
+            <select class="styled" id="sp-sort" style="width:170px">
+              ${Object.entries(SMART_FIELDS).map(([k, f]) => `<option value="${k}" ${rules.sort?.key === k ? 'selected' : ''}>${f.label}</option>`).join('')}
+            </select>
+            <select class="styled" id="sp-dir" style="width:120px">
+              <option value="1" ${(rules.sort?.dir || 1) === 1 ? 'selected' : ''}>ascending</option>
+              <option value="-1" ${rules.sort?.dir === -1 ? 'selected' : ''}>descending</option>
+            </select>
+            · limit <input type="number" class="lf-input" id="sp-limit" style="width:80px" min="0" value="${rules.limit || 0}" /> (0 = none)
+          </div>
+        </div>
+        <div class="modal-actions">
+          <button class="btn" id="sp-cancel">Cancel</button>
+          <button class="btn primary" id="sp-save">${existing ? 'Save' : 'Create'}</button>
+        </div>
+      </div>`;
+    root.classList.remove('hidden');
+
+    $('#sp-name').addEventListener('input', (e) => { nameDraft = e.target.value; });
+
+    const syncConds = () => {
+      root.querySelectorAll('.sp-cond').forEach((row) => {
+        const i = Number(row.dataset.i);
+        rules.conditions[i] = {
+          field: row.querySelector('.sp-field').value,
+          op: row.querySelector('.sp-op').value,
+          value: row.querySelector('.sp-val').value,
+        };
+      });
+    };
+    root.querySelectorAll('.sp-field').forEach((sel) =>
+      sel.addEventListener('change', () => {
+        syncConds();
+        const i = Number(sel.closest('.sp-cond').dataset.i);
+        rules.conditions[i].op = SMART_OPS[SMART_FIELDS[rules.conditions[i].field].type][0][0];
+        rules.conditions[i].value = '';
+        draw();
+      }));
+    root.querySelectorAll('.sp-rm').forEach((btn) =>
+      btn.addEventListener('click', () => {
+        syncConds();
+        rules.conditions.splice(Number(btn.closest('.sp-cond').dataset.i), 1);
+        if (!rules.conditions.length) rules.conditions.push({ field: 'genre', op: 'contains', value: '' });
+        draw();
+      }));
+    $('#sp-add').addEventListener('click', () => {
+      syncConds();
+      rules.conditions.push({ field: 'artist', op: 'contains', value: '' });
+      draw();
+    });
+    $('#sp-cancel').addEventListener('click', () => { root.classList.add('hidden'); root.innerHTML = ''; });
+    $('#sp-save').addEventListener('click', async () => {
+      const name = $('#sp-name').value.trim();
+      if (!name) return toast('Give the playlist a name', true);
+      syncConds();
+      rules.match = $('#sp-match').value;
+      rules.sort = { key: $('#sp-sort').value, dir: Number($('#sp-dir').value) };
+      rules.limit = Math.max(0, Number($('#sp-limit').value) || 0);
+      if (existing) {
+        existing.name = name;
+        existing.rules = rules;
+      } else {
+        state.playlists.push({
+          id: 'sp_' + Math.random().toString(36).slice(2, 10),
+          name, smart: true, trackIds: [], rules,
+        });
+      }
+      await savePlaylists();
+      root.classList.add('hidden');
+      root.innerHTML = '';
+      render();
+      toast(`${existing ? 'Updated' : 'Created'} smart playlist “${name}”`);
+    });
+  };
+  draw();
 }
 
 function renderPlaylist() {
@@ -660,14 +891,16 @@ function renderPlaylist() {
   const tracks = playlistTracks(p);
   content.innerHTML = `
     <div class="view-header">
-      <span class="view-title">${esc(p.name)}</span>
-      <span class="view-sub">${tracks.length} tracks · ${fmtLongTime(tracks.reduce((s, t) => s + t.duration, 0))}</span>
+      <span class="view-title">${p.smart ? '⚡ ' : ''}${esc(p.name)}</span>
+      <span class="view-sub">${tracks.length} tracks · ${fmtLongTime(tracks.reduce((s, t) => s + t.duration, 0))}${p.smart ? ' · auto-updating' : ''}</span>
       <span class="spacer"></span>
       <button class="btn primary" id="pl-play">Play</button>
+      ${p.smart ? '<button class="btn" id="pl-edit">Edit Rules</button>' : ''}
       <button class="btn danger" id="pl-delete">Delete</button>
     </div>
-    ${tracks.length ? trackTable(tracks) : '<p style="color:var(--text-3)">Right-click any track → “Add to Playlist”.</p>'}`;
+    ${tracks.length ? trackTable(tracks) : `<p style="color:var(--text-3)">${p.smart ? 'No tracks match these rules yet.' : 'Right-click any track → “Add to Playlist”.'}</p>`}`;
   $('#pl-play').addEventListener('click', () => tracks.length && playTracks(tracks, 0));
+  $('#pl-edit')?.addEventListener('click', () => openSmartPlaylistBuilder(p));
   $('#pl-delete').addEventListener('click', async () => {
     state.playlists = state.playlists.filter((x) => x.id !== p.id);
     await savePlaylists();
@@ -675,12 +908,16 @@ function renderPlaylist() {
     toast(`Deleted playlist “${p.name}”`);
   });
   content.querySelectorAll('tbody tr').forEach((row) => {
-    row.addEventListener('dblclick', () => playTracks(tracks, Number(row.dataset.idx)));
+    row.addEventListener('dblclick', (e) => {
+      if (e.target.closest('.stars')) return;
+      playTracks(tracks, Number(row.dataset.idx));
+    });
     row.addEventListener('contextmenu', (e) => {
       e.preventDefault();
-      openTrackMenu(e, tracks, Number(row.dataset.idx), p);
+      openTrackMenu(e, tracks, Number(row.dataset.idx), p.smart ? null : p);
     });
   });
+  bindStars(content);
 }
 
 async function savePlaylists() {
@@ -715,6 +952,8 @@ function promptModal(title, placeholder, onSubmit) {
     close();
   }
 }
+
+$('#new-smart-btn').addEventListener('click', () => openSmartPlaylistBuilder());
 
 $('#new-playlist-btn').addEventListener('click', () => {
   promptModal('New Playlist', 'Playlist name…', async (name) => {
@@ -864,6 +1103,27 @@ async function renderSettings() {
               <div class="hint">Source samples go to the driver untouched: no EQ, no ReplayGain, no correction, no software volume. Use your DAC's volume control.</div></div>
             <button class="toggle ${state.settings.nativeOutput?.bitPerfect ? 'on' : ''}" id="toggle-bitperfect"></button>
           </div>
+          <div class="setting-row" id="wex-row">
+            <div><div class="lbl">WASAPI Exclusive mode</div>
+              <div class="hint">Direct exclusive-mode access to the DAC — bypasses the Windows mixer and session volume entirely. Integer output only; falls back to the shared path if the device refuses the format.</div></div>
+            <button class="toggle ${state.settings.nativeOutput?.wasapiExclusive ? 'on' : ''}" id="toggle-wex"></button>
+          </div>
+          <div class="setting-row">
+            <div><div class="lbl">Output format</div>
+              <div class="hint">Sample format handed to the driver on the DSP path. Integer formats engage the dither stage below.</div></div>
+            <select class="styled" style="width:200px" id="native-format">
+              ${[['f32', '32-bit float'], ['s32', '32-bit integer'], ['s24', '24-bit integer'], ['s16', '16-bit integer']]
+                .map(([v, l]) => `<option value="${v}" ${(state.settings.nativeOutput?.outputFormat || 'f32') === v ? 'selected' : ''}>${l}</option>`).join('')}
+            </select>
+          </div>
+          <div class="setting-row">
+            <div><div class="lbl">DSD playback</div>
+              <div class="hint">DoP wraps the untouched 1-bit DSD stream in PCM frames for DoP-aware DACs (DSF files; needs a 176.4 kHz-capable integer path). PCM conversion plays everywhere.</div></div>
+            <select class="styled" style="width:200px" id="native-dsd">
+              <option value="pcm" ${(state.settings.nativeOutput?.dsdMode || 'pcm') === 'pcm' ? 'selected' : ''}>Convert to PCM 176.4 kHz</option>
+              <option value="dop" ${state.settings.nativeOutput?.dsdMode === 'dop' ? 'selected' : ''}>Native DSD over PCM (DoP)</option>
+            </select>
+          </div>
           <div class="setting-row">
             <div><div class="lbl">Buffer size</div><div class="hint">Frames per buffer. Smaller = lower latency, larger = safer.</div></div>
             <select class="styled" style="width:160px" id="native-buffer">
@@ -875,13 +1135,64 @@ async function renderSettings() {
       </div>
 
       <div class="settings-card">
+        <h3>Resampling &amp; Dither</h3>
+        <div class="desc">
+          Sample-rate conversion runs through the <b>SoX resampler</b> (soxr) inside the native
+          engine's decode pipeline — the same engine JRiver and HQPlayer users know. Dither is
+          applied once, at the final quantization to integer output: TPDF at ±1 LSB, optionally
+          with 2nd-order noise shaping that pushes quantization noise above the audible band.
+        </div>
+        <div class="setting-row" style="padding-top:0">
+          <div><div class="lbl">Sample-rate conversion</div></div>
+          <select class="styled" style="width:200px" id="rs-mode">
+            <option value="off" ${(state.settings.resample?.mode || 'off') === 'off' ? 'selected' : ''}>Off — source rate</option>
+            <option value="rate" ${state.settings.resample?.mode === 'rate' ? 'selected' : ''}>Fixed output rate</option>
+          </select>
+        </div>
+        <div class="setting-row ${(state.settings.resample?.mode || 'off') === 'off' ? 'hidden' : ''}" id="rs-rate-row">
+          <div><div class="lbl">Output rate</div></div>
+          <select class="styled" style="width:200px" id="rs-rate">
+            ${[44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000]
+              .map((r) => `<option value="${r}" ${(state.settings.resample?.rate || 96000) === r ? 'selected' : ''}>${(r / 1000).toFixed(1).replace('.0', '')} kHz</option>`).join('')}
+          </select>
+        </div>
+        <div class="setting-row">
+          <div><div class="lbl">SoX precision</div><div class="hint">28-bit is transparent; 33-bit is bit-exact overkill for the paranoid.</div></div>
+          <select class="styled" style="width:200px" id="rs-precision">
+            ${[[20, 'Quick (20-bit)'], [28, 'High quality (28-bit)'], [33, 'Very high (33-bit)']]
+              .map(([v, l]) => `<option value="${v}" ${(state.settings.resample?.precision || 28) === v ? 'selected' : ''}>${l}</option>`).join('')}
+          </select>
+        </div>
+        <div class="setting-row">
+          <div><div class="lbl">Dither</div><div class="hint">Active when the output format is integer. Noise shaping keeps the audible band ~20 dB cleaner.</div></div>
+          <select class="styled" style="width:240px" id="rs-dither">
+            <option value="off" ${(state.settings.dither || 'off') === 'off' ? 'selected' : ''}>Off (truncate)</option>
+            <option value="tpdf" ${state.settings.dither === 'tpdf' ? 'selected' : ''}>TPDF dither</option>
+            <option value="ns" ${state.settings.dither === 'ns' ? 'selected' : ''}>TPDF + noise shaping</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="settings-card">
         <h3>Speaker Correction
           <button class="toggle ${state.settings.speakerCorrection?.enabled ? 'on' : ''}" id="toggle-correction" style="margin-left:auto"></button>
         </h3>
         <div class="desc">
           JRiver-style room correction: per-channel level trim, distance delay, polarity, and a
-          parametric EQ bank per speaker. Applied in the active engine's DSP chain
-          (64-bit float on the native path). Disabled automatically in bit-perfect mode.
+          parametric EQ bank per speaker — plus full <b>FIR convolution</b> from a measured
+          impulse response (REW, Acourate, Audiolense exports). Applied in the active engine's
+          DSP chain (64-bit float + ffmpeg <code>afir</code> on the native path).
+          Disabled automatically in bit-perfect mode.
+        </div>
+        <div class="setting-row" style="padding-top:0">
+          <div><div class="lbl">Impulse response (convolution)</div>
+            <div class="hint" id="ir-name">${state.settings.speakerCorrection?.irName
+              ? esc(state.settings.speakerCorrection.irName)
+              : 'No impulse response loaded.'}</div></div>
+          <div style="display:flex;gap:8px">
+            <button class="btn" id="ir-load">Load IR…</button>
+            ${state.settings.speakerCorrection?.irPath ? '<button class="btn danger" id="ir-clear">Clear</button>' : ''}
+          </div>
         </div>
         <div id="correction-editor"></div>
       </div>
@@ -961,13 +1272,22 @@ async function renderSettings() {
   }
 
   async function pushNativeOutputConfig() {
-    await window.auralis.native.config({
-      api: no().api, deviceId: no().deviceId,
-      bitPerfect: no().bitPerfect, bufferSize: no().bufferSize,
-    });
+    await window.auralis.native.config(nativeConfigPayload());
   }
 
   if (state.settings.nativeOutput?.enabled) populateNativeSelectors();
+
+  // hide the exclusive toggle when the addon isn't present on this install
+  window.auralis.native.capabilities().then((caps) => {
+    if (!caps.wasapiExclusive) {
+      const row = $('#wex-row');
+      if (row) {
+        row.querySelector('.hint').textContent =
+          'Not available on this install (Windows only; requires the exclusive-mode addon).';
+        row.querySelector('.toggle').classList.add('disabled');
+      }
+    }
+  }).catch(() => {});
 
   $('#out-engine').addEventListener('change', async (e) => {
     const useNative = e.target.value === 'native';
@@ -1015,6 +1335,81 @@ async function renderSettings() {
     no().bufferSize = Number(e.target.value);
     saveSettings();
     await pushNativeOutputConfig();
+  });
+
+  $('#toggle-wex').addEventListener('click', async (e) => {
+    if (e.target.classList.contains('disabled')) return;
+    no().wasapiExclusive = !no().wasapiExclusive;
+    e.target.classList.toggle('on', no().wasapiExclusive);
+    saveSettings();
+    await pushNativeOutputConfig();
+    toast(no().wasapiExclusive
+      ? 'WASAPI Exclusive engaged — device is now Auralis-only'
+      : 'WASAPI Exclusive off — shared output path');
+  });
+
+  $('#native-format').addEventListener('change', async (e) => {
+    no().outputFormat = e.target.value;
+    saveSettings();
+    await pushNativeOutputConfig();
+  });
+
+  $('#native-dsd').addEventListener('change', async (e) => {
+    no().dsdMode = e.target.value;
+    saveSettings();
+    await pushNativeOutputConfig();
+  });
+
+  // ── Resampling & dither ──
+
+  const rs = () => state.settings.resample || (state.settings.resample = { mode: 'off', rate: 96000, precision: 28 });
+
+  $('#rs-mode').addEventListener('change', async (e) => {
+    rs().mode = e.target.value;
+    $('#rs-rate-row').classList.toggle('hidden', rs().mode === 'off');
+    saveSettings();
+    await pushNativeOutputConfig();
+  });
+  $('#rs-rate').addEventListener('change', async (e) => {
+    rs().rate = Number(e.target.value);
+    saveSettings();
+    await pushNativeOutputConfig();
+  });
+  $('#rs-precision').addEventListener('change', async (e) => {
+    rs().precision = Number(e.target.value);
+    saveSettings();
+    await pushNativeOutputConfig();
+  });
+  $('#rs-dither').addEventListener('change', async (e) => {
+    state.settings.dither = e.target.value;
+    saveSettings();
+    await pushNativeOutputConfig();
+  });
+
+  // ── Impulse response ──
+
+  $('#ir-load').addEventListener('click', async () => {
+    const ir = await window.auralis.dsp.chooseIr();
+    if (!ir) return;
+    const sc = correctionSettings();
+    sc.irPath = ir.path;
+    sc.irUrl = ir.url;
+    sc.irName = ir.name;
+    if (!sc.enabled) { sc.enabled = true; $('#toggle-correction')?.classList.add('on'); }
+    saveSettings();
+    applyCorrection();
+    await pushNativeOutputConfig();
+    toast(`Impulse response loaded: ${ir.name}`);
+    render();
+  });
+
+  $('#ir-clear')?.addEventListener('click', async () => {
+    const sc = correctionSettings();
+    sc.irPath = null; sc.irUrl = null; sc.irName = null;
+    saveSettings();
+    applyCorrection();
+    await pushNativeOutputConfig();
+    render();
   });
 
   // ── Speaker correction ──
@@ -1196,7 +1591,26 @@ function correctionSettings() {
 
 function correctionConfig() {
   const sc = correctionSettings();
-  return { enabled: sc.enabled, channels: sc.channels };
+  return {
+    enabled: sc.enabled, channels: sc.channels,
+    irPath: sc.irPath || null, irUrl: sc.irUrl || null,
+  };
+}
+
+function nativeConfigPayload() {
+  const no = state.settings.nativeOutput || {};
+  return {
+    api: no.api ?? 'default',
+    deviceId: no.deviceId ?? -1,
+    bitPerfect: !!no.bitPerfect,
+    bufferSize: no.bufferSize || 512,
+    outputFormat: no.outputFormat || 'f32',
+    dsdMode: no.dsdMode || 'pcm',
+    wasapiExclusive: !!no.wasapiExclusive,
+    resample: state.settings.resample || { mode: 'off', rate: 96000, precision: 28 },
+    dither: state.settings.dither || 'off',
+    correction: correctionConfig(),
+  };
 }
 
 let correctionApplyTimer = null;
@@ -1855,6 +2269,58 @@ function choosePlaylist(track) {
     }));
 }
 
+// ── Signal path indicator ──
+
+function renderSignalPath() {
+  const panel = $('#signal-path');
+  const sp = engine.getSignalPath?.();
+  if (!sp) {
+    panel.innerHTML = '<div class="sp-empty">Nothing playing — start a track to inspect the signal path.</div>';
+    return;
+  }
+  const dot = (q) => `<span class="sp-dot ${q}"></span>`;
+  const overallLabel = { bitperfect: 'BIT-PERFECT', lossless: 'LOSSLESS', enhanced: 'ENHANCED', lossy: 'LOSSY SOURCE' }[sp.overall] || '';
+  panel.innerHTML = `
+    <div class="sp-header">
+      ${dot(sp.overall)}
+      <span class="sp-overall">${overallLabel}</span>
+      <span class="sp-engine">${sp.engine === 'native' ? 'Native engine' : 'Standard engine'}</span>
+    </div>
+    ${sp.stages.map((st) => `
+      <div class="sp-stage">
+        ${dot(st.quality)}
+        <div class="sp-meta">
+          <div class="sp-label">${esc(st.label)}</div>
+          <div class="sp-detail">${esc(st.detail || '')}</div>
+        </div>
+      </div>`).join('')}`;
+}
+
+function updateQualityDot() {
+  const sp = engine.getSignalPath?.();
+  const el = $('#pb-quality');
+  el.classList.remove('q-bitperfect', 'q-lossless', 'q-lossy');
+  if (sp) el.classList.add(sp.overall === 'bitperfect' ? 'q-bitperfect' : sp.overall === 'lossy' ? 'q-lossy' : 'q-lossless');
+}
+
+$('#pb-quality').addEventListener('click', () => {
+  const panel = $('#signal-path');
+  const show = panel.classList.contains('hidden');
+  panel.classList.toggle('hidden', !show);
+  if (show) renderSignalPath();
+});
+
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('#signal-path') && !e.target.closest('#pb-quality')) {
+    $('#signal-path')?.classList.add('hidden');
+  }
+});
+
+setInterval(() => {
+  updateQualityDot();
+  if (!$('#signal-path').classList.contains('hidden')) renderSignalPath();
+}, 2000);
+
 // ── Auto-update ──
 
 window.auralis.updates.onReady((info) => {
@@ -1962,7 +2428,7 @@ $$('.nav-item[data-view]').forEach((btn) =>
   state.library = lib;
   state.playlists = pls.playlists || [];
   state.settings = settings || {};
-  state.stats = { plays: {}, lastPlayed: {}, ...stats };
+  state.stats = { plays: {}, lastPlayed: {}, ratings: {}, ...stats };
 
   // restore settings
   if (settings.volume != null) {
@@ -1981,12 +2447,7 @@ $$('.nav-item[data-view]').forEach((btn) =>
   if (settings.nativeOutput?.enabled) {
     const available = await window.auralis.native.available().catch(() => false);
     if (available) {
-      await window.auralis.native.config({
-        api: settings.nativeOutput.api ?? 'default',
-        deviceId: settings.nativeOutput.deviceId ?? -1,
-        bitPerfect: !!settings.nativeOutput.bitPerfect,
-        bufferSize: settings.nativeOutput.bufferSize || 512,
-      });
+      await window.auralis.native.config(nativeConfigPayload());
       await switchEngine(true);
     }
   }

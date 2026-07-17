@@ -61,7 +61,13 @@ export class NativeEngineProxy {
         this._levels = v.levels;
         this._spectrum.set(v.spectrum.slice(0, 512));
       }),
+      window.auralis.native.on('native:signal-path', (p) => {
+        this._signalPath = p;
+        this.onSignalPath?.(p);
+      }),
     ];
+    this._signalPath = null;
+    this.onSignalPath = null;
     this._pendingNext = null;
     this._lastSyncedNextId = null;
   }
@@ -133,4 +139,6 @@ export class NativeEngineProxy {
   }
 
   getVuLevels() { return this._levels; }
+
+  getSignalPath() { return this._signalPath; }
 }

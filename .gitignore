@@ -2,3 +2,5 @@ node_modules/
 release/
 *.log
 .DS_Store
+native-addons/*/build/
+native-addons/*/node_modules/
