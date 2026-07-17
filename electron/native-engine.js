@@ -34,6 +34,26 @@ const API_LABELS = {
 
 const EQ_FREQUENCIES = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
 
+// RtAudio stream flags. The TS enum is a `const enum` (inlined, no runtime
+// object), so use the numeric bit values directly.
+const RTAUDIO_FLAGS = {
+  NONINTERLEAVED: 0x1,
+  MINIMIZE_LATENCY: 0x2,
+  HOG_DEVICE: 0x4,
+  SCHEDULE_REALTIME: 0x8,
+};
+
+// audify's RtAudio constructor does info[0].As<Number>() whenever ANY argument
+// is present, so `new RtAudio(undefined)` throws "A number was expected".
+// Only pass the api when it is a real number; otherwise call with no arguments
+// so the default host API is chosen.
+function makeRtAudio(api) {
+  const n = Number(api);
+  return (api === undefined || api === null || api === 'default' || Number.isNaN(n))
+    ? new audify.RtAudio()
+    : new audify.RtAudio(n);
+}
+
 // ── float64 biquad (RBJ cookbook), direct form II transposed ─────────────
 
 class Biquad {
@@ -162,7 +182,7 @@ class NativeAudioEngine {
     for (const [name, id] of Object.entries(audify.RtAudioApi)) {
       if (name === 'UNSPECIFIED' || name === 'RTAUDIO_DUMMY') continue;
       try {
-        const rt = new audify.RtAudio(id);
+        const rt = makeRtAudio(id);
         if (rt.getDevices().filter((d) => d.outputChannels > 0).length > 0) {
           apis.push({ id, name, label: API_LABELS[name] || name });
         }
@@ -174,7 +194,7 @@ class NativeAudioEngine {
   listDevices(apiId) {
     if (!this.available) return [];
     try {
-      const rt = new audify.RtAudio(apiId || undefined);
+      const rt = makeRtAudio(apiId);
       return rt.getDevices()
         .map((d, idx) => ({ ...d, index: d.id ?? idx }))
         .filter((d) => d.outputChannels > 0)
@@ -306,17 +326,23 @@ class NativeAudioEngine {
   _openStream(sampleRate, channels) {
     const c = this.config;
     if (this.rt) { try { this.rt.closeStream(); } catch { /* fine */ } }
-    const apiId = c.api === 'default' ? undefined : Number(c.api);
-    this.rt = new audify.RtAudio(apiId);
+    this.rt = makeRtAudio(c.api);
     const deviceId = c.deviceId >= 0 ? c.deviceId : this.rt.getDefaultOutputDevice();
     const format = c.bitPerfect ? audify.RtAudioFormat.RTAUDIO_SINT32
                                 : audify.RtAudioFormat.RTAUDIO_FLOAT32;
+    // Stream flags MUST be a number — audify's binding does info[8].As<Number>()
+    // unconditionally once an errorCallback follows it, so passing `undefined`
+    // throws "A number was expected". Bit-perfect additionally requests
+    // HOG_DEVICE (best-effort exclusive access; ignored where unsupported).
+    const flags = c.bitPerfect
+      ? (RTAUDIO_FLAGS.MINIMIZE_LATENCY | RTAUDIO_FLAGS.HOG_DEVICE)
+      : RTAUDIO_FLAGS.MINIMIZE_LATENCY;
     const frameSize = this.rt.openStream(
       { deviceId, nChannels: channels, firstChannel: 0 },
       null, format, sampleRate, c.bufferSize || 512, 'Auralis',
       null,
       () => this._pump(),
-      undefined,
+      flags,
       (type, msg) => this.emit('native:error', { message: `${type}: ${msg}` }),
     );
     this.rt.outputVolume = c.bitPerfect ? 1 : Math.pow(c.volume, 2);
