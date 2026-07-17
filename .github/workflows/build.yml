@@ -1,9 +1,18 @@
 name: Build Windows Installer
 
+# Auto-update requires the installer + latest.yml to live on a GitHub Release.
+# Publishing a Release is therefore the trigger — regardless of whether the tag
+# is v-prefixed (v1.4.0) or bare (1.4.0). Releases created in the GitHub UI fire
+# the `release` event; a plain `push: tags` trigger would miss them.
 on:
-  push:
-    tags: ['v*']
+  release:
+    types: [published]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing release tag to build and attach the installer to (leave blank to just produce a downloadable artifact)'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -12,7 +21,11 @@ jobs:
   build-windows:
     runs-on: windows-latest
     steps:
+      # For a release, build the tagged commit. For a manual run with a tag,
+      # build that tag so the installer version matches the target release.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.release_tag || github.ref }}
 
       - uses: actions/setup-node@v4
         with:
@@ -22,23 +35,28 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # latest.yml (the electron-updater manifest) is emitted here because a
+      # github publish provider is configured in package.json.
       - name: Build NSIS installer
-        if: "!startsWith(github.ref, 'refs/tags/v')"
         run: npx electron-builder --win nsis --publish never
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
 
-      # Tag builds publish a GitHub Release including latest.yml + blockmap,
-      # which the in-app auto-updater (electron-updater) reads.
-      - name: Build and publish release
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: npx electron-builder --win nsis --publish always
-        env:
-          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload installer artifact
+      - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: Auralis-Setup
           path: release/Auralis-Setup-*.exe
+
+      # Attach to the release that triggered the run (or the tag given to a
+      # manual run). Decoupled from electron-builder's own tag-name matching,
+      # so a v prefix on the tag is never required.
+      - name: Attach installer to release
+        if: github.event_name == 'release' || github.event.inputs.release_tag != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.release_tag }}
+          files: |
+            release/Auralis-Setup-*.exe
+            release/latest.yml
+            release/*.blockmap
