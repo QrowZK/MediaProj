@@ -46,7 +46,16 @@ function attachEngineCallbacks(e) {
 async function switchEngine(useNative) {
   const playingTrack = engine.currentTrack;
   const pos = engine.currentTime;
-  engine.pause();
+  // Fully release the departing engine's output device — pausing is not
+  // enough: a native stream (especially WASAPI-exclusive) keeps the endpoint
+  // locked, leaving the other engine silent until the app restarts.
+  if (engine === nativeEngine && nativeEngine) {
+    try { await window.auralis.native.stop(); } catch { /* already down */ }
+    nativeEngine.currentTrack = null;
+    nativeEngine.paused = true;
+  } else {
+    webEngine.pause();
+  }
   if (useNative) {
     if (!nativeEngine) nativeEngine = new NativeEngineProxy();
     engine = nativeEngine;
@@ -64,10 +73,17 @@ async function switchEngine(useNative) {
   engine.setReplayGainMode(webEngine.replayGainMode);
   engine.setSpeakerCorrection?.(correctionConfig());
   if (playingTrack) {
-    const ok = await engine.play(playingTrack);
-    if (ok) {
-      onTrackStarted(playingTrack);
-      if (pos > 1) engine.seek(pos);
+    try {
+      const ok = await engine.play(playingTrack);
+      if (ok) {
+        onTrackStarted(playingTrack);
+        if (pos > 1) engine.seek(pos);
+      } else {
+        updatePlayButton(false);
+      }
+    } catch (err) {
+      updatePlayButton(false);
+      toast('Engine switch: playback could not resume — press play to retry', true);
     }
   }
 }
