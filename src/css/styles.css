@@ -494,6 +494,41 @@ table.tracks .t-fmt { width: 120px; }
 .pill-item:hover { border-color: var(--accent-2); color: var(--accent); background: var(--accent-soft); }
 .pill-item .cnt { color: var(--text-3); font-size: 11.5px; margin-left: 7px; font-family: var(--mono); }
 
+/* ── Folder tree ── */
+.folder-tree { font-size: 13px; }
+.ft-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding-top: 6px;
+  padding-bottom: 6px;
+  padding-right: 12px;
+  border-radius: 7px;
+  cursor: default;
+  color: var(--text-2);
+}
+.ft-row:hover { background: var(--bg-1); }
+.ft-dir { cursor: pointer; color: var(--text-1); }
+.ft-dir svg { color: var(--accent-2); flex-shrink: 0; }
+.ft-arrow { width: 12px; color: var(--text-3); font-size: 11px; flex-shrink: 0; }
+.ft-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1;
+}
+.ft-file .ft-name { color: var(--text-2); }
+.ft-file.playing .ft-name { color: var(--accent); }
+.ft-file svg { color: var(--text-3); flex-shrink: 0; }
+.ft-count, .ft-dur {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-3);
+  flex-shrink: 0;
+}
+.ft-file .badge { flex-shrink: 0; }
+
 /* ── Artist detail hero ── */
 .artist-hero {
   display: flex;

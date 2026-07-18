@@ -264,9 +264,23 @@ function packDop(channelBytes, markerPhase) {
   return { buffer: Buffer.from(out.buffer), markerPhase: phase & 1 };
 }
 
+// Benign RtAudio chatter that must never surface as a user-facing error,
+// regardless of which path it arrives through.
+const BENIGN_ERROR_RE = /no open stream|no compiled support|searching for a working|stream was closed/i;
+
 class NativeAudioEngine {
   constructor(emit) {
-    this.emit = emit; // (channel, payload) → webContents.send
+    this.rawEmit = emit;
+    this.emit = (channel, payload) => {
+      if (channel === 'native:error') {
+        if (!payload?.message || BENIGN_ERROR_RE.test(payload.message)) return;
+        // errors during a config-change restart shouldn't advance the queue
+        if (Date.now() < (this.restartUntil || 0)) payload = { ...payload, transient: true };
+      }
+      this.rawEmit(channel, payload);
+    };
+    this.restartUntil = 0;
+    this._enumCache = new Map(); // key → { at, value }
     this.rt = null;
     this.stream = null;      // { api, deviceId, sampleRate, channels, bitPerfect, frameSize, bytesPerSample }
     this.decoder = null;     // current ffmpeg child
@@ -303,23 +317,62 @@ class NativeAudioEngine {
 
   get available() { return !!(audify && ffmpegPath); }
 
+  // The bundled Windows ffmpeg lacks libsoxr (the Linux build has it), so
+  // probe once and fall back to swresample with a large filter when absent.
+  async probeSoxr() {
+    if (this._soxr !== undefined) return this._soxr;
+    this._soxr = await new Promise((resolve) => {
+      try {
+        const child = spawn(ffmpegPath, ['-v', 'error', '-f', 'lavfi', '-i', 'anullsrc=r=48000:d=0.05',
+          '-af', 'aresample=44100:resampler=soxr', '-f', 'null', '-'], { stdio: 'ignore' });
+        child.on('close', (code) => resolve(code === 0));
+        child.on('error', () => resolve(false));
+        setTimeout(() => { try { child.kill(); } catch { /* done */ } resolve(false); }, 5000);
+      } catch { resolve(false); }
+    });
+    return this._soxr;
+  }
+
+  _resampleFilter(rate) {
+    const c = this.config;
+    return this._soxr
+      ? `aresample=${rate}:resampler=soxr:precision=${c.resample?.precision || 28}`
+      : `aresample=${rate}:filter_size=256:cutoff=0.96`;
+  }
+
+  _cached(key, compute) {
+    const hit = this._enumCache.get(key);
+    if (hit && Date.now() - hit.at < 30000) return hit.value;
+    const value = compute();
+    this._enumCache.set(key, { at: Date.now(), value });
+    return value;
+  }
+
   listApis() {
     if (!this.available) return [];
-    const apis = [];
-    for (const [name, id] of Object.entries(audify.RtAudioApi)) {
-      if (name === 'UNSPECIFIED' || name === 'RTAUDIO_DUMMY') continue;
-      try {
-        const rt = makeRtAudio(id);
-        if (rt.getDevices().filter((d) => d.outputChannels > 0).length > 0) {
-          apis.push({ id, name, label: API_LABELS[name] || name });
-        }
-      } catch { /* API not functional on this machine */ }
-    }
-    return apis;
+    // Cached: probing constructs throwaway RtAudio instances whose destructors
+    // fire closeStream() warnings — keep the churn to once per 30s.
+    return this._cached('apis', () => {
+      const apis = [];
+      for (const [name, id] of Object.entries(audify.RtAudioApi)) {
+        if (name === 'UNSPECIFIED' || name === 'RTAUDIO_DUMMY') continue;
+        try {
+          const rt = makeRtAudio(id);
+          if (rt.getDevices().filter((d) => d.outputChannels > 0).length > 0) {
+            apis.push({ id, name, label: API_LABELS[name] || name });
+          }
+        } catch { /* API not functional on this machine */ }
+      }
+      return apis;
+    });
   }
 
   listDevices(apiId) {
     if (!this.available) return [];
+    return this._cached('devices:' + apiId, () => this._listDevicesUncached(apiId));
+  }
+
+  _listDevicesUncached(apiId) {
     try {
       const rt = makeRtAudio(apiId);
       return rt.getDevices()
@@ -351,10 +404,15 @@ class NativeAudioEngine {
       }
     } catch { /* stream mid-teardown */ }
     if (wasOutput !== this._outputKey() && this.currentTrack) {
-      // output target / pipeline topology changed mid-play: restart in place
+      // output target / pipeline topology changed mid-play: restart in place.
+      // Failures inside this window are flagged transient so the UI doesn't
+      // advance the queue over a settings tweak.
+      this.restartUntil = Date.now() + 2500;
       const pos = this.getPosition();
       const track = this.currentTrack;
-      this.play(track, pos).catch(() => {});
+      this.play(track, pos).catch((err) => {
+        this.emit('native:error', { message: err.message });
+      });
     } else if (this.dspState) {
       this._buildDsp(this.dspState.fs, this.dspState.channels);
     }
@@ -450,7 +508,7 @@ class NativeAudioEngine {
     const outRate = (c.resample?.mode === 'rate' && c.resample.rate)
       ? c.resample.rate
       : decodeRate;
-    return { mode: 'dsp', channels, outRate, format: c.outputFormat || 'f32' };
+    return { mode: 'dsp', channels, outRate, decodeRate, format: c.outputFormat || 'f32' };
   }
 
   async play(track, startAt = 0) {
@@ -498,6 +556,7 @@ class NativeAudioEngine {
       ? null
       : new Quantizer({ s16: 16, s24: 24, s32: 32 }[wireFormat], plan.channels, c.dither || 'off');
 
+    await this.probeSoxr();
     if (plan.mode === 'dop') this._startDopReader(track, startAt, plan);
     else this._spawnDecoder(track, startAt, plan);
 
@@ -631,18 +690,23 @@ class NativeAudioEngine {
       args.push('-map', 'a:0', '-ac', String(plan.channels),
         '-f', 's32le', '-acodec', 'pcm_s32le');
     } else {
-      // SoX resampler for any rate conversion; afir for impulse-response
-      // room correction — both at C speed inside ffmpeg, feeding the float64
-      // chain. Explicit soxr even at unity rate keeps the graph predictable.
-      const soxr = `aresample=${plan.outRate}:resampler=soxr:precision=${c.resample?.precision || 28}`;
+      // Rate conversion (soxr when available, high-quality swr otherwise) and
+      // afir impulse-response convolution, at C speed inside ffmpeg.
+      const decodeRate = plan.decodeRate || plan.outRate;
+      const needsResample = plan.outRate !== decodeRate;
+      const layout = plan.channels === 1 ? 'mono' : 'stereo';
       if (irPath) {
+        const main = (needsResample ? this._resampleFilter(plan.outRate) + ',' : '') +
+          `aformat=channel_layouts=${layout}:sample_rates=${plan.outRate}`;
         args.push('-filter_complex',
-          `[0:a]${soxr},aformat=channel_layouts=${plan.channels === 1 ? 'mono' : 'stereo'}[a];` +
-          `[1:a]aresample=${plan.outRate},aformat=channel_layouts=${plan.channels === 1 ? 'mono' : 'stereo'}[ir];` +
+          `[0:a]${main}[a];` +
+          `[1:a]aresample=${plan.outRate},aformat=channel_layouts=${layout}[ir];` +
           `[a][ir]afir[out]`,
           '-map', '[out]');
+      } else if (needsResample) {
+        args.push('-map', 'a:0', '-af', this._resampleFilter(plan.outRate), '-ac', String(plan.channels));
       } else {
-        args.push('-map', 'a:0', '-af', soxr, '-ac', String(plan.channels));
+        args.push('-map', 'a:0', '-ac', String(plan.channels), '-ar', String(plan.outRate));
       }
       args.push('-f', 'f64le', '-acodec', 'pcm_f64le');
     }
@@ -795,8 +859,9 @@ class NativeAudioEngine {
   _fill(initial = false) {
     if (!this.playing || !this.stream) return;
     if (this.stream.backend === 'wasapi-ex') {
-      // interval-driven: top the addon's ring buffer up to ~4 device buffers
-      const target = this.stream.frameSize * 4;
+      // interval-driven: keep ~250ms in the addon ring — a JS timer can jitter
+      // tens of ms under load, and exclusive-mode underruns are audible pops
+      const target = Math.max(this.stream.frameSize * 4, Math.round(this.stream.outRate * 0.25));
       while (this.pcmQueue.length > 0 && this._outQueuedFrames() < target) {
         this._outWrite(this.pcmQueue.shift());
         this.framesWritten++;
@@ -875,8 +940,10 @@ class NativeAudioEngine {
       if (t.dsd) stages.push({ kind: 'dsp', quality: 'lossless', label: 'DSD → PCM', detail: '176.4 kHz' });
       const decodeRate = t.dsd ? 176400 : (t.sampleRate || 44100);
       if (s.outRate !== decodeRate) {
-        stages.push({ kind: 'dsp', quality: 'enhanced', label: 'SoX resampler',
-          detail: `${decodeRate / 1000} kHz → ${s.outRate / 1000} kHz · ${c.resample?.precision || 28}-bit precision` });
+        stages.push({ kind: 'dsp', quality: 'enhanced',
+          label: this._soxr ? 'SoX resampler' : 'SWR resampler',
+          detail: `${decodeRate / 1000} kHz → ${s.outRate / 1000} kHz · ` +
+                  (this._soxr ? `${c.resample?.precision || 28}-bit precision` : 'filter 256') });
       }
       if (c.replayGain !== 'off') {
         stages.push({ kind: 'dsp', quality: 'enhanced', label: 'ReplayGain', detail: c.replayGain + ' gain' });

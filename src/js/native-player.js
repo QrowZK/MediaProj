@@ -56,7 +56,7 @@ export class NativeEngineProxy {
       }),
       window.auralis.native.on('native:state', (s) => { this.paused = !s.playing; }),
       window.auralis.native.on('native:error', (e) =>
-        this.onError?.(this.currentTrack, e.message)),
+        this.onError?.(this.currentTrack, e.message, e.transient)),
       window.auralis.native.on('native:viz', (v) => {
         this._levels = v.levels;
         this._spectrum.set(v.spectrum.slice(0, 512));
