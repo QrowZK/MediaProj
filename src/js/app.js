@@ -46,7 +46,16 @@ function attachEngineCallbacks(e) {
 async function switchEngine(useNative) {
   const playingTrack = engine.currentTrack;
   const pos = engine.currentTime;
-  engine.pause();
+  // Fully release the departing engine's output device — pausing is not
+  // enough: a native stream (especially WASAPI-exclusive) keeps the endpoint
+  // locked, leaving the other engine silent until the app restarts.
+  if (engine === nativeEngine && nativeEngine) {
+    try { await window.auralis.native.stop(); } catch { /* already down */ }
+    nativeEngine.currentTrack = null;
+    nativeEngine.paused = true;
+  } else {
+    webEngine.pause();
+  }
   if (useNative) {
     if (!nativeEngine) nativeEngine = new NativeEngineProxy();
     engine = nativeEngine;
@@ -64,10 +73,17 @@ async function switchEngine(useNative) {
   engine.setReplayGainMode(webEngine.replayGainMode);
   engine.setSpeakerCorrection?.(correctionConfig());
   if (playingTrack) {
-    const ok = await engine.play(playingTrack);
-    if (ok) {
-      onTrackStarted(playingTrack);
-      if (pos > 1) engine.seek(pos);
+    try {
+      const ok = await engine.play(playingTrack);
+      if (ok) {
+        onTrackStarted(playingTrack);
+        if (pos > 1) engine.seek(pos);
+      } else {
+        updatePlayButton(false);
+      }
+    } catch (err) {
+      updatePlayButton(false);
+      toast('Engine switch: playback could not resume — press play to retry', true);
     }
   }
 }
@@ -201,7 +217,7 @@ function render() {
     albums: renderAlbums, album: renderAlbumDetail, artists: renderArtists,
     artist: renderArtistDetail, tracks: renderTracksView, genres: renderGenres,
     genre: renderGenreDetail, playlist: renderPlaylist, settings: renderSettings,
-    mostplayed: renderMostPlayed,
+    mostplayed: renderMostPlayed, folders: renderFolders,
   };
   (views[state.view] || renderAlbums)();
   renderSidebarPlaylists();
@@ -502,6 +518,118 @@ function renderMostPlayed() {
     ${trackTable(ranked, { extraCol: { header: 'Plays', value: (t) => plays[t.id] || 0 } })}`;
   $('#mp-play').addEventListener('click', () => playTracks(ranked, 0));
   bindTrackTable(ranked);
+}
+
+// ── Folders (file tree) ──
+
+const folderExpanded = new Set(); // persisted for the session
+
+function buildFolderTree() {
+  const sep = state.library.tracks[0]?.path.includes('\\') ? '\\' : '/';
+  const roots = new Map();
+  const nodeFor = (dirPath, name, parent) => {
+    const map = parent ? parent.dirs : roots;
+    if (!map.has(name)) map.set(name, { name, path: dirPath, dirs: new Map(), tracks: [] });
+    return map.get(name);
+  };
+  const libRoots = (state.library.folders || []).slice()
+    .sort((a, b) => b.length - a.length);
+  for (const t of state.library.tracks) {
+    const root = libRoots.find((f) => t.path.startsWith(f));
+    const rootName = root ? root.split(sep).filter(Boolean).pop() : sep;
+    const rel = root ? t.path.slice(root.length).replace(/^[\\/]/, '') : t.path;
+    const parts = rel.split(sep);
+    let node = nodeFor(root || sep, rootName || sep, null);
+    for (let i = 0; i < parts.length - 1; i++) {
+      node = nodeFor(node.path + sep + parts[i], parts[i], node);
+    }
+    node.tracks.push(t);
+  }
+  return roots;
+}
+
+function renderFolderNode(node, depth) {
+  const open = folderExpanded.has(node.path);
+  const count = countTracks(node);
+  let html = `
+    <div class="ft-row ft-dir" data-path="${esc(node.path)}" style="padding-left:${10 + depth * 20}px">
+      <span class="ft-arrow">${open ? '▾' : '▸'}</span>
+      <svg viewBox="0 0 24 24" width="15" height="15"><path d="M3 6a2 2 0 0 1 2-2h4l2 2.5h8a2 2 0 0 1 2 2V18a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
+      <span class="ft-name">${esc(node.name)}</span>
+      <span class="ft-count">${count}</span>
+    </div>`;
+  if (open) {
+    for (const child of [...node.dirs.values()].sort((a, b) => a.name.localeCompare(b.name))) {
+      html += renderFolderNode(child, depth + 1);
+    }
+    const sorted = [...node.tracks].sort((a, b) => a.path.localeCompare(b.path));
+    for (const t of sorted) {
+      const isCurrent = t.id === engine.currentTrack?.id;
+      html += `
+        <div class="ft-row ft-file ${isCurrent ? 'playing' : ''}" data-id="${t.id}" data-dir="${esc(node.path)}"
+             style="padding-left:${10 + (depth + 1) * 20 + 14}px">
+          <svg viewBox="0 0 24 24" width="13" height="13"><path d="M9 18V5.5L20 3v12.2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><circle cx="6.6" cy="18.2" r="2.4" fill="currentColor"/><circle cx="17.6" cy="15.4" r="2.4" fill="currentColor"/></svg>
+          <span class="ft-name">${esc(t.path.split(/[\\/]/).pop())}</span>
+          <span class="badge ${qualityBadgeClass(t)}">${esc(shortFmt(t))}</span>
+          <span class="ft-dur">${fmtTime(t.duration)}</span>
+        </div>`;
+    }
+  }
+  return html;
+}
+
+function countTracks(node) {
+  let n = node.tracks.length;
+  for (const child of node.dirs.values()) n += countTracks(child);
+  return n;
+}
+
+function renderFolders() {
+  if (!state.library.tracks.length) {
+    content.innerHTML = emptyLibraryMarkup(); bindEmptyCta(); return;
+  }
+  const roots = buildFolderTree();
+  // roots start expanded on first visit
+  if (folderExpanded.size === 0) {
+    for (const r of roots.values()) folderExpanded.add(r.path);
+  }
+  let html = `
+    <div class="view-header">
+      <span class="view-title">Folders</span>
+      <span class="view-sub">your library on disk</span>
+    </div>
+    <div class="folder-tree">`;
+  for (const root of [...roots.values()].sort((a, b) => a.name.localeCompare(b.name))) {
+    html += renderFolderNode(root, 0);
+  }
+  content.innerHTML = html + '</div>';
+
+  content.querySelectorAll('.ft-dir').forEach((row) =>
+    row.addEventListener('click', () => {
+      const p = row.dataset.path;
+      folderExpanded.has(p) ? folderExpanded.delete(p) : folderExpanded.add(p);
+      renderFolders();
+    }));
+
+  const byId = new Map(state.library.tracks.map((t) => [t.id, t]));
+  const tracksInDir = (dirPath) => state.library.tracks
+    .filter((t) => t.path.startsWith(dirPath) &&
+      !t.path.slice(dirPath.length + 1).match(/[\\/]/))
+    .sort((a, b) => a.path.localeCompare(b.path));
+
+  content.querySelectorAll('.ft-file').forEach((row) => {
+    row.addEventListener('dblclick', () => {
+      const siblings = tracksInDir(row.dataset.dir);
+      const idx = siblings.findIndex((t) => t.id === row.dataset.id);
+      if (idx >= 0) playTracks(siblings, idx);
+    });
+    row.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      const siblings = tracksInDir(row.dataset.dir);
+      const idx = siblings.findIndex((t) => t.id === row.dataset.id);
+      if (idx >= 0) openTrackMenu(e, siblings, idx);
+    });
+  });
 }
 
 // ── Artists ──
@@ -1130,7 +1258,7 @@ async function renderSettings() {
               ${[128, 256, 512, 1024, 2048].map((b) => `<option value="${b}" ${(state.settings.nativeOutput?.bufferSize || 512) === b ? 'selected' : ''}>${b}</option>`).join('')}
             </select>
           </div>
-          <div class="hint" id="native-status" style="padding-top:8px"></div>
+          <div class="hint keep" id="native-status" style="padding-top:8px"></div>
         </div>
       </div>
 
@@ -1186,7 +1314,7 @@ async function renderSettings() {
         </div>
         <div class="setting-row" style="padding-top:0">
           <div><div class="lbl">Impulse response (convolution)</div>
-            <div class="hint" id="ir-name">${state.settings.speakerCorrection?.irName
+            <div class="hint keep" id="ir-name">${state.settings.speakerCorrection?.irName
               ? esc(state.settings.speakerCorrection.irName)
               : 'No impulse response loaded.'}</div></div>
           <div style="display:flex;gap:8px">
@@ -1199,7 +1327,7 @@ async function renderSettings() {
 
       <div class="settings-card">
         <h3>About &amp; Updates</h3>
-        <div class="desc" id="about-version">
+        <div class="desc keep" id="about-version">
           Auralis — a lossless-first library and player for people who hear the difference.
         </div>
         <div class="setting-row">
@@ -1813,13 +1941,14 @@ function engineOnTrackEnd() {
 
 let lastErrorToast = { msg: '', at: 0 };
 
-function engineOnError(track, msg) {
+function engineOnError(track, msg, transient = false) {
   // identical errors within a short window collapse into one toast
   const now = Date.now();
   if (msg !== lastErrorToast.msg || now - lastErrorToast.at > 8000) {
     toast(`${track ? `“${track.title}” — ` : ''}${msg}`, true);
   }
   lastErrorToast = { msg, at: now };
+  if (transient) return; // settings-change hiccup: never skip the song over it
   // auto-advance past undecodable file
   const idx = nextIndex();
   if (idx >= 0 && idx !== state.queueIndex) {
@@ -2173,7 +2302,13 @@ function syncLyrics(time) {
   const el = scroll.querySelector(`.lyric-line[data-i="${idx}"]`);
   if (el) {
     el.classList.add('active');
-    el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    // scroll ONLY the lyrics container — scrollIntoView also scrolls the
+    // overflow:hidden ancestors (#now-playing), dragging the collapse
+    // button and the whole overlay out of position
+    scroll.scrollTo({
+      top: el.offsetTop - scroll.clientHeight / 2 + el.clientHeight / 2,
+      behavior: 'smooth',
+    });
   }
 }
 
@@ -2184,6 +2319,8 @@ function toggleNowPlaying(show) {
   const shouldShow = show ?? np.classList.contains('hidden');
   np.classList.toggle('hidden', !shouldShow);
   if (shouldShow) {
+    np.scrollTop = 0; // undo any stray ancestor scroll from past scrollIntoView
+    np.scrollLeft = 0;
     spectrum.start();
     if (engine.currentTrack && lyricsState.trackId !== engine.currentTrack.id) {
       refreshLyrics(engine.currentTrack);

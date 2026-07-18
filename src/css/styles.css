@@ -494,6 +494,41 @@ table.tracks .t-fmt { width: 120px; }
 .pill-item:hover { border-color: var(--accent-2); color: var(--accent); background: var(--accent-soft); }
 .pill-item .cnt { color: var(--text-3); font-size: 11.5px; margin-left: 7px; font-family: var(--mono); }
 
+/* ── Folder tree ── */
+.folder-tree { font-size: 13px; }
+.ft-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding-top: 6px;
+  padding-bottom: 6px;
+  padding-right: 12px;
+  border-radius: 7px;
+  cursor: default;
+  color: var(--text-2);
+}
+.ft-row:hover { background: var(--bg-1); }
+.ft-dir { cursor: pointer; color: var(--text-1); }
+.ft-dir svg { color: var(--accent-2); flex-shrink: 0; }
+.ft-arrow { width: 12px; color: var(--text-3); font-size: 11px; flex-shrink: 0; }
+.ft-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1;
+}
+.ft-file .ft-name { color: var(--text-2); }
+.ft-file.playing .ft-name { color: var(--accent); }
+.ft-file svg { color: var(--text-3); flex-shrink: 0; }
+.ft-count, .ft-dur {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-3);
+  flex-shrink: 0;
+}
+.ft-file .badge { flex-shrink: 0; }
+
 /* ── Artist detail hero ── */
 .artist-hero {
   display: flex;
@@ -582,6 +617,11 @@ table.tracks .t-fmt { width: 120px; }
   border-radius: var(--radius);
   padding: 20px 22px;
 }
+/* Settings are name-only: explanatory copy is hidden except functional
+   status lines marked .keep (loaded IR name, connection status, version). */
+.settings-card .desc:not(.keep),
+.settings-card .hint:not(.keep) { display: none; }
+
 .settings-card h3 {
   font-size: 15px;
   font-weight: 650;
@@ -829,15 +869,21 @@ select.styled:focus { border-color: var(--accent-2); }
 #np-collapse {
   position: absolute;
   top: 18px; right: 22px;
-  z-index: 3;
-  width: 38px; height: 38px;
+  z-index: 10; /* above the lyrics column, which stretches into this corner */
+  width: 40px; height: 40px;
   border-radius: 50%;
-  background: rgba(255,255,255,0.06);
+  background: rgba(16, 18, 24, 0.75);
+  backdrop-filter: blur(10px);
   border: 1px solid var(--line-strong);
-  color: var(--text-2);
+  color: var(--text-1);
   display: grid; place-items: center;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
 }
-#np-collapse:hover { color: var(--text-1); background: rgba(255,255,255,0.12); }
+#np-collapse:hover {
+  color: var(--accent);
+  border-color: var(--accent-2);
+  background: rgba(16, 18, 24, 0.9);
+}
 
 .np-content {
   position: relative;
@@ -870,7 +916,8 @@ select.styled:focus { border-color: var(--accent-2); }
   width: 0;
   opacity: 0;
   overflow: hidden;
-  align-self: stretch;
+  align-self: center;
+  max-height: 72vh;
   display: flex;
   flex-direction: column;
   justify-content: center;
@@ -970,7 +1017,9 @@ select.styled:focus { border-color: var(--accent-2); }
   align-items: center;
   gap: 13px;
   width: 300px;
-  min-width: 220px;
+  min-width: 170px;
+  flex-shrink: 1.4;
+  overflow: hidden;
 }
 #pb-art {
   width: 58px; height: 58px;
@@ -1008,6 +1057,7 @@ select.styled:focus { border-color: var(--accent-2); }
   align-items: center;
   gap: 7px;
   max-width: 640px;
+  min-width: 260px;
   margin: 0 auto;
 }
 .pb-buttons { display: flex; align-items: center; gap: 6px; }
@@ -1111,10 +1161,24 @@ select.styled:focus { border-color: var(--accent-2); }
   display: flex;
   align-items: center;
   gap: 8px;
-  width: 300px;
-  min-width: 240px;
+  width: auto;
+  max-width: 40%;
+  min-width: 0;
+  flex-shrink: 1;
   justify-content: flex-end;
+  overflow: hidden;
 }
+
+/* Narrow windows: shed the badge text and meters before anything overlaps */
+@media (max-width: 1200px) { #vu-meter { display: none; } }
+@media (max-width: 1060px) {
+  #pb-quality {
+    max-width: 26px;
+    padding-right: 4px;
+    color: transparent; /* keep only the verdict dot */
+  }
+}
+@media (max-width: 920px) { #pb-quality { display: none; } }
 
 #pb-quality {
   font-family: var(--mono);
@@ -1128,7 +1192,16 @@ select.styled:focus { border-color: var(--accent-2); }
   white-space: nowrap;
 }
 #pb-quality:empty { display: none; }
-#pb-quality { cursor: pointer; position: relative; padding-left: 18px; transition: border-color 0.2s; }
+#pb-quality {
+  cursor: pointer;
+  position: relative;
+  padding-left: 18px;
+  transition: border-color 0.2s;
+  max-width: 190px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex-shrink: 1;
+}
 #pb-quality::before {
   content: "";
   position: absolute;
