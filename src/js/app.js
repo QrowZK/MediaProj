@@ -2410,13 +2410,17 @@ const lyricsState = { trackId: null, lines: [], synced: false, activeIdx: -1 };
 
 function parseLrc(text) {
   const lines = [];
+  // [offset:+500] shifts every stamp 500 ms earlier (LRC convention)
+  const offTag = text.match(/\[offset:\s*([+-]?\d+)\s*\]/i);
+  const offset = offTag ? Number(offTag[1]) / 1000 : 0;
   for (const raw of text.split(/\r?\n/)) {
     const stamps = [...raw.matchAll(/\[(\d{1,2}):(\d{2})(?:[.:](\d{1,3}))?\]/g)];
     const content = raw.replace(/\[[^\]]*\]/g, '').trim();
     if (!stamps.length) continue;
     for (const m of stamps) {
       const cs = (m[3] || '0').padEnd(3, '0').slice(0, 3);
-      lines.push({ time: Number(m[1]) * 60 + Number(m[2]) + Number(cs) / 1000, text: content });
+      const t = Number(m[1]) * 60 + Number(m[2]) + Number(cs) / 1000 - offset;
+      lines.push({ time: Math.max(0, t), text: content });
     }
   }
   return lines.filter((l) => l.text).sort((a, b) => a.time - b.time);
@@ -2480,18 +2484,33 @@ async function refreshLyrics(track) {
   np.classList.add('with-lyrics');
 }
 
+let lyricsUserScrollUntil = 0;
+$('#np-lyrics-scroll').addEventListener('wheel', () => {
+  lyricsUserScrollUntil = Date.now() + 3500;
+}, { passive: true });
+
 function syncLyrics(time) {
   if (!lyricsState.synced || !lyricsState.lines.length) return;
   if ($('#now-playing').classList.contains('hidden')) return;
   let idx = lyricsState.lines.findIndex((l) => l.time > time) - 1;
   if (idx === -2) idx = lyricsState.lines.length - 1; // past the last stamp
-  if (idx === lyricsState.activeIdx || idx < 0) return;
-  lyricsState.activeIdx = idx;
   const scroll = $('#np-lyrics-scroll');
+  if (idx < 0) {
+    // seeked back before the first stamp — clear the stale highlight
+    if (lyricsState.activeIdx !== -1) {
+      lyricsState.activeIdx = -1;
+      scroll.querySelector('.lyric-line.active')?.classList.remove('active');
+    }
+    return;
+  }
+  if (idx === lyricsState.activeIdx) return;
+  lyricsState.activeIdx = idx;
   scroll.querySelector('.lyric-line.active')?.classList.remove('active');
   const el = scroll.querySelector(`.lyric-line[data-i="${idx}"]`);
   if (el) {
     el.classList.add('active');
+    // let a manual scroll settle instead of yanking the view back every line
+    if (Date.now() < lyricsUserScrollUntil) return;
     // scroll ONLY the lyrics container — scrollIntoView also scrolls the
     // overflow:hidden ancestors (#now-playing), dragging the collapse
     // button and the whole overlay out of position
@@ -2743,6 +2762,14 @@ $('#mini-seek').addEventListener('pointerdown', (e) => {
   const rect = $('#mini-seek').getBoundingClientRect();
   const frac = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
   engine.seek(frac * engine.duration);
+});
+
+// A mouse click leaves the button focused, and any later keypress (Space =
+// play/pause) makes Chromium promote that focus to a visible glow ring that
+// then sticks. Blur after real pointer clicks; keyboard activation
+// (e.detail === 0) keeps its focus ring for accessibility.
+document.addEventListener('click', (e) => {
+  if (e.detail > 0) e.target.closest('button')?.blur();
 });
 
 // ── Window controls ──
