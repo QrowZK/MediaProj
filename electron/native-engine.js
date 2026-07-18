@@ -517,6 +517,12 @@ class NativeAudioEngine {
 
   async play(track, startAt = 0, gaplessJoin = false) {
     if (!this.available) throw new Error('Native output backend not available');
+    // Overlap guard: a second play() (seek/track pick) can interleave at the
+    // probeSoxr await below — its stopDecoder() runs before WE assign
+    // this.decoder, so our child would leak and decode the whole file into
+    // the void. The newest call wins; stale calls abort before spawning.
+    this._playSeq = (this._playSeq || 0) + 1;
+    const seq = this._playSeq;
     this.stopDecoder();
     this.pcmQueue = [];
     this.residual = Buffer.alloc(0);
@@ -571,6 +577,7 @@ class NativeAudioEngine {
       : new Quantizer({ s16: 16, s24: 24, s32: 32 }[wireFormat], plan.channels, c.dither || 'off');
 
     await this.probeSoxr();
+    if (seq !== this._playSeq) return; // superseded while awaiting — don't spawn
     if (plan.mode === 'dop') this._startDopReader(track, startAt, plan);
     else this._spawnDecoder(track, startAt, plan);
 
@@ -633,7 +640,11 @@ class NativeAudioEngine {
       { deviceId, nChannels: plan.channels, firstChannel: 0 },
       null, format, plan.outRate, c.bufferSize || 512, 'Auralis',
       null,
-      () => { depth.consumed++; this._pump(); },
+      // consumed < written guard: audify queues these callbacks via TSFN, so
+      // a pop that happened just before an _outFlush can arrive after the
+      // written=consumed reconcile — counting it would skew the depth
+      // accounting (and the position clock) until the next flush.
+      () => { if (depth.consumed < depth.written) depth.consumed++; this._pump(); },
       flags,
       (type, msg) => {
         if (RTAUDIO_WARNING_TYPES.has(type)) return; // warnings are not errors
@@ -1094,9 +1105,18 @@ class NativeAudioEngine {
 
   resume() {
     if (!this.stream || !this.currentTrack) return false;
+    if (!this.decoder && !this.dop) {
+      // Natural end already tore the decoder down (and stopped the progress
+      // timer that hosts the underrun watchdog) — a bare resume would sit in
+      // 'playing' silence forever. Restart the track properly instead.
+      this.play(this.currentTrack, 0)
+        .catch((err) => this.emit('native:error', { message: err.message }));
+      return true;
+    }
     this.playing = true;
     this._outStart();
     this._primeQueue();
+    this._startProgress();
     this.emit('native:state', { playing: true });
     return true;
   }
@@ -1107,6 +1127,11 @@ class NativeAudioEngine {
     this.play(track, Math.max(0, time)).catch(() => {});
   }
 
+  // Kills the decoder ONLY. Deliberately does NOT touch the device queue:
+  // on a gapless join the queued tail of the outgoing track must keep
+  // playing, and clearing audify's queue without reconciling the depth
+  // counters strands phantom depth that stalls _fill forever. Device
+  // flushing is _outFlush's job (seek / new track), which reconciles.
   stopDecoder() {
     if (this.decoder) {
       const d = this.decoder;
@@ -1114,10 +1139,6 @@ class NativeAudioEngine {
       try { d.kill('SIGKILL'); } catch { /* gone */ }
     }
     if (this.dop) { this.dop.cancelled = true; this.dop = null; }
-    if (this.rt) { try { if (this.rt.isStreamOpen()) this.rt.clearOutputQueue(); } catch { /* fine */ } }
-    if (this.stream?.backend === 'wasapi-ex' && this.wexHandle != null) {
-      try { wasapiEx.clear(this.wexHandle); } catch { /* fine */ }
-    }
   }
 
   stopAll() {
