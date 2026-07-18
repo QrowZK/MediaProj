@@ -528,10 +528,15 @@ class NativeAudioEngine {
     const useWex = c.wasapiExclusive && wasapiEx;
     if (useWex && plan.format === 'f32') plan.format = 's32';
 
+    // mode MUST be part of this check: bit-perfect and s32-DSP share a wire
+    // format, but the byte parser, quantizer, volume, and viz all branch on
+    // mode — reusing the stream across a mode flip feeds f64 bytes into an
+    // s32 parser (loud static) and strands the volume/meters.
     const needOpen = !this.stream ||
       this.stream.outRate !== plan.outRate ||
       this.stream.channels !== plan.channels ||
       this.stream.format !== plan.format ||
+      this.stream.mode !== plan.mode ||
       this.stream.backend !== (useWex ? 'wasapi-ex' : 'rtaudio');
     if (needOpen) {
       try {
@@ -565,6 +570,10 @@ class NativeAudioEngine {
     this._primeQueue();
     this._startProgress();
     this.emit('native:state', { playing: true });
+    if (plan.mode !== 'dsp') {
+      // no DSP taps on this path — blank the meters instead of freezing them
+      this.emit('native:viz', { levels: [0, 0], spectrum: new Array(512).fill(0) });
+    }
     this._emitSignalPath();
   }
 
@@ -579,7 +588,9 @@ class NativeAudioEngine {
         sampleRate: plan.outRate,
         channels: plan.channels,
         bits: plan.format === 's16' ? 16 : plan.format === 's24' ? 24 : 32,
-        bufferMs: Math.max(10, Math.round((c.bufferSize || 512) / plan.outRate * 1000)),
+        // generous device period: exclusive-mode underruns are audible pops
+        // and music playback doesn't need sub-50ms latency
+        bufferMs: Math.max(50, Math.round((c.bufferSize || 512) / plan.outRate * 1000)),
       });
       this.wexHandle = res.handle;
       this.stream = {
@@ -625,11 +636,14 @@ class NativeAudioEngine {
 
   _outStart() {
     if (this.stream?.backend === 'wasapi-ex') {
-      wasapiEx.start(this.wexHandle);
+      // Don't start the device on an empty ring — that guarantees an initial
+      // burst of underrun pops on every play/seek/format change. The pump
+      // starts the clock once the ring is half-primed.
+      this.wexStarted = false;
       if (!this.wexPump) {
-        // keep ~4 device buffers queued; the addon ring absorbs jitter
         this.wexPump = setInterval(() => this._fill(), 10);
       }
+      this._fill();
     } else if (this.rt && !this.rt.isStreamRunning()) {
       this.rt.start();
     }
@@ -865,6 +879,13 @@ class NativeAudioEngine {
       while (this.pcmQueue.length > 0 && this._outQueuedFrames() < target) {
         this._outWrite(this.pcmQueue.shift());
         this.framesWritten++;
+      }
+      // start the device clock only once half the target is buffered (or the
+      // decode already finished and this is all the audio there is)
+      if (!this.wexStarted &&
+          (this._outQueuedFrames() >= target / 2 || (this.decodeEnded && this.pcmQueue.length === 0))) {
+        this.wexStarted = true;
+        try { wasapiEx.start(this.wexHandle); } catch { /* already running */ }
       }
     } else {
       if (!this.rt) return;
