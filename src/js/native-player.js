@@ -54,7 +54,14 @@ export class NativeEngineProxy {
           this.onTrackStarted?.(track);
         }
       }),
-      window.auralis.native.on('native:state', (s) => { this.paused = !s.playing; }),
+      window.auralis.native.on('native:state', (s) => {
+        this.paused = !s.playing;
+        if (!s.playing) {
+          // no more viz events will arrive — don't leave the meters frozen lit
+          this._levels = [0, 0];
+          this._spectrum.fill(0);
+        }
+      }),
       window.auralis.native.on('native:error', (e) =>
         this.onError?.(this.currentTrack, e.message, e.transient)),
       window.auralis.native.on('native:viz', (v) => {

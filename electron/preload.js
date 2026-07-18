@@ -36,6 +36,28 @@ contextBridge.exposeInMainWorld('auralis', {
   dsp: {
     chooseIr: () => ipcRenderer.invoke('dsp:choose-ir'),
   },
+  upnp: {
+    serverConfig: (partial) => ipcRenderer.invoke('upnp:server-config', partial),
+    serverStatus: () => ipcRenderer.invoke('upnp:server-status'),
+    playlistsSnapshot: (s) => ipcRenderer.invoke('upnp:playlists-snapshot', s),
+    discoverRenderers: () => ipcRenderer.invoke('upnp:discover-renderers'),
+    zoneSelect: (location) => ipcRenderer.invoke('upnp:zone-select', location),
+    zonePlay: (track, startAt) => ipcRenderer.invoke('upnp:zone-play', track, startAt),
+    zonePause: () => ipcRenderer.invoke('upnp:zone-pause'),
+    zoneResume: () => ipcRenderer.invoke('upnp:zone-resume'),
+    zoneSeek: (s) => ipcRenderer.invoke('upnp:zone-seek', s),
+    zoneSetNext: (track) => ipcRenderer.invoke('upnp:zone-set-next', track),
+    zoneVolume: (v) => ipcRenderer.invoke('upnp:zone-volume', v),
+    zoneStop: () => ipcRenderer.invoke('upnp:zone-stop'),
+    on: (channel, cb) => {
+      const allowed = ['upnp:progress', 'upnp:track-ended', 'upnp:track-changed',
+                       'upnp:state', 'upnp:error'];
+      if (!allowed.includes(channel)) return () => {};
+      const listener = (_e, data) => cb(data);
+      ipcRenderer.on(channel, listener);
+      return () => ipcRenderer.removeListener(channel, listener);
+    },
+  },
   native: {
     available: () => ipcRenderer.invoke('native:available'),
     capabilities: () => ipcRenderer.invoke('native:capabilities'),

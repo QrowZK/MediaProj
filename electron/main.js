@@ -284,6 +284,8 @@ async function scanFolders(folders) {
 
   const library = { folders, tracks, updated: Date.now() };
   await writeJson(LIBRARY_FILE(), library);
+  cachedLibrary = library;
+  mediaServer?.bumpUpdateId();
   return library;
 }
 
@@ -655,6 +657,130 @@ function registerIpc() {
 }
 
 // ---------------------------------------------------------------------------
+// UPnP/DLNA media server (streamers browse & pull the library)
+// ---------------------------------------------------------------------------
+
+const { MediaServer } = require('./upnp/media-server');
+
+const UPNP_FILE = () => path.join(app.getPath('userData'), 'upnp.json');
+let mediaServer = null;
+let upnpPlaylistSnapshot = [];
+let cachedLibrary = null;
+
+async function getCachedLibrary() {
+  if (!cachedLibrary) cachedLibrary = await readJson(LIBRARY_FILE(), { folders: [], tracks: [] });
+  return cachedLibrary;
+}
+
+function decodeMediaUrl(url) {
+  try {
+    const encoded = new URL(url).pathname.replace(/^\//, '');
+    return Buffer.from(encoded, 'base64url').toString('utf8');
+  } catch { return null; }
+}
+
+function getMediaServer() {
+  if (!mediaServer) {
+    mediaServer = new MediaServer({
+      getLibrary: () => cachedLibrary || { folders: [], tracks: [] },
+      getPlaylists: () => upnpPlaylistSnapshot,
+      evaluatePlaylist: (p) => {
+        const byId = new Map((cachedLibrary?.tracks || []).map((t) => [t.id, t]));
+        return (p.trackIds || []).map((id) => byId.get(id)).filter(Boolean);
+      },
+      decodeMediaUrl,
+    });
+  }
+  return mediaServer;
+}
+
+async function upnpConfig() {
+  const cfg = await readJson(UPNP_FILE(), {});
+  if (!cfg.uuid) {
+    cfg.uuid = crypto.randomUUID();
+    await writeJson(UPNP_FILE(), cfg);
+  }
+  return { enabled: false, name: 'Auralis', port: 47700, ...cfg };
+}
+
+async function applyUpnpConfig(partial) {
+  const cfg = { ...(await upnpConfig()), ...partial };
+  await writeJson(UPNP_FILE(), cfg);
+  const server = getMediaServer();
+  await getCachedLibrary();
+  try {
+    if (cfg.enabled) await server.start({ enabled: true, name: cfg.name, port: cfg.port }, cfg.uuid);
+    else server.stop();
+    return { ok: true, ...server.status() };
+  } catch (err) {
+    server.stop();
+    return { ok: false, error: err.message, running: false };
+  }
+}
+
+// ── network renderer zone (UPnP AV / OpenHome control point) ──
+
+const { RendererEngine, discoverRenderers } = require('./upnp/renderer-client');
+const { trackItemXml } = require('./upnp/media-server');
+const { localIPv4: upnpLocalIp } = require('./upnp/ssdp');
+let rendererEngine = null;
+
+function getRendererEngine() {
+  if (!rendererEngine) {
+    rendererEngine = new RendererEngine((channel, payload) => {
+      mainWindow?.webContents.send(channel, payload);
+    });
+    rendererEngine.buildTrackUrl = (track) => {
+      const base = `http://${upnpLocalIp()}:${getMediaServer().config.port || 47700}`;
+      const t = (cachedLibrary?.tracks || []).find((x) => x.id === track.id) || track;
+      const didl = `<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">${trackItemXml(t, '0', base)}</DIDL-Lite>`;
+      return { uri: `${base}/stream/${encodeURIComponent(t.id)}`, didl };
+    };
+  }
+  return rendererEngine;
+}
+
+// The renderer pulls audio from our HTTP server — make sure it's up even if
+// the user hasn't enabled the media server explicitly (not persisted).
+async function ensureServerForZone() {
+  const server = getMediaServer();
+  if (server.status().running) return;
+  const cfg = await upnpConfig();
+  await getCachedLibrary();
+  await server.start({ name: cfg.name, port: cfg.port }, cfg.uuid);
+}
+
+function registerUpnpIpc() {
+  ipcMain.handle('upnp:server-config', async (_e, partial) => applyUpnpConfig(partial || {}));
+  ipcMain.handle('upnp:server-status', async () => {
+    const cfg = await upnpConfig();
+    return { ...getMediaServer().status(), enabled: cfg.enabled, name: cfg.name, port: cfg.port };
+  });
+  ipcMain.handle('upnp:playlists-snapshot', (_e, snapshot) => {
+    upnpPlaylistSnapshot = Array.isArray(snapshot) ? snapshot : [];
+  });
+
+  ipcMain.handle('upnp:discover-renderers', () => discoverRenderers());
+  ipcMain.handle('upnp:zone-select', async (_e, location) => {
+    if (location) await ensureServerForZone();
+    return getRendererEngine().select(location);
+  });
+  ipcMain.handle('upnp:zone-play', async (_e, track, startAt) => {
+    try {
+      await ensureServerForZone();
+      await getRendererEngine().play(track, startAt || 0);
+      return { ok: true };
+    } catch (err) { return { ok: false, error: err.message }; }
+  });
+  ipcMain.handle('upnp:zone-pause', () => getRendererEngine().pause());
+  ipcMain.handle('upnp:zone-resume', () => getRendererEngine().resume());
+  ipcMain.handle('upnp:zone-seek', (_e, s) => getRendererEngine().seek(s));
+  ipcMain.handle('upnp:zone-set-next', (_e, track) => getRendererEngine().setNext(track));
+  ipcMain.handle('upnp:zone-volume', (_e, v) => getRendererEngine().setVolume(v));
+  ipcMain.handle('upnp:zone-stop', () => getRendererEngine().stopAll());
+}
+
+// ---------------------------------------------------------------------------
 // Native output engine (ASIO / WASAPI / DirectSound via RtAudio + ffmpeg)
 // ---------------------------------------------------------------------------
 
@@ -837,7 +963,10 @@ app.whenReady().then(async () => {
   }
   setupAutoUpdater();
   registerNativeIpc();
+  registerUpnpIpc();
   createWindow();
+  // resume the media server if it was enabled last session
+  upnpConfig().then((cfg) => { if (cfg.enabled) applyUpnpConfig({}); }).catch(() => {});
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
