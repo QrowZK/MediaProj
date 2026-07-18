@@ -685,6 +685,22 @@ function registerNativeIpc() {
   ipcMain.handle('native:set-next', (_e, track) => getNativeEngine().setNext(track));
   ipcMain.handle('native:stop', () => getNativeEngine().stopAll());
   ipcMain.handle('native:position', () => getNativeEngine().getPosition());
+  ipcMain.handle('native:signal-path', () => getNativeEngine().getSignalPath());
+  ipcMain.handle('native:capabilities', () => ({
+    available: getNativeEngine().available,
+    wasapiExclusive: getNativeEngine().wasapiExclusiveAvailable,
+  }));
+
+  ipcMain.handle('dsp:choose-ir', async () => {
+    const res = await dialog.showOpenDialog(mainWindow, {
+      title: 'Load Impulse Response',
+      filters: [{ name: 'Impulse response (WAV)', extensions: ['wav'] }],
+      properties: ['openFile'],
+    });
+    if (res.canceled || !res.filePaths.length) return null;
+    const irPath = res.filePaths[0];
+    return { path: irPath, url: toMediaUrl(irPath), name: path.basename(irPath) };
+  });
 }
 
 // ---------------------------------------------------------------------------

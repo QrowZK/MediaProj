@@ -35,6 +35,13 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # WASAPI exclusive-mode addon (N-API → ABI-stable across Electron)
+      - name: Build WASAPI exclusive addon
+        working-directory: native-addons/wasapi-exclusive
+        run: |
+          npm install
+          npx node-gyp rebuild
+
       # latest.yml (the electron-updater manifest) is emitted here because a
       # github publish provider is configured in package.json.
       - name: Build NSIS installer
