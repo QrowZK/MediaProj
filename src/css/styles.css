@@ -1121,7 +1121,8 @@ select.styled:focus { border-color: var(--accent-2); }
   display: flex;
   align-items: center;
   gap: 8px;
-  width: 300px;
+  width: auto;
+  max-width: 40%;
   min-width: 0;
   flex-shrink: 1;
   justify-content: flex-end;
