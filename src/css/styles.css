@@ -582,6 +582,11 @@ table.tracks .t-fmt { width: 120px; }
   border-radius: var(--radius);
   padding: 20px 22px;
 }
+/* Settings are name-only: explanatory copy is hidden except functional
+   status lines marked .keep (loaded IR name, connection status, version). */
+.settings-card .desc:not(.keep),
+.settings-card .hint:not(.keep) { display: none; }
+
 .settings-card h3 {
   font-size: 15px;
   font-weight: 650;

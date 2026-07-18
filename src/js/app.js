@@ -1146,7 +1146,7 @@ async function renderSettings() {
               ${[128, 256, 512, 1024, 2048].map((b) => `<option value="${b}" ${(state.settings.nativeOutput?.bufferSize || 512) === b ? 'selected' : ''}>${b}</option>`).join('')}
             </select>
           </div>
-          <div class="hint" id="native-status" style="padding-top:8px"></div>
+          <div class="hint keep" id="native-status" style="padding-top:8px"></div>
         </div>
       </div>
 
@@ -1202,7 +1202,7 @@ async function renderSettings() {
         </div>
         <div class="setting-row" style="padding-top:0">
           <div><div class="lbl">Impulse response (convolution)</div>
-            <div class="hint" id="ir-name">${state.settings.speakerCorrection?.irName
+            <div class="hint keep" id="ir-name">${state.settings.speakerCorrection?.irName
               ? esc(state.settings.speakerCorrection.irName)
               : 'No impulse response loaded.'}</div></div>
           <div style="display:flex;gap:8px">
@@ -1215,7 +1215,7 @@ async function renderSettings() {
 
       <div class="settings-card">
         <h3>About &amp; Updates</h3>
-        <div class="desc" id="about-version">
+        <div class="desc keep" id="about-version">
           Auralis — a lossless-first library and player for people who hear the difference.
         </div>
         <div class="setting-row">
