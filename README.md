@@ -88,13 +88,24 @@ invert, and up to 8 parametric EQ bands per speaker. Runs in the active engine's
 chain — 64-bit float on the native path, Web Audio nodes on the standard path — and is
 bypassed automatically in bit-perfect mode.
 
+### Network audio (Settings → Output Engine / Media Server)
+- **UPnP/DLNA media server** — Auralis advertises itself on the network (SSDP) and serves
+  the library to any streamer, with full hi-res metadata (sample rate, bit depth, art)
+  and Range-capable, DLNA-tagged HTTP streaming of the **original untouched files**.
+  Albums, artists, genres, tracks, and your playlists (smart ones included) are all
+  browsable from the streamer's own app.
+- **Renderer as an output zone** — pick *Network Renderer (UPnP / OpenHome)* as the
+  output engine and Auralis drives a hardware streamer (WiiM, Linn, Lumin, Cambridge,
+  Volumio, …) as its player: transport, seek, volume, and **gapless handoff** via
+  `SetNextAVTransportURI` (UPnP AV) or playlist insertion (OpenHome). The renderer pulls
+  the audio bit-perfect from the media server — no transcoding in the path.
+
 ### Honest notes for the discerning ear
 The **Standard** engine decodes via Chromium (FLAC / WAV / AIFF / MP3 / AAC / OGG / Opus)
 and runs at the output device's shared-mode rate; use **Native Direct Output** for the
-full format list and direct API access. **WASAPI exclusive mode** is not yet wired —
-RtAudio's WASAPI backend is shared-mode; for a bit-perfect exclusive path today, use
-**ASIO** (every serious DAC ships an ASIO driver, and ASIO bypasses the mixer by design).
-WaveOut/MME is superseded by DirectSound and intentionally not offered.
+full format list and direct API access. WaveOut/MME is superseded by DirectSound and
+intentionally not offered. On the network side, Auralis speaks **UPnP AV and OpenHome** —
+it does not (and cannot) speak Roon RAAT or HQPlayer NAA, which are proprietary.
 
 ## Install (Windows)
 

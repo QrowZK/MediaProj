@@ -4,6 +4,7 @@
 
 import { AudioEngine, EQ_FREQUENCIES, EQ_PRESETS } from './player.js';
 import { NativeEngineProxy } from './native-player.js';
+import { ZoneEngineProxy } from './upnp-player.js';
 import { SpectrumVisualizer, VuMeter } from './visualizer.js';
 
 const $ = (sel) => document.querySelector(sel);
@@ -30,7 +31,14 @@ const state = {
 
 const webEngine = new AudioEngine();
 let nativeEngine = null;
+let zoneEngine = null;
 let engine = webEngine;
+
+function engineMode() {
+  if (state.settings.zone?.enabled && state.settings.zone?.location) return 'zone';
+  if (state.settings.nativeOutput?.enabled) return 'native';
+  return 'standard';
+}
 const spectrum = new SpectrumVisualizer($('#np-spectrum'), engine);
 const vu = new VuMeter($('#vu-meter'), engine);
 vu.start();
@@ -43,7 +51,8 @@ function attachEngineCallbacks(e) {
   e.onTimeUpdate = engineOnTimeUpdate;
 }
 
-async function switchEngine(useNative) {
+async function switchEngine(mode) {
+  if (typeof mode === 'boolean') mode = mode ? 'native' : 'standard';
   const playingTrack = engine.currentTrack;
   const pos = engine.currentTime;
   // Fully release the departing engine's output device — pausing is not
@@ -53,13 +62,30 @@ async function switchEngine(useNative) {
     try { await window.auralis.native.stop(); } catch { /* already down */ }
     nativeEngine.currentTrack = null;
     nativeEngine.paused = true;
+  } else if (engine === zoneEngine && zoneEngine) {
+    try { zoneEngine.destroy(); } catch { /* renderer already gone */ }
+    zoneEngine = null;
   } else {
     webEngine.pause();
   }
-  if (useNative) {
+  if (mode === 'zone') {
+    const zone = state.settings.zone || {};
+    let info = null;
+    try {
+      info = await window.auralis.upnp.zoneSelect(zone.location);
+    } catch { /* unreachable renderer */ }
+    if (!info) {
+      toast(`Renderer “${zone.name || 'network zone'}” is unreachable — using standard output`, true);
+      mode = 'standard';
+    } else {
+      zoneEngine = new ZoneEngineProxy(info);
+      engine = zoneEngine;
+    }
+  }
+  if (mode === 'native') {
     if (!nativeEngine) nativeEngine = new NativeEngineProxy();
     engine = nativeEngine;
-  } else {
+  } else if (mode === 'standard') {
     engine = webEngine;
   }
   attachEngineCallbacks(engine);
@@ -1051,6 +1077,21 @@ function renderPlaylist() {
 async function savePlaylists() {
   await window.auralis.playlists.set({ playlists: state.playlists });
   renderSidebarPlaylists();
+  pushUpnpSnapshot();
+}
+
+// The media server serves playlists (smart ones included) from a snapshot
+// the renderer evaluates — main never duplicates the rules engine.
+let upnpSnapshotTimer = null;
+function pushUpnpSnapshot() {
+  clearTimeout(upnpSnapshotTimer);
+  upnpSnapshotTimer = setTimeout(() => {
+    const snapshot = state.playlists.map((p) => ({
+      id: p.id, name: p.name,
+      trackIds: playlistTracks(p).map((t) => t.id),
+    }));
+    window.auralis.upnp.playlistsSnapshot(snapshot).catch(() => {});
+  }, 500);
 }
 
 function promptModal(title, placeholder, onSubmit) {
@@ -1213,11 +1254,27 @@ async function renderSettings() {
         <div class="setting-row" style="padding-top:0">
           <div><div class="lbl">Engine</div></div>
           <select class="styled" style="width:280px" id="out-engine">
-            <option value="standard" ${!state.settings.nativeOutput?.enabled ? 'selected' : ''}>Standard (Web Audio)</option>
-            <option value="native" ${state.settings.nativeOutput?.enabled ? 'selected' : ''}>Native Direct Output</option>
+            <option value="standard" ${engineMode() === 'standard' ? 'selected' : ''}>Standard (Web Audio)</option>
+            <option value="native" ${engineMode() === 'native' ? 'selected' : ''}>Native Direct Output</option>
+            <option value="zone" ${engineMode() === 'zone' ? 'selected' : ''}>Network Renderer (UPnP / OpenHome)</option>
           </select>
         </div>
-        <div id="native-rows" class="${state.settings.nativeOutput?.enabled ? '' : 'hidden'}">
+        <div id="zone-rows" class="${engineMode() === 'zone' ? '' : 'hidden'}">
+          <div class="setting-row">
+            <div><div class="lbl">Renderer</div>
+              <div class="hint">Streamers on your network (WiiM, Linn, Lumin, Cambridge, Volumio…). Audio is served from the Auralis media server, untouched.</div></div>
+            <div style="display:flex;gap:8px;align-items:center">
+              <select class="styled" style="width:280px" id="zone-device">
+                ${state.settings.zone?.location
+                  ? `<option value="${esc(state.settings.zone.location)}" selected>${esc(state.settings.zone.name || 'Saved renderer')}</option>`
+                  : '<option value="">Searching…</option>'}
+              </select>
+              <button class="btn" id="zone-refresh">Refresh</button>
+            </div>
+          </div>
+          <div class="hint keep" id="zone-status" style="padding-top:8px"></div>
+        </div>
+        <div id="native-rows" class="${engineMode() === 'native' ? '' : 'hidden'}">
           <div class="setting-row">
             <div><div class="lbl">Host API</div><div class="hint">ASIO appears when a device driver provides it.</div></div>
             <select class="styled" style="width:280px" id="native-api"><option value="default">System default</option></select>
@@ -1326,6 +1383,21 @@ async function renderSettings() {
       </div>
 
       <div class="settings-card">
+        <h3>Media Server (DLNA / OpenHome)
+          <button class="toggle" id="toggle-upnp" style="margin-left:auto"></button>
+        </h3>
+        <div class="desc keep" id="upnp-status" style="margin-bottom:14px">Checking…</div>
+        <div class="setting-row" style="padding-top:0">
+          <div><div class="lbl">Server name</div></div>
+          <input type="text" class="lf-input" style="width:280px" id="upnp-name" spellcheck="false" />
+        </div>
+        <div class="setting-row">
+          <div><div class="lbl">Port</div></div>
+          <input type="number" class="lf-input" style="width:120px" id="upnp-port" min="1024" max="65535" />
+        </div>
+      </div>
+
+      <div class="settings-card">
         <h3>About &amp; Updates</h3>
         <div class="desc keep" id="about-version">
           Auralis — a lossless-first library and player for people who hear the difference.
@@ -1411,6 +1483,67 @@ async function renderSettings() {
 
   if (state.settings.nativeOutput?.enabled) populateNativeSelectors();
 
+  // ── network renderer zone ──
+
+  const zn = () => state.settings.zone || (state.settings.zone = {
+    enabled: false, location: null, name: '', openhome: false,
+  });
+
+  async function populateZoneDevices() {
+    const status = $('#zone-status');
+    const sel = $('#zone-device');
+    if (!sel) return;
+    if (status) status.textContent = 'Searching the network for renderers…';
+    $('#zone-refresh')?.setAttribute('disabled', '');
+    let found = [];
+    try { found = await window.auralis.upnp.discoverRenderers(); } catch { /* offline */ }
+    $('#zone-refresh')?.removeAttribute('disabled');
+    const saved = zn();
+    if (saved.location && !found.some((r) => r.id === saved.location)) {
+      found = [{ id: saved.location, name: saved.name || 'Saved renderer',
+                 model: '', openhome: !!saved.openhome, offline: true }, ...found];
+    }
+    if (!found.length) {
+      sel.innerHTML = '<option value="">No renderers found</option>';
+      if (status) status.textContent =
+        'Nothing answered the search. Make sure the streamer is on the same network, then hit Refresh.';
+      return;
+    }
+    sel.innerHTML = found.map((r) =>
+      `<option value="${esc(r.id)}" ${saved.location === r.id ? 'selected' : ''}>` +
+      `${esc(r.name)}${r.model ? ` — ${esc(r.model)}` : ''}` +
+      `${r.openhome ? ' (OpenHome)' : ''}${r.offline ? ' — not responding' : ''}</option>`).join('');
+    sel.dataset.names = JSON.stringify(Object.fromEntries(found.map((r) => [r.id, { name: r.name, openhome: r.openhome }])));
+    if (status) status.textContent = `${found.filter((r) => !r.offline).length} renderer(s) on the network.`;
+    if (!saved.location) {
+      const first = found.find((r) => !r.offline);
+      if (first) {
+        saved.location = first.id; saved.name = first.name; saved.openhome = first.openhome;
+        sel.value = first.id;
+        saveSettings();
+      }
+    }
+  }
+
+  if (engineMode() === 'zone') populateZoneDevices();
+
+  $('#zone-refresh')?.addEventListener('click', populateZoneDevices);
+
+  $('#zone-device')?.addEventListener('change', async (e) => {
+    const loc = e.target.value;
+    if (!loc) return;
+    const meta = JSON.parse(e.target.dataset.names || '{}')[loc] || {};
+    const z = zn();
+    z.location = loc;
+    z.name = meta.name || e.target.selectedOptions[0]?.textContent || 'Renderer';
+    z.openhome = !!meta.openhome;
+    saveSettings();
+    if (z.enabled) {
+      await switchEngine('zone');
+      if (engine === zoneEngine) toast(`Output zone: ${z.name}`);
+    }
+  });
+
   // hide the exclusive toggle when the addon isn't present on this install
   window.auralis.native.capabilities().then((caps) => {
     if (!caps.wasapiExclusive) {
@@ -1424,21 +1557,39 @@ async function renderSettings() {
   }).catch(() => {});
 
   $('#out-engine').addEventListener('change', async (e) => {
-    const useNative = e.target.value === 'native';
-    if (useNative && !(await window.auralis.native.available())) {
+    const mode = e.target.value; // standard | native | zone
+    if (mode === 'native' && !(await window.auralis.native.available())) {
       toast('Native output backend is not available on this install', true);
       e.target.value = 'standard';
       return;
     }
-    no().enabled = useNative;
+    no().enabled = mode === 'native';
+    zn().enabled = mode === 'zone';
     saveSettings();
-    $('#native-rows').classList.toggle('hidden', !useNative);
-    if (useNative) {
+    $('#native-rows').classList.toggle('hidden', mode !== 'native');
+    $('#zone-rows').classList.toggle('hidden', mode !== 'zone');
+    if (mode === 'native') {
       await populateNativeSelectors();
       await pushNativeOutputConfig();
     }
-    await switchEngine(useNative);
-    toast(useNative ? 'Native direct output engaged' : 'Standard engine engaged');
+    if (mode === 'zone') {
+      await populateZoneDevices();
+      if (!zn().location) {
+        toast('No renderer selected yet — pick one below when it appears', true);
+        return; // stay on webEngine until a device is chosen
+      }
+    }
+    await switchEngine(mode);
+    if (mode === 'zone' && engine !== zoneEngine) {
+      // select fell back to standard; reflect that
+      e.target.value = 'standard';
+      zn().enabled = false;
+      saveSettings();
+      return;
+    }
+    toast(mode === 'native' ? 'Native direct output engaged'
+      : mode === 'zone' ? `Output zone: ${zn().name || 'network renderer'}`
+      : 'Standard engine engaged');
   });
 
   $('#native-api').addEventListener('change', async (e) => {
@@ -1545,6 +1696,45 @@ async function renderSettings() {
     await pushNativeOutputConfig();
     render();
   });
+
+  // ── Media server ──
+
+  const upnpStatusText = (s) => s.running
+    ? `Running at ${s.address} — streamers can browse the library now.`
+    : (s.error ? `Failed to start: ${s.error}` : 'Stopped.');
+
+  window.auralis.upnp.serverStatus().then((s) => {
+    $('#toggle-upnp').classList.toggle('on', !!s.enabled);
+    $('#upnp-name').value = s.name || 'Auralis';
+    $('#upnp-port').value = s.port || 47700;
+    $('#upnp-status').textContent = upnpStatusText(s);
+  }).catch(() => { $('#upnp-status').textContent = 'Unavailable.'; });
+
+  $('#toggle-upnp').addEventListener('click', async (e) => {
+    const on = !e.target.classList.contains('on');
+    e.target.classList.toggle('on', on);
+    $('#upnp-status').textContent = on ? 'Starting…' : 'Stopping…';
+    pushUpnpSnapshot();
+    const s = await window.auralis.upnp.serverConfig({
+      enabled: on,
+      name: $('#upnp-name').value.trim() || 'Auralis',
+      port: Number($('#upnp-port').value) || 47700,
+    });
+    $('#upnp-status').textContent = upnpStatusText(s);
+    if (on && !s.ok) e.target.classList.remove('on');
+  });
+
+  const upnpSettingChanged = async () => {
+    const enabled = $('#toggle-upnp').classList.contains('on');
+    const s = await window.auralis.upnp.serverConfig({
+      enabled,
+      name: $('#upnp-name').value.trim() || 'Auralis',
+      port: Number($('#upnp-port').value) || 47700,
+    });
+    $('#upnp-status').textContent = upnpStatusText(s);
+  };
+  $('#upnp-name').addEventListener('change', upnpSettingChanged);
+  $('#upnp-port').addEventListener('change', upnpSettingChanged);
 
   // ── Speaker correction ──
 
@@ -2594,14 +2784,19 @@ $$('.nav-item[data-view]').forEach((btn) =>
     engine.setOutputDevice(settings.outputDevice).catch(() => {});
   }
   engine.setSpeakerCorrection?.(correctionConfig());
-  if (settings.nativeOutput?.enabled) {
+  const bootMode = engineMode();
+  if (bootMode === 'native') {
     const available = await window.auralis.native.available().catch(() => false);
     if (available) {
       await window.auralis.native.config(nativeConfigPayload());
-      await switchEngine(true);
+      await switchEngine('native');
     }
+  } else if (bootMode === 'zone') {
+    // don't block boot on an offline renderer — connect in the background
+    switchEngine('zone').catch(() => {});
   }
   updateEqButton();
   updateTransportUi();
   render();
+  pushUpnpSnapshot();
 })();
