@@ -732,12 +732,28 @@ class NativeAudioEngine {
     child.stdout.on('data', (chunk) => this._onPcm(child, chunk));
     child.on('close', (code) => {
       if (child !== this.decoder) return;
+      this._flushResidual();
       this.decodeEnded = true;
       if (code !== 0 && errBuf && this.pcmQueue.length === 0 && this.framesWritten === 0) {
         this.emit('native:error', { message: errBuf.split('\n')[0] });
       }
       this._maybeAdvance();
     });
+  }
+
+  // The decoder's last chunk almost never lands on a frame boundary, so a
+  // sub-frame tail sits in `residual` — pad it to one full frame of silence
+  // and queue it, or end-of-track advance stalls behind it forever.
+  _flushResidual() {
+    const s = this.stream;
+    if (!s || this.residual.length === 0) return;
+    const bytesPerFrame = s.channels * (s.mode === 'bitperfect' ? 4 : 8);
+    const frameBytes = s.frameSize * bytesPerFrame;
+    const padded = Buffer.alloc(frameBytes);
+    this.residual.copy(padded, 0, 0, Math.min(this.residual.length, frameBytes));
+    this.residual = Buffer.alloc(0);
+    this.pcmQueue.push(this._prepareFrame(padded));
+    this._fill();
   }
 
   // ── native DSD: stream DSF blocks, pack as DoP ──
@@ -792,7 +808,7 @@ class NativeAudioEngine {
         if (!state.cancelled) engine.emit('native:error', { message: 'DSD: ' + err.message });
       } finally {
         await fh.close().catch(() => {});
-        if (!state.cancelled) { engine.decodeEnded = true; engine._maybeAdvance(); }
+        if (!state.cancelled) { engine._flushResidual(); engine.decodeEnded = true; engine._maybeAdvance(); }
       }
     })();
   }
