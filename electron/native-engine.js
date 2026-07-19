@@ -312,7 +312,9 @@ class NativeAudioEngine {
     this.wexHandle = null;       // active WASAPI-exclusive stream handle
     this.wexPump = null;
     this.dop = null;             // active DoP reader state
-    this.fftAccum = [];
+    // rolling contiguous mono window for the viz FFT — one PCM block is only
+    // ~512 frames, far too short for a 2048-point spectrum on its own
+    this.fftMono = new Float64Array(2048);
     this.lastVizEmit = 0;
     this.vizBlockCounter = 0;
     this.progressTimer = null;
@@ -532,6 +534,7 @@ class NativeAudioEngine {
     this.framesWritten = 0;
     this.startOffset = startAt;
     this.dop = null;
+    this.fftMono.fill(0);
 
     const c = this.config;
     const plan = this._planFor(track);
@@ -589,7 +592,7 @@ class NativeAudioEngine {
     this.emit('native:state', { playing: true });
     if (plan.mode !== 'dsp') {
       // no DSP taps on this path — blank the meters instead of freezing them
-      this.emit('native:viz', { levels: [0, 0], spectrum: new Array(512).fill(0) });
+      this.emit('native:viz', { levels: [0, 0], spectrum: new Array(512).fill(0), nyquist: Math.min(plan.outRate / 2, 24000) });
     }
     this._emitSignalPath();
   }
@@ -900,9 +903,11 @@ class NativeAudioEngine {
     // f64 in → DSP → quantize to the configured output format
     const f64 = new Float64Array(block.buffer.slice(block.byteOffset, block.byteOffset + block.length));
     this._processBlock(f64);
-    // Viz is COMPUTED here at decode time but EMITTED at device-write time
+    // Every block feeds the rolling FFT window so it stays CONTIGUOUS audio;
+    // viz is COMPUTED here at decode time but EMITTED at device-write time
     // (_outWrite): decode runs in ~1s backpressure bursts, so emitting from
     // here makes the meters stutter in bursts instead of following playback.
+    this._ingestFftSamples(f64, s.channels);
     const viz = this._shouldComputeViz() ? this._computeViz(f64, s.channels) : null;
     let out;
     if (this.quantizer) {
@@ -927,8 +932,25 @@ class NativeAudioEngine {
     return (this.vizBlockCounter = (this.vizBlockCounter || 0) + 1) % blocksPerViz === 0;
   }
 
+  // slide the rolling mono window left and append this block (downmixed) —
+  // a block is only ~512 frames, so the 2048-pt FFT needs history, and that
+  // history must be CONTIGUOUS audio or the seams smear the spectrum
+  _ingestFftSamples(f64, channels) {
+    const frames = f64.length / channels;
+    const win = this.fftMono;
+    const take = Math.min(frames, win.length);
+    win.copyWithin(0, take);
+    const base = win.length - take;
+    const first = frames - take; // if the block is huge, keep only its tail
+    for (let i = 0; i < take; i++) {
+      let s = 0;
+      for (let ch = 0; ch < channels; ch++) s += f64[(first + i) * channels + ch];
+      win[base + i] = s / channels;
+    }
+  }
+
   _computeViz(f64, channels) {
-    // RMS per channel
+    // RMS per channel from the current block
     const levels = [0, 0];
     const frames = f64.length / channels;
     for (let ch = 0; ch < Math.min(2, channels); ch++) {
@@ -936,23 +958,37 @@ class NativeAudioEngine {
       for (let i = 0; i < frames; i++) { const v = f64[i * channels + ch]; sum += v * v; }
       levels[ch] = Math.sqrt(sum / frames);
     }
-    // mono 2048-pt spectrum
-    const n = 2048;
+    // 2048-pt spectrum over the rolling contiguous window. (The old code fed
+    // ONE 512-frame block into a 2048-pt FFT — the clamp repeated the last
+    // sample over the top 3/4 of the input, so the "spectrum" was mostly a
+    // window/step artifact rather than the audio.)
+    const n = this.fftMono.length;
     const mono = new Float64Array(n);
-    const step = Math.max(1, Math.floor(frames / n));
     for (let i = 0; i < n; i++) {
-      const idx = Math.min(frames - 1, i * step) * channels;
-      // Hann window
-      mono[i] = (f64[idx] || 0) * 0.5 * (1 - Math.cos(2 * Math.PI * i / n));
+      mono[i] = this.fftMono[i] * 0.5 * (1 - Math.cos(2 * Math.PI * i / (n - 1))); // Hann
     }
-    const mags = fftMagnitudes(mono);
+    const mags = fftMagnitudes(mono); // n/2 bins spanning 0..outRate/2
+    // Cap the EMITTED range at 24 kHz: at hi-res rates (96/192k) spreading 512
+    // display bins to a 48/96 kHz Nyquist makes the bass bins so coarse the
+    // display's whole left edge collapses into the DC bin — and nothing
+    // musical lives above 24 kHz anyway.
+    const fullNy = this.stream.outRate / 2;
+    const effNy = Math.min(fullNy, 24000);
+    const cover = Math.max(1, Math.round(mags.length * effNy / fullNy));
     const bins = new Uint8Array(512);
+    const per = cover / 512;
     for (let i = 0; i < 512; i++) {
-      const m = mags[Math.floor(i * mags.length / 512)];
+      // average the covered mags instead of skipping — a narrowband peak
+      // landing on a skipped bin would vanish from the display
+      const a = Math.floor(i * per);
+      const b = Math.max(a + 1, Math.floor((i + 1) * per));
+      let m = 0, k = a;
+      for (; k < b && k < mags.length; k++) m += mags[k];
+      m /= Math.max(1, k - a);
       const db = 20 * Math.log10(m + 1e-9);
       bins[i] = Math.max(0, Math.min(255, Math.round((db + 90) / 90 * 255)));
     }
-    return { levels, spectrum: Array.from(bins) };
+    return { levels, spectrum: Array.from(bins), nyquist: effNy };
   }
 
   _primeQueue() { this._fill(); }

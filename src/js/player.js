@@ -331,6 +331,8 @@ export class AudioEngine {
     }
   }
 
+  getSpectrumNyquist() { return this.ctx.sampleRate / 2; }
+
   getSpectrum(buffer) {
     this.analyser.getByteFrequencyData(buffer);
     return buffer;

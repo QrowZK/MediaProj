@@ -38,7 +38,9 @@ export class ZoneEngineProxy {
       window.auralis.upnp.on('upnp:track-ended', (p) => {
         if (!p.advancedTo) {
           const next = this.onTrackEnd?.();
-          if (next) this.play(next);
+          // start it and tell the app — otherwise the UI stays on the
+          // finished track when the renderer didn't gapless-advance itself
+          if (next) this.play(next).then((ok) => { if (ok) this.onTrackStarted?.(next); });
           else this.paused = true;
         } else {
           this.onTrackEnd?.();
@@ -119,6 +121,7 @@ export class ZoneEngineProxy {
   async setOutputDevice() {}
   async listOutputDevices() { return []; }
 
+  getSpectrumNyquist() { return 22050; }
   getSpectrum(buffer) { buffer.fill(0); return buffer; }
   getVuLevels() { return [0, 0]; }
 
