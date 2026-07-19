@@ -170,7 +170,11 @@ function fftMagnitudes(samples) {
 
 // ── engine ───────────────────────────────────────────────────────────────
 
-const FRAME_QUEUE_TARGET = 6; // frames kept queued in RtAudio
+// Depth of decoded audio kept inside audify's output queue. audify's write()
+// is non-blocking into an UNBOUNDED std::queue — nothing pushes back — so we
+// must do our own accounting or the whole track lands in the queue at decode
+// speed and the position clock (framesWritten) races ahead of the audio.
+const RT_QUEUE_SECONDS = 0.15;
 
 // ── dithered quantization (f64 → integer PCM) ───────────────────────────
 // TPDF dither at ±1 LSB, optional 2nd-order noise shaping (error feedback
@@ -309,7 +313,8 @@ class NativeAudioEngine {
     this.wexPump = null;
     this.dop = null;             // active DoP reader state
     this.fftAccum = [];
-    this.lastViz = 0;
+    this.lastVizEmit = 0;
+    this.vizBlockCounter = 0;
     this.progressTimer = null;
   }
 
@@ -511,8 +516,14 @@ class NativeAudioEngine {
     return { mode: 'dsp', channels, outRate, decodeRate, format: c.outputFormat || 'f32' };
   }
 
-  async play(track, startAt = 0) {
+  async play(track, startAt = 0, gaplessJoin = false) {
     if (!this.available) throw new Error('Native output backend not available');
+    // Overlap guard: a second play() (seek/track pick) can interleave at the
+    // probeSoxr await below — its stopDecoder() runs before WE assign
+    // this.decoder, so our child would leak and decode the whole file into
+    // the void. The newest call wins; stale calls abort before spawning.
+    this._playSeq = (this._playSeq || 0) + 1;
+    const seq = this._playSeq;
     this.stopDecoder();
     this.pcmQueue = [];
     this.residual = Buffer.alloc(0);
@@ -552,6 +563,11 @@ class NativeAudioEngine {
         }
         this._openStream(plan, false);
       }
+    } else if (!gaplessJoin) {
+      // seek / user picked a different track: the old tail queued at the
+      // device must not keep playing. A gapless join keeps it — that IS the
+      // seamless handoff.
+      this._outFlush();
     }
 
     this._buildDsp(plan.outRate, plan.channels);
@@ -562,6 +578,7 @@ class NativeAudioEngine {
       : new Quantizer({ s16: 16, s24: 24, s32: 32 }[wireFormat], plan.channels, c.dither || 'off');
 
     await this.probeSoxr();
+    if (seq !== this._playSeq) return; // superseded while awaiting — don't spawn
     if (plan.mode === 'dop') this._startDopReader(track, startAt, plan);
     else this._spawnDecoder(track, startAt, plan);
 
@@ -615,11 +632,20 @@ class NativeAudioEngine {
     const flags = plan.mode !== 'dsp'
       ? (RTAUDIO_FLAGS.MINIMIZE_LATENCY | RTAUDIO_FLAGS.HOG_DEVICE)
       : RTAUDIO_FLAGS.MINIMIZE_LATENCY;
+    // audify pops one block per device callback and fires frameOutput only
+    // when it actually popped — counting those calls IS the playback clock
+    // (it pauses on underrun, exactly like the audio). Stream-scoped, so it
+    // survives the per-track counter resets across a gapless join.
+    const depth = { written: 0, consumed: 0 };
     const frameSize = this.rt.openStream(
       { deviceId, nChannels: plan.channels, firstChannel: 0 },
       null, format, plan.outRate, c.bufferSize || 512, 'Auralis',
       null,
-      () => this._pump(),
+      // consumed < written guard: audify queues these callbacks via TSFN, so
+      // a pop that happened just before an _outFlush can arrive after the
+      // written=consumed reconcile — counting it would skew the depth
+      // accounting (and the position clock) until the next flush.
+      () => { if (depth.consumed < depth.written) depth.consumed++; this._pump(); },
       flags,
       (type, msg) => {
         if (RTAUDIO_WARNING_TYPES.has(type)) return; // warnings are not errors
@@ -631,6 +657,7 @@ class NativeAudioEngine {
       backend: 'rtaudio', outRate: plan.outRate, channels: plan.channels,
       format: plan.format, mode: plan.mode,
       frameSize: frameSize || c.bufferSize || 512,
+      depth,
     };
   }
 
@@ -673,20 +700,54 @@ class NativeAudioEngine {
   }
 
   _outWrite(buf) {
-    if (this.stream?.backend === 'wasapi-ex') wasapiEx.write(this.wexHandle, buf);
-    else this.rt.write(buf);
+    if (this.stream?.backend === 'wasapi-ex') {
+      wasapiEx.write(this.wexHandle, buf);
+    } else {
+      this.rt.write(buf);
+      this.stream.depth.written++;
+    }
+    // emit the viz frame computed at decode time now that its audio is
+    // actually headed to the device — write cadence follows playback, so the
+    // meters move smoothly instead of in decode bursts
+    if (buf._viz && Date.now() - (this.lastVizEmit || 0) > 50) {
+      this.lastVizEmit = Date.now();
+      this.emit('native:viz', buf._viz);
+    }
   }
 
+  // Un-played audio sitting between us and the DAC (frames)
   _outQueuedFrames() {
-    if (this.stream?.backend === 'wasapi-ex') {
+    const s = this.stream;
+    if (!s) return 0;
+    if (s.backend === 'wasapi-ex') {
       try { return wasapiEx.queued(this.wexHandle); } catch { return 0; }
     }
-    return 0; // RtAudio path uses the frame-callback pull model instead
+    return Math.max(0, s.depth.written - s.depth.consumed) * s.frameSize;
   }
 
   _outLatencyFrames() {
     if (this.stream?.backend === 'wasapi-ex') return this._outQueuedFrames();
-    return this.rt?.getStreamLatency?.() || 0;
+    return this._outQueuedFrames() + (this.rt?.getStreamLatency?.() || 0);
+  }
+
+  // Drop any un-played queued audio (seek / user-picked new track — the old
+  // tail must not keep playing). NOT used on gapless joins.
+  _outFlush() {
+    const s = this.stream;
+    if (!s) return;
+    if (s.backend === 'wasapi-ex') {
+      // Stop the device BEFORE clearing: clearing a running ring races the
+      // render thread (a torn read is an audible pop), and a running device
+      // on a just-emptied ring pops again at the audio→silence boundary.
+      // wexStarted resets so the pump restarts the clock once half-primed —
+      // the same clean-start path used on open.
+      try { wasapiEx.stop(this.wexHandle); } catch { /* fine */ }
+      try { wasapiEx.clear(this.wexHandle); } catch { /* fine */ }
+      this.wexStarted = false;
+    } else if (this.rt) {
+      try { this.rt.clearOutputQueue(); } catch { /* fine */ }
+      s.depth.written = s.depth.consumed; // queue is empty now
+    }
   }
 
   // ── decode: ffmpeg with SoX resampling + FIR room convolution ──
@@ -839,20 +900,34 @@ class NativeAudioEngine {
     // f64 in → DSP → quantize to the configured output format
     const f64 = new Float64Array(block.buffer.slice(block.byteOffset, block.byteOffset + block.length));
     this._processBlock(f64);
-    this._collectViz(f64, s.channels);
-    if (this.quantizer) return this.quantizer.process(f64);
-    const f32 = new Float32Array(f64.length);
-    for (let i = 0; i < f64.length; i++) {
-      const v = f64[i];
-      f32[i] = v > 1 ? 1 : v < -1 ? -1 : v;
+    // Viz is COMPUTED here at decode time but EMITTED at device-write time
+    // (_outWrite): decode runs in ~1s backpressure bursts, so emitting from
+    // here makes the meters stutter in bursts instead of following playback.
+    const viz = this._shouldComputeViz() ? this._computeViz(f64, s.channels) : null;
+    let out;
+    if (this.quantizer) {
+      out = this.quantizer.process(f64);
+    } else {
+      const f32 = new Float32Array(f64.length);
+      for (let i = 0; i < f64.length; i++) {
+        const v = f64[i];
+        f32[i] = v > 1 ? 1 : v < -1 ? -1 : v;
+      }
+      out = Buffer.from(f32.buffer);
     }
-    return Buffer.from(f32.buffer);
+    if (viz) out._viz = viz;
+    return out;
   }
 
-  _collectViz(f64, channels) {
-    const now = Date.now();
-    if (now - this.lastViz < 66) return;
-    this.lastViz = now;
+  // compute roughly one viz frame per ~66ms of AUDIO (not wall clock — the
+  // decoder produces audio much faster than realtime)
+  _shouldComputeViz() {
+    const s = this.stream;
+    const blocksPerViz = Math.max(1, Math.round(0.066 * s.outRate / s.frameSize));
+    return (this.vizBlockCounter = (this.vizBlockCounter || 0) + 1) % blocksPerViz === 0;
+  }
+
+  _computeViz(f64, channels) {
     // RMS per channel
     const levels = [0, 0];
     const frames = f64.length / channels;
@@ -877,21 +952,20 @@ class NativeAudioEngine {
       const db = 20 * Math.log10(m + 1e-9);
       bins[i] = Math.max(0, Math.min(255, Math.round((db + 90) / 90 * 255)));
     }
-    this.emit('native:viz', { levels, spectrum: Array.from(bins) });
+    return { levels, spectrum: Array.from(bins) };
   }
 
-  _primeQueue() {
-    for (let i = 0; i < FRAME_QUEUE_TARGET; i++) this._fill(true);
-  }
+  _primeQueue() { this._fill(); }
 
   _pump() { this._fill(); }
 
-  _fill(initial = false) {
+  _fill() {
     if (!this.playing || !this.stream) return;
     if (this.stream.backend === 'wasapi-ex') {
-      // interval-driven: keep ~250ms in the addon ring — a JS timer can jitter
-      // tens of ms under load, and exclusive-mode underruns are audible pops
-      const target = Math.max(this.stream.frameSize * 4, Math.round(this.stream.outRate * 0.25));
+      // interval-driven: keep ~500ms in the addon ring — the main process can
+      // stall for a long beat (GC, scans, IPC bursts) and every exclusive-mode
+      // underrun is an audible pop. Latency doesn't matter for music playback.
+      const target = Math.max(this.stream.frameSize * 4, Math.round(this.stream.outRate * 0.5));
       while (this.pcmQueue.length > 0 && this._outQueuedFrames() < target) {
         this._outWrite(this.pcmQueue.shift());
         this.framesWritten++;
@@ -905,12 +979,14 @@ class NativeAudioEngine {
       }
     } else {
       if (!this.rt) return;
-      while (this.pcmQueue.length > 0) {
-        // keep the device queue shallow: write one frame per pump (or prime)
+      // audify's queue is unbounded and its write() never blocks — keep only
+      // ~150ms in it so the position clock stays honest and backpressure can
+      // reach the decoder. The frameOutput callback tops this up per frame.
+      const target = Math.max(this.stream.frameSize * 2,
+        Math.round(this.stream.outRate * RT_QUEUE_SECONDS));
+      while (this.pcmQueue.length > 0 && this._outQueuedFrames() < target) {
         this._outWrite(this.pcmQueue.shift());
         this.framesWritten++;
-        if (!initial) break;
-        if (this.framesWritten >= FRAME_QUEUE_TARGET) break;
       }
     }
     if (this.decoder?.stdout?.isPaused() && this.pcmQueue.length * this.stream.frameSize / this.stream.outRate < 1) {
@@ -930,7 +1006,7 @@ class NativeAudioEngine {
       this.nextTrack = null;
       const pos = 0;
       this.emit('native:track-ended', { advancedTo: track.id });
-      this.play(track, pos).then(() => {
+      this.play(track, pos, true).then(() => {
         this.emit('native:track-changed', { trackId: track.id });
       }).catch((err) => this.emit('native:error', { message: err.message }));
     } else {
@@ -1033,6 +1109,10 @@ class NativeAudioEngine {
     this._stopProgress();
     this.progressTimer = setInterval(() => {
       if (!this.playing) return;
+      // watchdog refill: if the device queue underran while the decoder was
+      // paused on backpressure, no _onPcm and no frameOutput callback will
+      // arrive to restart the flow — this tick does.
+      this._fill();
       this.emit('native:progress', {
         time: this.getPosition(),
         duration: this.currentTrack?.duration || 0,
@@ -1055,9 +1135,18 @@ class NativeAudioEngine {
 
   resume() {
     if (!this.stream || !this.currentTrack) return false;
+    if (!this.decoder && !this.dop) {
+      // Natural end already tore the decoder down (and stopped the progress
+      // timer that hosts the underrun watchdog) — a bare resume would sit in
+      // 'playing' silence forever. Restart the track properly instead.
+      this.play(this.currentTrack, 0)
+        .catch((err) => this.emit('native:error', { message: err.message }));
+      return true;
+    }
     this.playing = true;
     this._outStart();
     this._primeQueue();
+    this._startProgress();
     this.emit('native:state', { playing: true });
     return true;
   }
@@ -1068,6 +1157,11 @@ class NativeAudioEngine {
     this.play(track, Math.max(0, time)).catch(() => {});
   }
 
+  // Kills the decoder ONLY. Deliberately does NOT touch the device queue:
+  // on a gapless join the queued tail of the outgoing track must keep
+  // playing, and clearing audify's queue without reconciling the depth
+  // counters strands phantom depth that stalls _fill forever. Device
+  // flushing is _outFlush's job (seek / new track), which reconciles.
   stopDecoder() {
     if (this.decoder) {
       const d = this.decoder;
@@ -1075,10 +1169,6 @@ class NativeAudioEngine {
       try { d.kill('SIGKILL'); } catch { /* gone */ }
     }
     if (this.dop) { this.dop.cancelled = true; this.dop = null; }
-    if (this.rt) { try { if (this.rt.isStreamOpen()) this.rt.clearOutputQueue(); } catch { /* fine */ } }
-    if (this.stream?.backend === 'wasapi-ex' && this.wexHandle != null) {
-      try { wasapiEx.clear(this.wexHandle); } catch { /* fine */ }
-    }
   }
 
   stopAll() {

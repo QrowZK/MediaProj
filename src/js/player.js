@@ -48,6 +48,12 @@ export class AudioEngine {
     this.analyser = this.ctx.createAnalyser();
     this.analyser.fftSize = 4096;
     this.analyser.smoothingTimeConstant = 0.82;
+    // Web Audio's default display window is -100..-30 dB — music's bass/mid
+    // bins sit above -30 dBFS nearly all the time, so they peg at 255 and the
+    // spectrum reads as a maxed-out, left-heavy plateau. Match the native
+    // engine's -90..0 window so both engines draw alike.
+    this.analyser.minDecibels = -90;
+    this.analyser.maxDecibels = 0;
 
     // stereo VU
     this.splitter = this.ctx.createChannelSplitter(2);
