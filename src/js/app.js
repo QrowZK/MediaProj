@@ -1190,6 +1190,18 @@ async function renderSettings() {
             <div class="hint">Shows lyrics beside the artwork on the Now Playing screen — from .lrc/.txt files next to your audio, embedded tags, or LRCLIB lookup (cached). Time-synced lyrics follow the music; click a line to jump there.</div></div>
           <button class="toggle ${state.settings.showLyrics !== false ? 'on' : ''}" id="toggle-lyrics"></button>
         </div>
+        <div class="setting-row">
+          <div><div class="lbl">Autoplay</div>
+            <div class="hint">When the queue runs out — the last track of an album, for instance — keep playing instead of stopping.</div></div>
+          <button class="toggle ${state.settings.autoplay?.enabled ? 'on' : ''}" id="toggle-autoplay"></button>
+        </div>
+        <div class="setting-row ${state.settings.autoplay?.enabled ? '' : 'hidden'}" id="autoplay-mode-row">
+          <div><div class="lbl">Continue with</div></div>
+          <select class="styled" style="width:200px" id="autoplay-mode">
+            <option value="random" ${(state.settings.autoplay?.mode || 'random') === 'random' ? 'selected' : ''}>Library random</option>
+            <option value="sameArtist" ${state.settings.autoplay?.mode === 'sameArtist' ? 'selected' : ''}>Same artist</option>
+          </select>
+        </div>
       </div>
 
       <div class="settings-card">
@@ -1778,6 +1790,19 @@ async function renderSettings() {
     }
   });
 
+  const ap = () => state.settings.autoplay || (state.settings.autoplay = { enabled: false, mode: 'random' });
+
+  $('#toggle-autoplay').addEventListener('click', (e) => {
+    ap().enabled = !ap().enabled;
+    e.target.classList.toggle('on', ap().enabled);
+    $('#autoplay-mode-row').classList.toggle('hidden', !ap().enabled);
+    saveSettings();
+  });
+  $('#autoplay-mode').addEventListener('change', (e) => {
+    ap().mode = e.target.value;
+    saveSettings();
+  });
+
   $('#toggle-lastfm').addEventListener('click', (e) => {
     state.settings.lastfm = state.settings.lastfm || {};
     state.settings.lastfm.enabled = !state.settings.lastfm.enabled;
@@ -2117,12 +2142,54 @@ function nextIndex(forEnd = false) {
   return next;
 }
 
+const AUTOPLAY_BATCH_SIZE = 20;
+
+function buildAutoplayBatch() {
+  const tracks = state.library.tracks || [];
+  if (!tracks.length) return [];
+  const mode = state.settings.autoplay?.mode || 'random';
+  const queued = new Set(state.queue.map((t) => t.id));
+  let pool;
+  if (mode === 'sameArtist') {
+    const artist = state.queue[state.queue.length - 1]?.artist;
+    pool = tracks.filter((t) => t.artist === artist && !queued.has(t.id));
+    if (!pool.length) pool = tracks.filter((t) => t.artist === artist); // only track(s) by this artist — repeat rather than stop
+  } else {
+    pool = tracks.filter((t) => !queued.has(t.id));
+  }
+  if (!pool.length) pool = tracks.slice(); // whole library already queued — repeat rather than stop
+  const shuffled = [...pool];
+  shuffleArray(shuffled);
+  return shuffled.slice(0, AUTOPLAY_BATCH_SIZE);
+}
+
+// Lazily extends the queue once it's about to run dry — called from both
+// peekNext (ahead of time, so the normal gapless-preload path sees the new
+// tracks) and onTrackEnd (belt-and-braces). Self-limiting: once appended,
+// nextIndex() no longer returns -1, so this is a no-op until that batch
+// itself runs out — which is exactly what keeps autoplay continuous.
+function maybeAutoplayExtend() {
+  if (!state.settings.autoplay?.enabled) return;
+  if (!state.queue.length || nextIndex(true) !== -1) return;
+  const batch = buildAutoplayBatch();
+  if (!batch.length) return;
+  const mode = state.settings.autoplay?.mode || 'random';
+  const artist = state.queue[state.queue.length - 1]?.artist;
+  state.queue.push(...batch);
+  renderQueue();
+  toast(mode === 'sameArtist'
+    ? `Autoplay: more from ${artist || 'this artist'}`
+    : `Autoplay: ${batch.length} random track${batch.length === 1 ? '' : 's'} queued`);
+}
+
 function enginePeekNext() {
+  maybeAutoplayExtend();
   const idx = nextIndex(true);
   return idx >= 0 ? state.queue[idx] : null;
 }
 
 function engineOnTrackEnd() {
+  maybeAutoplayExtend();
   const idx = nextIndex(true);
   if (idx < 0) { updatePlayButton(false); return null; }
   state.queueIndex = idx;
