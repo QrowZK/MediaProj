@@ -313,7 +313,8 @@ class NativeAudioEngine {
     this.wexPump = null;
     this.dop = null;             // active DoP reader state
     this.fftAccum = [];
-    this.lastViz = 0;
+    this.lastVizEmit = 0;
+    this.vizBlockCounter = 0;
     this.progressTimer = null;
   }
 
@@ -705,6 +706,13 @@ class NativeAudioEngine {
       this.rt.write(buf);
       this.stream.depth.written++;
     }
+    // emit the viz frame computed at decode time now that its audio is
+    // actually headed to the device — write cadence follows playback, so the
+    // meters move smoothly instead of in decode bursts
+    if (buf._viz && Date.now() - (this.lastVizEmit || 0) > 50) {
+      this.lastVizEmit = Date.now();
+      this.emit('native:viz', buf._viz);
+    }
   }
 
   // Un-played audio sitting between us and the DAC (frames)
@@ -728,7 +736,14 @@ class NativeAudioEngine {
     const s = this.stream;
     if (!s) return;
     if (s.backend === 'wasapi-ex') {
+      // Stop the device BEFORE clearing: clearing a running ring races the
+      // render thread (a torn read is an audible pop), and a running device
+      // on a just-emptied ring pops again at the audio→silence boundary.
+      // wexStarted resets so the pump restarts the clock once half-primed —
+      // the same clean-start path used on open.
+      try { wasapiEx.stop(this.wexHandle); } catch { /* fine */ }
       try { wasapiEx.clear(this.wexHandle); } catch { /* fine */ }
+      this.wexStarted = false;
     } else if (this.rt) {
       try { this.rt.clearOutputQueue(); } catch { /* fine */ }
       s.depth.written = s.depth.consumed; // queue is empty now
@@ -885,20 +900,34 @@ class NativeAudioEngine {
     // f64 in → DSP → quantize to the configured output format
     const f64 = new Float64Array(block.buffer.slice(block.byteOffset, block.byteOffset + block.length));
     this._processBlock(f64);
-    this._collectViz(f64, s.channels);
-    if (this.quantizer) return this.quantizer.process(f64);
-    const f32 = new Float32Array(f64.length);
-    for (let i = 0; i < f64.length; i++) {
-      const v = f64[i];
-      f32[i] = v > 1 ? 1 : v < -1 ? -1 : v;
+    // Viz is COMPUTED here at decode time but EMITTED at device-write time
+    // (_outWrite): decode runs in ~1s backpressure bursts, so emitting from
+    // here makes the meters stutter in bursts instead of following playback.
+    const viz = this._shouldComputeViz() ? this._computeViz(f64, s.channels) : null;
+    let out;
+    if (this.quantizer) {
+      out = this.quantizer.process(f64);
+    } else {
+      const f32 = new Float32Array(f64.length);
+      for (let i = 0; i < f64.length; i++) {
+        const v = f64[i];
+        f32[i] = v > 1 ? 1 : v < -1 ? -1 : v;
+      }
+      out = Buffer.from(f32.buffer);
     }
-    return Buffer.from(f32.buffer);
+    if (viz) out._viz = viz;
+    return out;
   }
 
-  _collectViz(f64, channels) {
-    const now = Date.now();
-    if (now - this.lastViz < 66) return;
-    this.lastViz = now;
+  // compute roughly one viz frame per ~66ms of AUDIO (not wall clock — the
+  // decoder produces audio much faster than realtime)
+  _shouldComputeViz() {
+    const s = this.stream;
+    const blocksPerViz = Math.max(1, Math.round(0.066 * s.outRate / s.frameSize));
+    return (this.vizBlockCounter = (this.vizBlockCounter || 0) + 1) % blocksPerViz === 0;
+  }
+
+  _computeViz(f64, channels) {
     // RMS per channel
     const levels = [0, 0];
     const frames = f64.length / channels;
@@ -923,7 +952,7 @@ class NativeAudioEngine {
       const db = 20 * Math.log10(m + 1e-9);
       bins[i] = Math.max(0, Math.min(255, Math.round((db + 90) / 90 * 255)));
     }
-    this.emit('native:viz', { levels, spectrum: Array.from(bins) });
+    return { levels, spectrum: Array.from(bins) };
   }
 
   _primeQueue() { this._fill(); }
@@ -933,9 +962,10 @@ class NativeAudioEngine {
   _fill() {
     if (!this.playing || !this.stream) return;
     if (this.stream.backend === 'wasapi-ex') {
-      // interval-driven: keep ~250ms in the addon ring — a JS timer can jitter
-      // tens of ms under load, and exclusive-mode underruns are audible pops
-      const target = Math.max(this.stream.frameSize * 4, Math.round(this.stream.outRate * 0.25));
+      // interval-driven: keep ~500ms in the addon ring — the main process can
+      // stall for a long beat (GC, scans, IPC bursts) and every exclusive-mode
+      // underrun is an audible pop. Latency doesn't matter for music playback.
+      const target = Math.max(this.stream.frameSize * 4, Math.round(this.stream.outRate * 0.5));
       while (this.pcmQueue.length > 0 && this._outQueuedFrames() < target) {
         this._outWrite(this.pcmQueue.shift());
         this.framesWritten++;
