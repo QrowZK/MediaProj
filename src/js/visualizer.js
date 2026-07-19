@@ -61,7 +61,13 @@ export class SpectrumVisualizer {
         Math.floor(Math.pow(10, minLog + (maxLog - minLog) * ((i + 1) / this.bars))));
       let sum = 0;
       for (let b = lo; b < hi && b < bins; b++) sum += this.buffer[b];
-      const v = sum / ((hi - lo) * 255);
+      // Real music's magnitude spectrum is bass/mid-heavy, so on a log-frequency
+      // axis the un-compensated display piles up on the left with the treble
+      // bars barely moving. A mild upward tilt toward the high bars — the same
+      // trick winamp/foobar2000-style analyzers use — spreads the energy back
+      // across the full width instead of it reading as off-center.
+      const tilt = 1 + (i / (this.bars - 1)) * 0.8;
+      const v = Math.min(1, (sum / ((hi - lo) * 255)) * tilt);
 
       // smooth decay
       this.peaks[i] = Math.max(v, this.peaks[i] * 0.88);
