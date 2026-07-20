@@ -333,6 +333,12 @@ export class AudioEngine {
 
   getSpectrumNyquist() { return this.ctx.sampleRate / 2; }
 
+  // the queued "next" is gone (queue cleared) — drop the preload
+  clearNext() {
+    this.preloadedTrack = null;
+    this.idleEl.removeAttribute('src');
+  }
+
   getSpectrum(buffer) {
     this.analyser.getByteFrequencyData(buffer);
     return buffer;

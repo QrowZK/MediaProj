@@ -2187,6 +2187,7 @@ function buildAutoplayBatch() {
 function maybeAutoplayExtend(atTrackEnd = false) {
   if (!state.settings.autoplay?.enabled) return;
   if (autoplayHold && !atTrackEnd) return; // user just cleared — wait for the song to finish
+  if (state.queue.length >= 1000) return;  // bound multi-hour sessions — the queue is not a log
   if (!state.queue.length || nextIndex(true) !== -1) return;
   const batch = buildAutoplayBatch();
   if (!batch.length) return;
@@ -2215,6 +2216,7 @@ function engineOnTrackEnd() {
 }
 
 let lastErrorToast = { msg: '', at: 0 };
+let errorStreak = 0; // consecutive engine errors; reset on any successful start
 
 function engineOnError(track, msg, transient = false) {
   // identical errors within a short window collapse into one toast
@@ -2224,6 +2226,13 @@ function engineOnError(track, msg, transient = false) {
   }
   lastErrorToast = { msg, at: now };
   if (transient) return; // settings-change hiccup: never skip the song over it
+  // circuit breaker: with autoplay feeding the queue, a library where every
+  // file fails would otherwise loop error→advance→extend forever
+  if (++errorStreak >= 8) {
+    toast('Too many consecutive playback failures — stopping', true);
+    updatePlayButton(false);
+    return;
+  }
   // auto-advance past undecodable file (autoplay may extend if it was the last)
   maybeAutoplayExtend(true);
   const idx = nextIndex();
@@ -2235,6 +2244,7 @@ function engineOnError(track, msg, transient = false) {
 
 function onTrackStarted(track) {
   playCountedFor = null;
+  errorStreak = 0;
   sessionPlayed.add(track.id);
   trackStartedAt = Math.floor(Date.now() / 1000);
   updatePlayButton(true);
@@ -2315,6 +2325,9 @@ $('#btn-play').addEventListener('click', async () => {
 });
 
 $('#btn-next').addEventListener('click', () => {
+  // an explicit "next" is a track-end intent: let autoplay extend even while
+  // a post-clear hold is set, or the button silently does nothing
+  maybeAutoplayExtend(true);
   const idx = nextIndex();
   if (idx >= 0) { state.queueIndex = idx; startTrack(state.queue[idx]); }
 });
@@ -2469,10 +2482,11 @@ $('#btn-queue').addEventListener('click', () => {
 $('#queue-clear').addEventListener('click', () => {
   state.queue = engine.currentTrack ? [engine.currentTrack] : [];
   state.queueIndex = state.queue.length ? 0 : -1;
-  // the old "next" is gone with the queue — drop the web engine's preload and
-  // let autoplay wait for the current track to finish instead of instantly
-  // refilling the list the user just emptied
-  webEngine.preloadedTrack = null;
+  // the old "next" is gone with the queue — disarm it on the ACTIVE engine
+  // immediately (native/zone would otherwise gapless-advance into a removed
+  // track before their next sync tick) and let autoplay wait for the current
+  // track to finish instead of instantly refilling the list the user emptied
+  engine.clearNext?.();
   autoplayHold = true;
   renderQueue();
 });

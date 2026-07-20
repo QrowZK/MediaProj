@@ -119,6 +119,15 @@ export class NativeEngineProxy {
     window.auralis.native.setNext(next ? this._slim(next) : null);
   }
 
+  // queue cleared: disarm the synced next NOW — waiting for the next progress
+  // tick leaves a window where the engine gapless-advances into a track the
+  // user just removed
+  clearNext() {
+    this._pendingNext = null;
+    this._lastSyncedNextId = null;
+    window.auralis.native.setNext(null);
+  }
+
   async toggle() {
     if (!this.currentTrack) return false;
     if (this.paused) { await window.auralis.native.resume(); this.paused = false; }

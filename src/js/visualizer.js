@@ -79,7 +79,11 @@ export class SpectrumVisualizer {
       let avg = sum / (hi - lo);
       if (avg > SILENCE_GATE) {
         const octavesUp = Math.log2(Math.sqrt(fLo * fHi) / fMin);
-        avg = Math.min(255, avg + TILT_DB_PER_OCTAVE * octavesUp * COUNTS_PER_DB);
+        // ramp the tilt in over ~8dB above the gate — a hard step makes
+        // near-threshold treble (fades, reverb tails) pop a third of the way
+        // up the display and strand peak-hold caps there
+        const ramp = Math.min(1, (avg - SILENCE_GATE) / 24);
+        avg = Math.min(255, avg + TILT_DB_PER_OCTAVE * octavesUp * COUNTS_PER_DB * ramp);
       }
       const v = avg / 255;
 

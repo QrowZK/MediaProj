@@ -100,6 +100,14 @@ export class ZoneEngineProxy {
     window.auralis.upnp.zoneSetNext(next ? this._slim(next) : null);
   }
 
+  // queue cleared: rescind the renderer's queued next NOW, or the physical
+  // device keeps playing the track the user just removed
+  clearNext() {
+    this._pendingNext = null;
+    this._lastSyncedNextId = null;
+    window.auralis.upnp.zoneSetNext(null);
+  }
+
   async toggle() {
     if (!this.currentTrack) return false;
     if (this.paused) { await window.auralis.upnp.zoneResume(); this.paused = false; }
