@@ -38,8 +38,9 @@ export class NativeEngineProxy {
         if (!p.advancedTo) {
           const next = this.onTrackEnd?.();
           // onTrackEnd advances app queue state; if it returns a track the
-          // main side didn't have preloaded, start it explicitly.
-          if (next) this.play(next);
+          // main side didn't have preloaded, start it explicitly — and tell
+          // the app it started, or the UI stays on the finished track.
+          if (next) this.play(next).then((ok) => { if (ok) this.onTrackStarted?.(next); });
           else this.paused = true;
         } else {
           // main advanced gapless-style; keep app queue in sync
@@ -67,6 +68,7 @@ export class NativeEngineProxy {
       window.auralis.native.on('native:viz', (v) => {
         this._levels = v.levels;
         this._spectrum.set(v.spectrum.slice(0, 512));
+        if (v.nyquist) this._vizNyquist = v.nyquist;
       }),
       window.auralis.native.on('native:signal-path', (p) => {
         this._signalPath = p;
@@ -117,6 +119,15 @@ export class NativeEngineProxy {
     window.auralis.native.setNext(next ? this._slim(next) : null);
   }
 
+  // queue cleared: disarm the synced next NOW — waiting for the next progress
+  // tick leaves a window where the engine gapless-advances into a track the
+  // user just removed
+  clearNext() {
+    this._pendingNext = null;
+    this._lastSyncedNextId = null;
+    window.auralis.native.setNext(null);
+  }
+
   async toggle() {
     if (!this.currentTrack) return false;
     if (this.paused) { await window.auralis.native.resume(); this.paused = false; }
@@ -139,6 +150,8 @@ export class NativeEngineProxy {
 
   async setOutputDevice() { /* device chosen via native output settings */ }
   async listOutputDevices() { return []; }
+
+  getSpectrumNyquist() { return this._vizNyquist || 22050; }
 
   getSpectrum(buffer) {
     buffer.set(this._spectrum.subarray(0, buffer.length));

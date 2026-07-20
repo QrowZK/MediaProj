@@ -156,6 +156,10 @@ class RendererEngine {
     const { uri, didl } = this.buildTrackUrl(track);
     this.currentTrack = track;
     this.nextUri = null;
+    this.ohNextId = null;
+    // a stale high lastPos from the previous track would make the OH poll's
+    // wrap detector read this track's opening seconds as a track change
+    this.lastPos = 0;
     if (this.mode === 'avtransport') {
       const ctl = this.device.avTransport.controlUrl;
       await soapCall(ctl, AVT, 'SetAVTransportURI', {
@@ -174,6 +178,7 @@ class RendererEngine {
         AfterId: 0, Uri: escapeXml(uri), Metadata: xmlArg(didl),
       });
       const newId = Number(xmlValue(res, 'NewId') || 0);
+      this.ohCurrentId = newId;
       await soapCall(ctl, OH_PLAYLIST, 'SeekId', { Value: newId });
       await soapCall(ctl, OH_PLAYLIST, 'Play', {});
       if (startAt > 1) {
@@ -189,7 +194,26 @@ class RendererEngine {
 
   async setNext(track) {
     this.nextTrack = track;
-    if (!this.device || !track) return;
+    if (!this.device) return;
+    if (!track) {
+      // RESCIND the queued next on the physical renderer — just forgetting it
+      // locally leaves the device primed to play a track the user removed
+      // (the exact "Clear Queue keeps playing the old queue" failure)
+      if (this.mode === 'avtransport' && this.nextUri) {
+        this.nextUri = null;
+        await soapCall(this.device.avTransport.controlUrl, AVT, 'SetNextAVTransportURI', {
+          InstanceID: 0, NextURI: '', NextURIMetaData: '',
+        }).catch(() => { /* some renderers refuse an empty next — best effort */ });
+      } else if (this.mode === 'openhome' && this.ohNextId) {
+        const id = this.ohNextId;
+        this.ohNextId = null;
+        this.nextUri = null;
+        await soapCall(this.device.ohPlaylist.controlUrl, OH_PLAYLIST, 'DeleteId', {
+          Value: id,
+        }).catch(() => { /* fine */ });
+      }
+      return;
+    }
     if (this.mode === 'avtransport') {
       const { uri, didl } = this.buildTrackUrl(track);
       this.nextUri = uri;
@@ -199,9 +223,19 @@ class RendererEngine {
     } else {
       const { uri, didl } = this.buildTrackUrl(track);
       this.nextUri = uri;
-      await soapCall(this.device.ohPlaylist.controlUrl, OH_PLAYLIST, 'Insert', {
-        AfterId: 0, Uri: escapeXml(uri), Metadata: xmlArg(didl),
-      }).catch(() => { this.nextUri = null; });
+      // replace any previously queued next, and insert AFTER the playing
+      // entry — AfterId 0 puts it at the playlist HEAD, where the renderer
+      // would never reach it and gapless silently never happened
+      if (this.ohNextId) {
+        await soapCall(this.device.ohPlaylist.controlUrl, OH_PLAYLIST, 'DeleteId', {
+          Value: this.ohNextId,
+        }).catch(() => { /* fine */ });
+        this.ohNextId = null;
+      }
+      const res = await soapCall(this.device.ohPlaylist.controlUrl, OH_PLAYLIST, 'Insert', {
+        AfterId: this.ohCurrentId || 0, Uri: escapeXml(uri), Metadata: xmlArg(didl),
+      }).catch(() => { this.nextUri = null; return null; });
+      if (res) this.ohNextId = Number(xmlValue(res, 'NewId') || 0) || null;
     }
   }
 
@@ -299,6 +333,8 @@ class RendererEngine {
           this.currentTrack = next;
           this.nextTrack = null;
           this.nextUri = null;
+          this.ohCurrentId = this.ohNextId || this.ohCurrentId;
+          this.ohNextId = null;
           this.emit('upnp:track-ended', { advancedTo: next?.id || null });
           this.emit('upnp:track-changed', { trackId: next?.id || null });
         } else {
@@ -328,6 +364,8 @@ class RendererEngine {
     this.currentTrack = null;
     this.nextTrack = null;
     this.nextUri = null;
+    this.ohNextId = null;
+    this.ohCurrentId = null;
     this.lastPos = 0;
   }
 }

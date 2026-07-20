@@ -44,10 +44,24 @@ export class SpectrumVisualizer {
     this.engine.getSpectrum(this.buffer);
 
     const bins = this.buffer.length;
-    const minLog = Math.log10(2);            // skip DC
-    const maxLog = Math.log10(bins - 1);
     const barW = w / this.bars;
     const usableH = h * 0.9;
+
+    // Map bars to REAL frequencies: 30 Hz … 16 kHz log-spaced against the
+    // engine's actual Nyquist (differs per engine and per machine). The old
+    // mapping spread raw bin INDICES to the full Nyquist — parking the top
+    // third of the display in the 10–24 kHz band where music has nothing.
+    const ny = this.engine.getSpectrumNyquist?.() || 22050;
+    const fMin = 30;
+    const fMax = Math.min(16000, ny * 0.95);
+    const logSpan = Math.log(fMax / fMin);
+    // Spectrum bytes are LINEAR IN dB (both engines map -90..0 dB → 0..255,
+    // ~2.83 counts/dB), so pink-noise slope compensation must be ADDITIVE in
+    // counts — multiplying a dB-scaled value skews loud bins harder than
+    // quiet ones, which is why the old multiplicative tilt barely helped.
+    const COUNTS_PER_DB = 255 / 90;
+    const TILT_DB_PER_OCTAVE = 3.5;
+    const SILENCE_GATE = 6; // ≈ -88 dB: don't tilt the noise floor into fake bars
 
     const grad = c.createLinearGradient(0, h, 0, h - usableH);
     grad.addColorStop(0, 'rgba(207, 139, 62, 0.75)');
@@ -55,19 +69,23 @@ export class SpectrumVisualizer {
     grad.addColorStop(1, 'rgba(240, 214, 160, 0.35)');
 
     for (let i = 0; i < this.bars; i++) {
-      // logarithmic frequency mapping
-      const lo = Math.floor(Math.pow(10, minLog + (maxLog - minLog) * (i / this.bars)));
-      const hi = Math.max(lo + 1,
-        Math.floor(Math.pow(10, minLog + (maxLog - minLog) * ((i + 1) / this.bars))));
+      const fLo = fMin * Math.exp(logSpan * (i / this.bars));
+      const fHi = fMin * Math.exp(logSpan * ((i + 1) / this.bars));
+      // skip bin 0 (DC): sub-bin-width bass bars would otherwise read silence
+      const lo = Math.max(1, Math.min(bins - 1, Math.floor(fLo / ny * bins)));
+      const hi = Math.max(lo + 1, Math.min(bins, Math.ceil(fHi / ny * bins)));
       let sum = 0;
-      for (let b = lo; b < hi && b < bins; b++) sum += this.buffer[b];
-      // Real music's magnitude spectrum is bass/mid-heavy, so on a log-frequency
-      // axis the un-compensated display piles up on the left with the treble
-      // bars barely moving. A mild upward tilt toward the high bars — the same
-      // trick winamp/foobar2000-style analyzers use — spreads the energy back
-      // across the full width instead of it reading as off-center.
-      const tilt = 1 + (i / (this.bars - 1)) * 0.8;
-      const v = Math.min(1, (sum / ((hi - lo) * 255)) * tilt);
+      for (let b = lo; b < hi; b++) sum += this.buffer[b];
+      let avg = sum / (hi - lo);
+      if (avg > SILENCE_GATE) {
+        const octavesUp = Math.log2(Math.sqrt(fLo * fHi) / fMin);
+        // ramp the tilt in over ~8dB above the gate — a hard step makes
+        // near-threshold treble (fades, reverb tails) pop a third of the way
+        // up the display and strand peak-hold caps there
+        const ramp = Math.min(1, (avg - SILENCE_GATE) / 24);
+        avg = Math.min(255, avg + TILT_DB_PER_OCTAVE * octavesUp * COUNTS_PER_DB * ramp);
+      }
+      const v = avg / 255;
 
       // smooth decay
       this.peaks[i] = Math.max(v, this.peaks[i] * 0.88);
