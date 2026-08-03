@@ -703,11 +703,24 @@ class NativeAudioEngine {
   }
 
   _outWrite(buf) {
-    if (this.stream?.backend === 'wasapi-ex') {
-      wasapiEx.write(this.wexHandle, buf);
-    } else {
-      this.rt.write(buf);
-      this.stream.depth.written++;
+    // Never let a device-write throw escape: _fill runs from a 10ms interval
+    // and the RtAudio callback — an exception there is an uncaught
+    // main-process error repeating every tick (device unplugged/invalidated
+    // mid-write, e.g. under heavy load).
+    try {
+      if (this.stream?.backend === 'wasapi-ex') {
+        wasapiEx.write(this.wexHandle, buf);
+      } else {
+        this.rt.write(buf);
+        this.stream.depth.written++;
+      }
+    } catch (err) {
+      const now = Date.now();
+      if (now - (this.lastWriteErrAt || 0) > 5000) {
+        this.lastWriteErrAt = now;
+        this.emit('native:error', { message: 'Device write failed: ' + err.message, transient: true });
+      }
+      return;
     }
     // emit the viz frame computed at decode time now that its audio is
     // actually headed to the device — write cadence follows playback, so the

@@ -52,7 +52,9 @@ export class SpectrumVisualizer {
     // mapping spread raw bin INDICES to the full Nyquist — parking the top
     // third of the display in the 10–24 kHz band where music has nothing.
     const ny = this.engine.getSpectrumNyquist?.() || 22050;
-    const fMin = 30;
+    // floor the display where the FFT actually has resolution — bars below
+    // ~1.5 bins would all mirror bin 1 and render as a rigid slanted cluster
+    const fMin = Math.max(30, 1.5 * ny / bins);
     const fMax = Math.min(16000, ny * 0.95);
     const logSpan = Math.log(fMax / fMin);
     // Spectrum bytes are LINEAR IN dB (both engines map -90..0 dB → 0..255,
@@ -74,9 +76,21 @@ export class SpectrumVisualizer {
       // skip bin 0 (DC): sub-bin-width bass bars would otherwise read silence
       const lo = Math.max(1, Math.min(bins - 1, Math.floor(fLo / ny * bins)));
       const hi = Math.max(lo + 1, Math.min(bins, Math.ceil(fHi / ny * bins)));
-      let sum = 0;
-      for (let b = lo; b < hi; b++) sum += this.buffer[b];
-      let avg = sum / (hi - lo);
+      let avg;
+      if (hi - lo <= 1) {
+        // bar narrower than one FFT bin: INTERPOLATE at its center frequency.
+        // Flat-reading the floor bin makes every bass bar mirror the same bin,
+        // and with the per-bar tilt that renders as a fixed slanted ramp
+        // bouncing in unison across the display's left side.
+        const p = Math.max(1, Math.min(bins - 1.001, Math.sqrt(fLo * fHi) / ny * bins - 0.5));
+        const b0 = Math.floor(p);
+        const frac = p - b0;
+        avg = this.buffer[b0] * (1 - frac) + this.buffer[Math.min(bins - 1, b0 + 1)] * frac;
+      } else {
+        let sum = 0;
+        for (let b = lo; b < hi; b++) sum += this.buffer[b];
+        avg = sum / (hi - lo);
+      }
       if (avg > SILENCE_GATE) {
         const octavesUp = Math.log2(Math.sqrt(fLo * fHi) / fMin);
         // ramp the tilt in over ~8dB above the gate — a hard step makes
