@@ -2108,6 +2108,7 @@ window.auralis.library.onScanProgress((p) => {
 // ── Queue & transport ────────────────────────────────────────────────────
 
 function playTracks(tracks, startIdx) {
+  autoplayHold = false; // explicit user start — normal autoplay behavior resumes
   state.queue = [...tracks];
   state.queueIndex = startIdx;
   if (state.shuffle) {
@@ -2144,20 +2145,35 @@ function nextIndex(forEnd = false) {
 
 const AUTOPLAY_BATCH_SIZE = 20;
 
+// Everything the user has actually heard this session — autoplay must not
+// serve these back. The queue alone can't carry this history: "Clear Queue"
+// empties it, which is exactly when the just-played album became re-pickable.
+const sessionPlayed = new Set();
+
+// Set by "Clear Queue": the user just asked for an empty list, so don't
+// visibly refill it a quarter-second later — extend only once the current
+// track actually ends (autoplay's keep-playing promise still holds).
+let autoplayHold = false;
+
 function buildAutoplayBatch() {
   const tracks = state.library.tracks || [];
   if (!tracks.length) return [];
   const mode = state.settings.autoplay?.mode || 'random';
   const queued = new Set(state.queue.map((t) => t.id));
+  const fresh = (t) => !queued.has(t.id) && !sessionPlayed.has(t.id);
+  // exclusion tiers: unheard first; relax to not-queued; repeat before stopping
   let pool;
   if (mode === 'sameArtist') {
     const artist = state.queue[state.queue.length - 1]?.artist;
-    pool = tracks.filter((t) => t.artist === artist && !queued.has(t.id));
-    if (!pool.length) pool = tracks.filter((t) => t.artist === artist); // only track(s) by this artist — repeat rather than stop
+    const byArtist = tracks.filter((t) => t.artist === artist);
+    pool = byArtist.filter(fresh);
+    if (!pool.length) pool = byArtist.filter((t) => !queued.has(t.id));
+    if (!pool.length) pool = byArtist;
   } else {
-    pool = tracks.filter((t) => !queued.has(t.id));
+    pool = tracks.filter(fresh);
+    if (!pool.length) pool = tracks.filter((t) => !queued.has(t.id));
   }
-  if (!pool.length) pool = tracks.slice(); // whole library already queued — repeat rather than stop
+  if (!pool.length) pool = tracks.slice();
   const shuffled = [...pool];
   shuffleArray(shuffled);
   return shuffled.slice(0, AUTOPLAY_BATCH_SIZE);
@@ -2168,11 +2184,14 @@ function buildAutoplayBatch() {
 // tracks) and onTrackEnd (belt-and-braces). Self-limiting: once appended,
 // nextIndex() no longer returns -1, so this is a no-op until that batch
 // itself runs out — which is exactly what keeps autoplay continuous.
-function maybeAutoplayExtend() {
+function maybeAutoplayExtend(atTrackEnd = false) {
   if (!state.settings.autoplay?.enabled) return;
+  if (autoplayHold && !atTrackEnd) return; // user just cleared — wait for the song to finish
+  if (state.queue.length >= 1000) return;  // bound multi-hour sessions — the queue is not a log
   if (!state.queue.length || nextIndex(true) !== -1) return;
   const batch = buildAutoplayBatch();
   if (!batch.length) return;
+  autoplayHold = false;
   const mode = state.settings.autoplay?.mode || 'random';
   const artist = state.queue[state.queue.length - 1]?.artist;
   state.queue.push(...batch);
@@ -2189,7 +2208,7 @@ function enginePeekNext() {
 }
 
 function engineOnTrackEnd() {
-  maybeAutoplayExtend();
+  maybeAutoplayExtend(true);
   const idx = nextIndex(true);
   if (idx < 0) { updatePlayButton(false); return null; }
   state.queueIndex = idx;
@@ -2197,6 +2216,7 @@ function engineOnTrackEnd() {
 }
 
 let lastErrorToast = { msg: '', at: 0 };
+let errorStreak = 0; // consecutive engine errors; reset on any successful start
 
 function engineOnError(track, msg, transient = false) {
   // identical errors within a short window collapse into one toast
@@ -2206,7 +2226,15 @@ function engineOnError(track, msg, transient = false) {
   }
   lastErrorToast = { msg, at: now };
   if (transient) return; // settings-change hiccup: never skip the song over it
-  // auto-advance past undecodable file
+  // circuit breaker: with autoplay feeding the queue, a library where every
+  // file fails would otherwise loop error→advance→extend forever
+  if (++errorStreak >= 8) {
+    toast('Too many consecutive playback failures — stopping', true);
+    updatePlayButton(false);
+    return;
+  }
+  // auto-advance past undecodable file (autoplay may extend if it was the last)
+  maybeAutoplayExtend(true);
   const idx = nextIndex();
   if (idx >= 0 && idx !== state.queueIndex) {
     state.queueIndex = idx;
@@ -2216,6 +2244,8 @@ function engineOnError(track, msg, transient = false) {
 
 function onTrackStarted(track) {
   playCountedFor = null;
+  errorStreak = 0;
+  sessionPlayed.add(track.id);
   trackStartedAt = Math.floor(Date.now() / 1000);
   updatePlayButton(true);
   updateMiniUi(track);
@@ -2295,6 +2325,9 @@ $('#btn-play').addEventListener('click', async () => {
 });
 
 $('#btn-next').addEventListener('click', () => {
+  // an explicit "next" is a track-end intent: let autoplay extend even while
+  // a post-clear hold is set, or the button silently does nothing
+  maybeAutoplayExtend(true);
   const idx = nextIndex();
   if (idx >= 0) { state.queueIndex = idx; startTrack(state.queue[idx]); }
 });
@@ -2449,6 +2482,12 @@ $('#btn-queue').addEventListener('click', () => {
 $('#queue-clear').addEventListener('click', () => {
   state.queue = engine.currentTrack ? [engine.currentTrack] : [];
   state.queueIndex = state.queue.length ? 0 : -1;
+  // the old "next" is gone with the queue — disarm it on the ACTIVE engine
+  // immediately (native/zone would otherwise gapless-advance into a removed
+  // track before their next sync tick) and let autoplay wait for the current
+  // track to finish instead of instantly refilling the list the user emptied
+  engine.clearNext?.();
+  autoplayHold = true;
   renderQueue();
 });
 
