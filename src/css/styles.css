@@ -928,6 +928,16 @@ select.styled:focus { border-color: var(--accent-2); }
   width: auto;
   opacity: 1;
 }
+.artist-link {
+  cursor: pointer;
+  transition: color 0.15s;
+}
+.artist-link:hover {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
 .np-lyrics-scroll {
   position: relative; /* offsetParent for .lyric-line — the auto-scroll math
                          reads offsetTop relative to this container */

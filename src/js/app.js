@@ -350,7 +350,7 @@ function renderAlbumDetail() {
       <div class="hero-meta">
         <div class="hero-kicker">Album${album.year ? ` · ${album.year}` : ''}</div>
         <div class="hero-title">${esc(album.album)}</div>
-        <div class="hero-sub"><b>${esc(album.artist)}</b> · ${album.tracks.length} tracks · ${fmtLongTime(album.duration)}</div>
+        <div class="hero-sub"><b><a class="artist-link" id="hero-artist" title="Go to artist">${esc(album.artist)}</a></b> · ${album.tracks.length} tracks · ${fmtLongTime(album.duration)}</div>
         <div class="hero-actions">
           <button class="btn primary" id="hero-play">
             <svg viewBox="0 0 24 24" width="15" height="15"><path d="M8 5v14l11-7z" fill="currentColor"/></svg>
@@ -363,6 +363,7 @@ function renderAlbumDetail() {
     </div>
     ${trackTable(album.tracks, { numbers: true })}`;
   $('#back-btn').addEventListener('click', () => go('albums'));
+  $('#hero-artist').addEventListener('click', () => go('artist', album.artist));
   $('#hero-play').addEventListener('click', () => playTracks(album.tracks, 0));
   $('#hero-shuffle').addEventListener('click', () => {
     state.shuffle = true;
