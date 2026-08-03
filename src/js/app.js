@@ -350,7 +350,7 @@ function renderAlbumDetail() {
       <div class="hero-meta">
         <div class="hero-kicker">Album${album.year ? ` · ${album.year}` : ''}</div>
         <div class="hero-title">${esc(album.album)}</div>
-        <div class="hero-sub"><b>${esc(album.artist)}</b> · ${album.tracks.length} tracks · ${fmtLongTime(album.duration)}</div>
+        <div class="hero-sub"><b><a class="artist-link" id="hero-artist" title="Go to artist">${esc(album.artist)}</a></b> · ${album.tracks.length} tracks · ${fmtLongTime(album.duration)}</div>
         <div class="hero-actions">
           <button class="btn primary" id="hero-play">
             <svg viewBox="0 0 24 24" width="15" height="15"><path d="M8 5v14l11-7z" fill="currentColor"/></svg>
@@ -363,6 +363,7 @@ function renderAlbumDetail() {
     </div>
     ${trackTable(album.tracks, { numbers: true })}`;
   $('#back-btn').addEventListener('click', () => go('albums'));
+  $('#hero-artist').addEventListener('click', () => go('artist', album.artist));
   $('#hero-play').addEventListener('click', () => playTracks(album.tracks, 0));
   $('#hero-shuffle').addEventListener('click', () => {
     state.shuffle = true;
@@ -2081,7 +2082,11 @@ function hideScanStrip() {
   scanStrip = null;
 }
 
+let scanActive = false;
+
 async function runScan(folders) {
+  if (scanActive) return; // a scan is already running — main joins it anyway
+  scanActive = true;
   showScanStrip('Scanning…');
   try {
     const lib = await window.auralis.library.scan(folders);
@@ -2093,11 +2098,15 @@ async function runScan(folders) {
   } catch (err) {
     toast('Scan failed: ' + err.message, true);
   } finally {
+    // flag BEFORE hiding: the final progress IPC event can arrive after the
+    // invoke resolves and would resurrect the strip forever
+    scanActive = false;
     hideScanStrip();
   }
 }
 
 window.auralis.library.onScanProgress((p) => {
+  if (!scanActive) return; // stale event racing the scan's completion
   if (p.phase === 'discover') {
     showScanStrip(`Discovering files… ${p.found.toLocaleString()}`);
   } else {
@@ -2271,13 +2280,14 @@ function onTrackStarted(track) {
   if (track.genre) badges.push(`<span class="badge">${esc(track.genre.toUpperCase())}</span>`);
   $('#np-quality').innerHTML = badges.join('');
 
-  // MediaSession (OS media keys / overlay)
+  // MediaSession (OS media keys / overlay). Artwork is omitted: MediaImage
+  // only accepts http/https/data/blob, and our auralis:// URLs logged a
+  // console error on every track start.
   if ('mediaSession' in navigator) {
     navigator.mediaSession.metadata = new MediaMetadata({
       title: track.title,
       artist: track.artist,
       album: track.album,
-      artwork: track.artUrl ? [{ src: track.artUrl, sizes: '512x512' }] : [],
     });
   }
 
