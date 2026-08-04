@@ -357,6 +357,7 @@ function renderAlbumDetail() {
             Play
           </button>
           <button class="btn" id="hero-shuffle">Shuffle</button>
+          <button class="btn" id="hero-export">Export…</button>
           ${qualityBadgeClass(album.best) ? `<span class="badge ${qualityBadgeClass(album.best)}">${esc(qualityLabel(album.best))}</span>` : ''}
         </div>
       </div>
@@ -370,6 +371,7 @@ function renderAlbumDetail() {
     updateTransportUi();
     playTracks(album.tracks, Math.floor(Math.random() * album.tracks.length));
   });
+  $('#hero-export').addEventListener('click', () => openExportModal(album.tracks, album.album));
   bindTrackTable(album.tracks);
 }
 
@@ -1051,11 +1053,13 @@ function renderPlaylist() {
       <span class="spacer"></span>
       <button class="btn primary" id="pl-play">Play</button>
       ${p.smart ? '<button class="btn" id="pl-edit">Edit Rules</button>' : ''}
+      ${tracks.length ? '<button class="btn" id="pl-export">Export…</button>' : ''}
       <button class="btn danger" id="pl-delete">Delete</button>
     </div>
     ${tracks.length ? trackTable(tracks) : `<p style="color:var(--text-3)">${p.smart ? 'No tracks match these rules yet.' : 'Right-click any track → “Add to Playlist”.'}</p>`}`;
   $('#pl-play').addEventListener('click', () => tracks.length && playTracks(tracks, 0));
   $('#pl-edit')?.addEventListener('click', () => openSmartPlaylistBuilder(p));
+  $('#pl-export')?.addEventListener('click', () => openExportModal(tracks, p.name));
   $('#pl-delete').addEventListener('click', async () => {
     state.playlists = state.playlists.filter((x) => x.id !== p.id);
     await savePlaylists();
@@ -1153,6 +1157,7 @@ async function renderSettings() {
         <div style="display:flex;gap:10px;margin-top:12px">
           <button class="btn primary" id="settings-add-folder">Add Folder</button>
           <button class="btn" id="settings-rescan">Rescan Library</button>
+          <button class="btn" id="settings-export-library" ${state.library.tracks.length ? '' : 'disabled'}>Export Library…</button>
         </div>
       </div>
 
@@ -1764,6 +1769,7 @@ async function renderSettings() {
 
   $('#settings-add-folder').addEventListener('click', addFolders);
   $('#settings-rescan').addEventListener('click', rescan);
+  $('#settings-export-library')?.addEventListener('click', () => openExportModal(state.library.tracks, 'Library'));
   content.querySelectorAll('.rm[data-folder]').forEach((b) =>
     b.addEventListener('click', async () => {
       const folders = state.library.folders.filter((f) => f !== b.dataset.folder);
@@ -2113,6 +2119,123 @@ window.auralis.library.onScanProgress((p) => {
     showScanStrip(`Reading metadata — ${p.file}`, Math.round((p.done / p.total) * 100));
   }
 });
+
+// ── Library export ───────────────────────────────────────────────────────
+
+const EXPORT_FORMATS = [
+  ['copy', 'Keep original (copy)'],
+  ['flac', 'FLAC (lossless)'],
+  ['alac', 'ALAC (lossless, Apple)'],
+  ['mp3_320', 'MP3 320 kbps'],
+  ['mp3_v0', 'MP3 V0 (VBR, ~245 kbps)'],
+  ['aac_256', 'AAC 256 kbps'],
+];
+
+let exportStrip = null;
+function showExportStrip(text, pct) {
+  if (!exportStrip) {
+    exportStrip = document.createElement('div');
+    exportStrip.id = 'export-strip';
+    exportStrip.innerHTML = `<div class="spin"></div><span class="es-text"></span><span class="pct"></span><button class="es-cancel" id="export-strip-cancel">Cancel</button>`;
+    document.body.appendChild(exportStrip);
+    $('#export-strip-cancel').addEventListener('click', () => window.auralis.library.cancelExport());
+  }
+  exportStrip.querySelector('.es-text').textContent = text;
+  exportStrip.querySelector('.pct').textContent = pct != null ? `${pct}%` : '';
+}
+function hideExportStrip() {
+  exportStrip?.remove();
+  exportStrip = null;
+}
+
+let exportActive = false;
+
+window.auralis.library.onExportProgress((p) => {
+  if (!exportActive) return;
+  const pct = p.total ? Math.round((p.done / p.total) * 100) : 0;
+  showExportStrip(p.file ? `Exporting — ${p.file}` : `Exporting ${p.done}/${p.total}…`, pct);
+});
+
+function openExportModal(tracks, label) {
+  if (!tracks.length) return;
+  const root = $('#modal-root');
+  let destDir = null;
+  root.innerHTML = `
+    <div class="modal export-modal">
+      <h3>Export “${esc(label)}”</h3>
+      <div class="desc">${tracks.length} track${tracks.length === 1 ? '' : 's'}. Files are organized as Artist/Album/Track — Title, with cover.jpg per album.</div>
+      <div class="setting-row" style="padding-top:0">
+        <div><div class="lbl">Quality</div></div>
+        <select class="styled" id="export-format" style="width:200px">
+          ${EXPORT_FORMATS.map(([k, l]) => `<option value="${k}">${esc(l)}</option>`).join('')}
+        </select>
+      </div>
+      <div class="setting-row">
+        <div><div class="lbl">Downsample to 16-bit/44.1kHz</div>
+          <div class="hint">Smaller files for phones and DAPs. Ignored when keeping originals.</div></div>
+        <button class="toggle disabled" id="export-downsample"></button>
+      </div>
+      <div class="setting-row">
+        <div><div class="lbl">Destination</div>
+          <div class="hint" id="export-dest-path" style="word-break:break-all">No folder chosen.</div></div>
+        <button class="btn" id="export-choose-folder">Choose…</button>
+      </div>
+      <div class="modal-actions">
+        <button class="btn" id="export-cancel">Cancel</button>
+        <button class="btn primary" id="export-start" disabled>Export</button>
+      </div>
+    </div>`;
+  root.classList.remove('hidden');
+  const close = () => { root.classList.add('hidden'); root.innerHTML = ''; };
+  $('#export-cancel').addEventListener('click', close);
+
+  const updateStartEnabled = () => { $('#export-start').disabled = !destDir; };
+
+  $('#export-format').addEventListener('change', (e) => {
+    const copy = e.target.value === 'copy';
+    $('#export-downsample').classList.toggle('disabled', copy);
+  });
+
+  $('#export-downsample').addEventListener('click', (e) => {
+    if (e.target.classList.contains('disabled')) return;
+    e.target.classList.toggle('on');
+  });
+
+  $('#export-choose-folder').addEventListener('click', async () => {
+    const picked = await window.auralis.library.chooseExportFolder();
+    if (!picked) return;
+    destDir = picked;
+    $('#export-dest-path').textContent = destDir;
+    updateStartEnabled();
+  });
+
+  $('#export-start').addEventListener('click', async () => {
+    if (!destDir) return;
+    const format = $('#export-format').value;
+    const downsample = $('#export-downsample').classList.contains('on') && format !== 'copy';
+    const trackIds = tracks.map((t) => t.id);
+    close();
+    exportActive = true;
+    showExportStrip('Exporting…', 0);
+    try {
+      const res = await window.auralis.library.export({ trackIds, destDir, format, downsample });
+      exportActive = false;
+      hideExportStrip();
+      if (res.cancelled) {
+        toast(`Export cancelled — ${res.exported} track${res.exported === 1 ? '' : 's'} written`);
+        return;
+      }
+      const bits = [`${res.exported} exported`];
+      if (res.skipped) bits.push(`${res.skipped} already present`);
+      if (res.failed) bits.push(`${res.failed} failed`);
+      toast(bits.join(', '), res.failed > 0, { label: 'Show in Folder', fn: () => window.auralis.shell.showItem(res.destDir) });
+    } catch (err) {
+      exportActive = false;
+      hideExportStrip();
+      toast('Export failed: ' + err.message, true);
+    }
+  });
+}
 
 // ── Queue & transport ────────────────────────────────────────────────────
 
@@ -2690,6 +2813,7 @@ function openTrackMenu(e, tracks, idx, playlistCtx = null) {
         render();
       } }] : []),
     { sep: true },
+    { label: 'Export…', fn: () => openExportModal([track], track.title) },
     { label: 'Show in File Explorer', fn: () => window.auralis.shell.showItem(track.path) },
   ];
   ctxMenu.innerHTML = items.map((it, i) =>

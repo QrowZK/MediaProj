@@ -30,6 +30,7 @@ const ART_CACHE_DIR = () => path.join(app.getPath('userData'), 'art-cache');
 
 let mainWindow = null;
 let scanCancelled = false;
+let activeExporter = null;
 
 // music-metadata is ESM-only; load it lazily via dynamic import.
 let mmPromise = null;
@@ -538,6 +539,31 @@ function registerIpc() {
     scanCancelled = true;
     activeScan?.worker?.postMessage({ type: 'cancel' });
   });
+
+  ipcMain.handle('library:choose-export-folder', async () => {
+    const res = await dialog.showOpenDialog(mainWindow, {
+      title: 'Export To…',
+      properties: ['openDirectory', 'createDirectory'],
+    });
+    return res.canceled ? null : res.filePaths[0];
+  });
+
+  ipcMain.handle('library:export', async (_e, { trackIds, destDir, format, downsample }) => {
+    if (activeExporter) return { ok: false, error: 'An export is already running' };
+    const { LibraryExporter } = require('./export');
+    const lib = await readJson(LIBRARY_FILE(), { tracks: [] });
+    const byId = new Map(lib.tracks.map((t) => [t.id, t]));
+    const tracks = (trackIds || []).map((id) => byId.get(id)).filter(Boolean);
+    activeExporter = new LibraryExporter({ resolveArtPath: decodeMediaUrl });
+    try {
+      return await activeExporter.run(tracks, destDir, { format, downsample }, (p) => {
+        mainWindow?.webContents.send('export:progress', p);
+      });
+    } finally {
+      activeExporter = null;
+    }
+  });
+  ipcMain.handle('library:cancel-export', () => { activeExporter?.cancel(); });
 
   ipcMain.handle('settings:get', () => readJson(SETTINGS_FILE(), {}));
   ipcMain.handle('settings:set', async (_e, settings) => writeJson(SETTINGS_FILE(), settings));
