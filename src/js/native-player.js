@@ -49,6 +49,9 @@ export class NativeEngineProxy {
       }),
       window.auralis.native.on('native:track-changed', () => {
         const track = this._pendingNext;
+        // re-arm setNext on the next progress tick (repeat-one yields the
+        // same id each loop, which the dedupe would otherwise swallow)
+        this._lastSyncedNextId = null;
         if (track) {
           this.currentTrack = track;
           this._pendingNext = null;
@@ -88,12 +91,12 @@ export class NativeEngineProxy {
 
   get buffered() { return 0; }
 
-  async play(track) {
+  async play(track, startAt = 0) {
     this.currentTrack = track;
     this.duration = track.duration || 0;
-    this.currentTime = 0;
+    this.currentTime = startAt || 0;
     this._lastSyncedNextId = null;
-    const res = await window.auralis.native.play(this._slim(track), 0);
+    const res = await window.auralis.native.play(this._slim(track), startAt || 0);
     if (!res.ok) {
       this.onError?.(track, res.error || 'Native playback failed');
       return false;

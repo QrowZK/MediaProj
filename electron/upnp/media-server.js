@@ -6,6 +6,7 @@
 
 const http = require('http');
 const fs = require('fs');
+const { pipeline } = require('stream');
 const fsp = fs.promises;
 const path = require('path');
 const { SsdpAdvertiser, localIPv4 } = require('./ssdp');
@@ -384,11 +385,11 @@ class MediaServer {
         'Content-Length': end - start + 1,
       });
       if (req.method === 'HEAD') return res.end();
-      fs.createReadStream(track.path, { start, end }).pipe(res);
+      pipeline(fs.createReadStream(track.path, { start, end }), res, () => {});
     } else {
       res.writeHead(200, { ...headers, 'Content-Length': stat.size });
       if (req.method === 'HEAD') return res.end();
-      fs.createReadStream(track.path).pipe(res);
+      pipeline(fs.createReadStream(track.path), res, () => {});
     }
   }
 

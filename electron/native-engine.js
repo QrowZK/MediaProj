@@ -410,14 +410,16 @@ class NativeAudioEngine {
         this.rt.outputVolume = Math.pow(this.config.volume, 2);
       }
     } catch { /* stream mid-teardown */ }
-    if (wasOutput !== this._outputKey() && this.currentTrack) {
-      // output target / pipeline topology changed mid-play: restart in place.
+    if (wasOutput !== this._outputKey() && this.currentTrack && !this.ended) {
+      // output target / pipeline topology changed mid-play: restart in place
+      // (paused stays paused; a finished track is left alone — restarting it
+      // at its end would re-fire track-ended and advance the queue).
       // Failures inside this window are flagged transient so the UI doesn't
       // advance the queue over a settings tweak.
       this.restartUntil = Date.now() + 2500;
       const pos = this.getPosition();
       const track = this.currentTrack;
-      this.play(track, pos).catch((err) => {
+      this.play(track, pos, false, { startPaused: !this.playing }).catch((err) => {
         this.emit('native:error', { message: err.message });
       });
     } else if (this.dspState) {
@@ -518,7 +520,24 @@ class NativeAudioEngine {
     return { mode: 'dsp', channels, outRate, decodeRate, format: c.outputFormat || 'f32' };
   }
 
-  async play(track, startAt = 0, gaplessJoin = false) {
+  // Would playing `track` next force the output stream to be reopened (which
+  // drops whatever is still queued at the device)? Mirrors play()'s needOpen.
+  _wouldReopen(track) {
+    if (!this.stream) return true;
+    const plan = this._planFor(track);
+    const useWex = this.config.wasapiExclusive && wasapiEx;
+    if (useWex && plan.format === 'f32') plan.format = 's32';
+    return this.stream.outRate !== plan.outRate ||
+      this.stream.channels !== plan.channels ||
+      this.stream.format !== plan.format ||
+      this.stream.mode !== plan.mode ||
+      this.stream.backend !== (useWex ? 'wasapi-ex' : 'rtaudio');
+  }
+
+  // opts.startPaused: prepare the track (decoder + device) but leave the
+  // transport paused — used by seek/config-restart while the user is paused,
+  // so those never silently un-pause.
+  async play(track, startAt = 0, gaplessJoin = false, opts = {}) {
     if (!this.available) throw new Error('Native output backend not available');
     // Overlap guard: a second play() (seek/track pick) can interleave at the
     // probeSoxr await below — its stopDecoder() runs before WE assign
@@ -530,6 +549,7 @@ class NativeAudioEngine {
     this.pcmQueue = [];
     this.residual = Buffer.alloc(0);
     this.decodeEnded = false;
+    this.ended = false;
     this.currentTrack = track;
     this.framesWritten = 0;
     this.startOffset = startAt;
@@ -585,11 +605,20 @@ class NativeAudioEngine {
     if (plan.mode === 'dop') this._startDopReader(track, startAt, plan);
     else this._spawnDecoder(track, startAt, plan);
 
-    this.playing = true;
-    this._outStart();
-    this._primeQueue();
-    this._startProgress();
-    this.emit('native:state', { playing: true });
+    if (opts.startPaused) {
+      // decoder fills pcmQueue up to its backpressure limit and waits;
+      // resume() starts the device and the progress clock from here.
+      this.playing = false;
+      this._stopProgress();
+      this.emit('native:state', { playing: false });
+      this.emit('native:progress', { time: startAt, duration: track.duration || 0 });
+    } else {
+      this.playing = true;
+      this._outStart();
+      this._primeQueue();
+      this._startProgress();
+      this.emit('native:state', { playing: true });
+    }
     if (plan.mode !== 'dsp') {
       // no DSP taps on this path — blank the meters instead of freezing them
       this.emit('native:viz', { levels: [0, 0], spectrum: new Array(512).fill(0), nyquist: Math.min(plan.outRate / 2, 24000) });
@@ -720,7 +749,7 @@ class NativeAudioEngine {
         this.lastWriteErrAt = now;
         this.emit('native:error', { message: 'Device write failed: ' + err.message, transient: true });
       }
-      return;
+      return false;
     }
     // emit the viz frame computed at decode time now that its audio is
     // actually headed to the device — write cadence follows playback, so the
@@ -729,6 +758,7 @@ class NativeAudioEngine {
       this.lastVizEmit = Date.now();
       this.emit('native:viz', buf._viz);
     }
+    return true;
   }
 
   // Un-played audio sitting between us and the DAC (frames)
@@ -807,14 +837,25 @@ class NativeAudioEngine {
     let errBuf = '';
     child.stderr.on('data', (d) => { errBuf += d; });
     child.stdout.on('data', (chunk) => this._onPcm(child, chunk));
+    child.on('error', (err) => {
+      // spawn failure (binary missing/unexecutable) — without a listener this
+      // is an uncaught main-process exception; 'close' may never follow.
+      if (child !== this.decoder) return;
+      this.decoder = null;
+      this.decodeEnded = true;
+      this.emit('native:error', { message: 'ffmpeg: ' + err.message });
+    });
     child.on('close', (code) => {
       if (child !== this.decoder) return;
-      this._flushResidual();
+      this.decoder = null;
+      // decodeEnded first: _fill's exclusive-mode "start on all-there-is"
+      // condition must see it when the residual is the only audio left.
       this.decodeEnded = true;
+      this._flushResidual();
       if (code !== 0 && errBuf && this.pcmQueue.length === 0 && this.framesWritten === 0) {
         this.emit('native:error', { message: errBuf.split('\n')[0] });
       }
-      this._maybeAdvance();
+      this._fill();
     });
   }
 
@@ -840,8 +881,9 @@ class NativeAudioEngine {
     const state = { cancelled: false, markerPhase: 0 };
     this.dop = state;
     (async () => {
-      const fh = await fsPromises.open(track.path, 'r');
+      let fh = null;
       try {
+        fh = await fsPromises.open(track.path, 'r');
         const head = Buffer.alloc(92);
         await fh.read(head, 0, 92, 0);
         const info = parseDsfHeader(head);
@@ -855,7 +897,9 @@ class NativeAudioEngine {
         const blockPair = Buffer.alloc(blockSize * channels);
         while (!state.cancelled) {
           const { bytesRead } = await fh.read(blockPair, 0, blockPair.length, offset);
-          if (bytesRead < blockPair.length) break; // EOF
+          // re-check after the await: a seek/restart may have cancelled us and
+          // reset pcmQueue for a new stream while this read was in flight
+          if (state.cancelled || bytesRead < blockPair.length) break; // EOF / cancelled
           offset += bytesRead;
           const perCh = [];
           for (let ch = 0; ch < channels; ch++) {
@@ -884,8 +928,13 @@ class NativeAudioEngine {
       } catch (err) {
         if (!state.cancelled) engine.emit('native:error', { message: 'DSD: ' + err.message });
       } finally {
-        await fh.close().catch(() => {});
-        if (!state.cancelled) { engine._flushResidual(); engine.decodeEnded = true; engine._maybeAdvance(); }
+        if (fh) await fh.close().catch(() => {});
+        if (!state.cancelled) {
+          if (engine.dop === state) engine.dop = null;
+          engine.decodeEnded = true;
+          engine._flushResidual();
+          engine._fill();
+        }
       }
     })();
   }
@@ -1016,7 +1065,11 @@ class NativeAudioEngine {
       // underrun is an audible pop. Latency doesn't matter for music playback.
       const target = Math.max(this.stream.frameSize * 4, Math.round(this.stream.outRate * 0.5));
       while (this.pcmQueue.length > 0 && this._outQueuedFrames() < target) {
-        this._outWrite(this.pcmQueue.shift());
+        const buf = this.pcmQueue.shift();
+        // a failed write must not be counted as played — otherwise a dead
+        // device drains the whole queue at decode speed and the engine skips
+        // through the playlist in seconds
+        if (!this._outWrite(buf)) { this.pcmQueue.unshift(buf); break; }
         this.framesWritten++;
       }
       // start the device clock only once half the target is buffered (or the
@@ -1034,7 +1087,8 @@ class NativeAudioEngine {
       const target = Math.max(this.stream.frameSize * 2,
         Math.round(this.stream.outRate * RT_QUEUE_SECONDS));
       while (this.pcmQueue.length > 0 && this._outQueuedFrames() < target) {
-        this._outWrite(this.pcmQueue.shift());
+        const buf = this.pcmQueue.shift();
+        if (!this._outWrite(buf)) { this.pcmQueue.unshift(buf); break; }
         this.framesWritten++;
       }
     }
@@ -1048,6 +1102,12 @@ class NativeAudioEngine {
     if (!this.decodeEnded || this.pcmQueue.length > 0 || this.residual.length > 0) return;
     if (!this.playing) return;
     const next = this.nextTrack;
+    // The device still holds the last ~150ms (RtAudio) / ~500ms (exclusive)
+    // of this track. A same-stream gapless join keeps it playing, but a
+    // reopen (rate/format change) or a stop-then-play would drop it — so in
+    // those cases wait for the device to drain first. The progress tick,
+    // the exclusive pump, and the RtAudio frame callback all re-poll here.
+    if ((!next || this._wouldReopen(next)) && this._outQueuedFrames() > 0) return;
     this.decodeEnded = false;
     if (next) {
       // Gapless continuation: same stream when format matches, else reopen
@@ -1060,6 +1120,8 @@ class NativeAudioEngine {
       }).catch((err) => this.emit('native:error', { message: err.message }));
     } else {
       this.playing = false;
+      this.ended = true;
+      this._outStop();
       this._stopProgress();
       this.emit('native:track-ended', { advancedTo: null });
       this.emit('native:state', { playing: false });
@@ -1184,7 +1246,7 @@ class NativeAudioEngine {
 
   resume() {
     if (!this.stream || !this.currentTrack) return false;
-    if (!this.decoder && !this.dop) {
+    if (this.ended) {
       // Natural end already tore the decoder down (and stopped the progress
       // timer that hosts the underrun watchdog) — a bare resume would sit in
       // 'playing' silence forever. Restart the track properly instead.
@@ -1203,7 +1265,8 @@ class NativeAudioEngine {
   seek(time) {
     if (!this.currentTrack) return;
     const track = this.currentTrack;
-    this.play(track, Math.max(0, time)).catch(() => {});
+    // scrubbing while paused must not start playback
+    this.play(track, Math.max(0, time), false, { startPaused: !this.playing }).catch(() => {});
   }
 
   // Kills the decoder ONLY. Deliberately does NOT touch the device queue:

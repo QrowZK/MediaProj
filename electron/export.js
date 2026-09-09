@@ -120,13 +120,25 @@ class LibraryExporter {
         try { already = (await fsp.stat(filePath)).size > 0; } catch { /* doesn't exist yet */ }
         if (already) { skipped++; continue; }
 
-        if (opts.format === 'copy' || !fmt.args) {
-          await fsp.copyFile(track.path, filePath);
-        } else {
-          await this._runFfmpeg([
-            '-y', '-v', 'error', '-i', track.path, '-map_metadata', '0', '-vn',
-            ...fmt.args(!!opts.downsample), filePath,
-          ]);
+        // Write to a .part file and rename on success so a cancelled or failed
+        // export never leaves a truncated file that looks "already exported".
+        const partPath = filePath + '.part';
+        await fsp.unlink(partPath).catch(() => {}); // stale from a previous run
+        try {
+          if (opts.format === 'copy' || !fmt.args) {
+            await fsp.copyFile(track.path, partPath);
+          } else {
+            // the .part name hides the extension from ffmpeg, so name the muxer
+            const muxer = { flac: 'flac', m4a: 'ipod', mp3: 'mp3' }[fmt.ext];
+            await this._runFfmpeg([
+              '-y', '-v', 'error', '-i', track.path, '-map_metadata', '0', '-vn',
+              ...fmt.args(!!opts.downsample), '-f', muxer, partPath,
+            ]);
+          }
+          await fsp.rename(partPath, filePath);
+        } catch (err) {
+          await fsp.unlink(partPath).catch(() => {});
+          throw err;
         }
         exported++;
       } catch (err) {

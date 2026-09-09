@@ -51,18 +51,23 @@ function attachEngineCallbacks(e) {
   e.onTimeUpdate = engineOnTimeUpdate;
 }
 
+let switchGen = 0; // re-entrancy guard: a newer switchEngine call wins
+
 async function switchEngine(mode) {
   if (typeof mode === 'boolean') mode = mode ? 'native' : 'standard';
-  const playingTrack = engine.currentTrack;
-  const pos = engine.currentTime;
+  const gen = ++switchGen;
+  const prev = engine;
+  const playingTrack = prev.currentTrack;
+  const pos = prev.currentTime;
   // Fully release the departing engine's output device — pausing is not
   // enough: a native stream (especially WASAPI-exclusive) keeps the endpoint
   // locked, leaving the other engine silent until the app restarts.
-  if (engine === nativeEngine && nativeEngine) {
+  if (prev === nativeEngine && nativeEngine) {
     try { await window.auralis.native.stop(); } catch { /* already down */ }
+    if (gen !== switchGen) return;
     nativeEngine.currentTrack = null;
     nativeEngine.paused = true;
-  } else if (engine === zoneEngine && zoneEngine) {
+  } else if (prev === zoneEngine && zoneEngine) {
     try { zoneEngine.destroy(); } catch { /* renderer already gone */ }
     zoneEngine = null;
   } else {
@@ -74,6 +79,10 @@ async function switchEngine(mode) {
     try {
       info = await window.auralis.upnp.zoneSelect(zone.location);
     } catch { /* unreachable renderer */ }
+    if (gen !== switchGen) return;
+    // playback may have been (re)started on the departing engine while the
+    // renderer handshake was in flight — silence it again before handing over
+    if (prev === webEngine && webEngine.currentTrack && !webEngine.paused) webEngine.pause();
     if (!info) {
       toast(`Renderer “${zone.name || 'network zone'}” is unreachable — using standard output`, true);
       mode = 'standard';
@@ -88,22 +97,27 @@ async function switchEngine(mode) {
   } else if (mode === 'standard') {
     engine = webEngine;
   }
+  // detach the departing engine so a late event from it can't drive the queue
+  if (prev !== engine) {
+    prev.peekNext = prev.onTrackEnd = prev.onTrackStarted = prev.onError = prev.onTimeUpdate = null;
+  }
   attachEngineCallbacks(engine);
   spectrum.engine = engine;
   spectrum.buffer = new Uint8Array(engine.analyser.frequencyBinCount);
   vu.engine = engine;
-  // carry DSP state over
-  engine.setVolume(webEngine.volume);
-  engine.applyEqGains([...webEngine.eqGains]);
-  engine.setEqEnabled(webEngine.eqEnabled);
-  engine.setReplayGainMode(webEngine.replayGainMode);
+  // carry DSP state over from the departing engine
+  engine.setVolume(prev.volume);
+  engine.applyEqGains([...prev.eqGains]);
+  engine.setEqEnabled(prev.eqEnabled);
+  engine.setReplayGainMode(prev.replayGainMode);
+  if ('gapless' in prev && 'gapless' in engine) engine.gapless = prev.gapless;
   engine.setSpeakerCorrection?.(correctionConfig());
   if (playingTrack) {
     try {
-      const ok = await engine.play(playingTrack);
+      const ok = await engine.play(playingTrack, pos > 1 ? pos : 0);
+      if (gen !== switchGen) return;
       if (ok) {
         onTrackStarted(playingTrack);
-        if (pos > 1) engine.seek(pos);
       } else {
         updatePlayButton(false);
       }
@@ -2494,7 +2508,7 @@ $('#btn-repeat').addEventListener('click', () => {
 
 // media keys
 if ('mediaSession' in navigator) {
-  navigator.mediaSession.setActionHandler('play', () => engine.toggle().then(updatePlayButton));
+  navigator.mediaSession.setActionHandler('play', () => $('#btn-play').click());
   navigator.mediaSession.setActionHandler('pause', () => engine.toggle().then(updatePlayButton));
   navigator.mediaSession.setActionHandler('nexttrack', () => $('#btn-next').click());
   navigator.mediaSession.setActionHandler('previoustrack', () => $('#btn-prev').click());

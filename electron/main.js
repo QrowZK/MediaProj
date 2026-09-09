@@ -32,13 +32,6 @@ let mainWindow = null;
 let scanCancelled = false;
 let activeExporter = null;
 
-// music-metadata is ESM-only; load it lazily via dynamic import.
-let mmPromise = null;
-function loadMusicMetadata() {
-  if (!mmPromise) mmPromise = import('music-metadata');
-  return mmPromise;
-}
-
 // ---------------------------------------------------------------------------
 // Privileged protocol for streaming local audio / artwork with Range support
 // ---------------------------------------------------------------------------
@@ -137,10 +130,18 @@ async function readJson(file, fallback) {
   }
 }
 
-async function writeJson(file, data) {
-  const tmp = file + '.tmp';
-  await fsp.writeFile(tmp, JSON.stringify(data), 'utf8');
-  await fsp.rename(tmp, file);
+// Writes to the same file are serialized and use a unique tmp name so two
+// concurrent saves can't race each other's rename.
+const writeChains = new Map();
+function writeJson(file, data) {
+  const prev = writeChains.get(file) || Promise.resolve();
+  const next = prev.catch(() => {}).then(async () => {
+    const tmp = `${file}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
+    await fsp.writeFile(tmp, JSON.stringify(data), 'utf8');
+    await fsp.rename(tmp, file);
+  });
+  writeChains.set(file, next);
+  return next;
 }
 
 // ---------------------------------------------------------------------------
@@ -173,6 +174,8 @@ function scanFolders(folders) {
       },
     });
     if (activeScan) activeScan.worker = worker;
+    // cancel-scan may have arrived while the library was still being read
+    if (scanCancelled) worker.postMessage({ type: 'cancel' });
 
     try {
       const tracks = await new Promise((resolve, reject) => {
@@ -463,6 +466,30 @@ async function submitScrobble(creds, scrobble) {
 // Lyrics: side files (.lrc/.txt) → embedded tags → LRCLIB lookup
 // ---------------------------------------------------------------------------
 
+// Tag parsing runs off the main thread: lyrics are requested at every track
+// start, and a parseFile on the main loop can starve the WASAPI pump.
+function parseTagsInWorker(filePath) {
+  return new Promise((resolve) => {
+    const { Worker } = require('worker_threads');
+    let worker;
+    let done = false;
+    const finish = (value) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      worker?.terminate().catch(() => {});
+      resolve(value);
+    };
+    const timer = setTimeout(() => finish(null), 15000);
+    try {
+      worker = new Worker(path.join(__dirname, 'lyrics-worker.js'), { workerData: { path: filePath } });
+    } catch { return finish(null); }
+    worker.on('message', (m) => finish(m && m.ok ? m : null));
+    worker.on('error', () => finish(null));
+    worker.on('exit', () => finish(null));
+  });
+}
+
 const LYRICS_CACHE_FILE = () => path.join(app.getPath('userData'), 'lyrics-cache.json');
 let lyricsCache = null;
 
@@ -483,9 +510,8 @@ async function getLyrics(track) {
 
   // 2. Embedded lyrics tag
   try {
-    const mm = await loadMusicMetadata();
-    const meta = await mm.parseFile(track.path, { skipCovers: true });
-    const lyr = meta?.common?.lyrics?.[0];
+    const meta = await parseTagsInWorker(track.path);
+    const lyr = meta?.lyrics?.[0];
     const text = typeof lyr === 'string' ? lyr : (lyr?.text || lyr?.syncText?.map((l) => l.text).join('\n'));
     if (text && text.trim()) {
       return { text, synced: /\[\d{1,2}:\d{2}/.test(text), source: 'embedded' };
@@ -914,6 +940,14 @@ app.whenReady().then(async () => {
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
+});
+
+app.on('before-quit', () => {
+  try { activeExporter?.cancel(); } catch {}
+  try { activeScan?.worker?.terminate(); } catch {}
+  try { nativeEngine?.stopAll(); } catch {}
+  try { rendererEngine?.stopAll(); } catch {}
+  try { mediaServer?.stop(); } catch {}
 });
 
 app.on('window-all-closed', () => {
