@@ -13,6 +13,14 @@ contextBridge.exposeInMainWorld('auralis', {
       ipcRenderer.on('scan:progress', listener);
       return () => ipcRenderer.removeListener('scan:progress', listener);
     },
+    chooseExportFolder: () => ipcRenderer.invoke('library:choose-export-folder'),
+    export: (payload) => ipcRenderer.invoke('library:export', payload),
+    cancelExport: () => ipcRenderer.invoke('library:cancel-export'),
+    onExportProgress: (cb) => {
+      const listener = (_e, data) => cb(data);
+      ipcRenderer.on('export:progress', listener);
+      return () => ipcRenderer.removeListener('export:progress', listener);
+    },
   },
   settings: {
     get: () => ipcRenderer.invoke('settings:get'),
