@@ -100,6 +100,7 @@ export class AudioEngine {
     this.onTrackEnd = null;      // set by app: () => nextTrack or null
     this.onTimeUpdate = null;
     this.onError = null;
+    this._errorReportedFor = null; // track id whose error was already reported
 
     this.setVolume(this.volume);
     this._bindElementEvents();
@@ -121,7 +122,7 @@ export class AudioEngine {
       });
       el.addEventListener('error', () => {
         if (idx !== this.active || !el.src) return;
-        this.onError?.(this.currentTrack,
+        this._reportError(this.currentTrack,
           'This format cannot be decoded by the playback engine.');
       });
     });
@@ -137,20 +138,31 @@ export class AudioEngine {
     gainNode.gain.value = Math.pow(10, db / 20);
   }
 
-  async play(track) {
+  // An undecodable file fires the element 'error' event AND rejects play();
+  // report once per track so the app doesn't double-advance.
+  _reportError(track, message) {
+    if (track && this._errorReportedFor === track.id) return;
+    this._errorReportedFor = track ? track.id : null;
+    this.onError?.(track, message);
+  }
+
+  async play(track, startAt = 0) {
     await this.ctx.resume();
     this.preloadedTrack = null;
     this.currentTrack = track;
+    this._errorReportedFor = null;
     const el = this.el;
     this.idleEl.removeAttribute('src');
     this._applyReplayGain(this.sourceGains[this.active], track);
     el.src = track.url;
+    if (startAt > 0 && isFinite(startAt)) el.currentTime = startAt;
     try {
       await el.play();
       return true;
     } catch (err) {
-      if (err.name !== 'AbortError') {
-        this.onError?.(track, 'Playback failed: ' + err.message);
+      // el.error means the element 'error' listener already reported it
+      if (err.name !== 'AbortError' && !el.error) {
+        this._reportError(track, 'Playback failed: ' + err.message);
       }
       return false;
     }
@@ -178,6 +190,7 @@ export class AudioEngine {
       this.active = 1 - this.active;
       this.currentTrack = next;
       this.preloadedTrack = null;
+      this._errorReportedFor = null;
       try {
         await this.el.play();
         this.onTrackStarted?.(next);

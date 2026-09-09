@@ -83,9 +83,9 @@ async function extractTrack(mm, filePath, existingArtByAlbum) {
   const albumKey = `${albumArtist}::${album}`.toLowerCase();
 
   let artUrl = existingArtByAlbum.get(albumKey);
-  if (artUrl === undefined) {
+  if (!artUrl) {
     artUrl = await cacheAlbumArt(c.picture, albumKey);
-    existingArtByAlbum.set(albumKey, artUrl);
+    if (artUrl) existingArtByAlbum.set(albumKey, artUrl);
   }
 
   return {
@@ -144,7 +144,7 @@ async function extractTrack(mm, filePath, existingArtByAlbum) {
     const file = allFiles[i];
     const prev = byPath.get(file);
     try {
-      if (prev && prev.mtime === (await fsp.stat(file)).mtimeMs) {
+      if (prev && prev.mtime === (await fsp.stat(file)).mtimeMs && prev.artUrl) {
         tracks.push(prev);
       } else {
         tracks.push(await extractTrack(mm, file, artByAlbum));
@@ -158,6 +158,13 @@ async function extractTrack(mm, filePath, existingArtByAlbum) {
         file: path.basename(file),
       });
     }
+  }
+
+  // A track processed before its album's art was found (e.g. track 1 has no
+  // embedded art but track 4 does) would otherwise stay stuck without art —
+  // backfill from the now-complete per-album cache.
+  for (const t of tracks) {
+    if (!t.artUrl && artByAlbum.get(t.albumKey)) t.artUrl = artByAlbum.get(t.albumKey);
   }
 
   parentPort.postMessage({ type: 'done', tracks });

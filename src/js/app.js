@@ -51,18 +51,23 @@ function attachEngineCallbacks(e) {
   e.onTimeUpdate = engineOnTimeUpdate;
 }
 
+let switchGen = 0; // re-entrancy guard: a newer switchEngine call wins
+
 async function switchEngine(mode) {
   if (typeof mode === 'boolean') mode = mode ? 'native' : 'standard';
-  const playingTrack = engine.currentTrack;
-  const pos = engine.currentTime;
+  const gen = ++switchGen;
+  const prev = engine;
+  const playingTrack = prev.currentTrack;
+  const pos = prev.currentTime;
   // Fully release the departing engine's output device — pausing is not
   // enough: a native stream (especially WASAPI-exclusive) keeps the endpoint
   // locked, leaving the other engine silent until the app restarts.
-  if (engine === nativeEngine && nativeEngine) {
+  if (prev === nativeEngine && nativeEngine) {
     try { await window.auralis.native.stop(); } catch { /* already down */ }
+    if (gen !== switchGen) return;
     nativeEngine.currentTrack = null;
     nativeEngine.paused = true;
-  } else if (engine === zoneEngine && zoneEngine) {
+  } else if (prev === zoneEngine && zoneEngine) {
     try { zoneEngine.destroy(); } catch { /* renderer already gone */ }
     zoneEngine = null;
   } else {
@@ -74,6 +79,10 @@ async function switchEngine(mode) {
     try {
       info = await window.auralis.upnp.zoneSelect(zone.location);
     } catch { /* unreachable renderer */ }
+    if (gen !== switchGen) return;
+    // playback may have been (re)started on the departing engine while the
+    // renderer handshake was in flight — silence it again before handing over
+    if (prev === webEngine && webEngine.currentTrack && !webEngine.paused) webEngine.pause();
     if (!info) {
       toast(`Renderer “${zone.name || 'network zone'}” is unreachable — using standard output`, true);
       mode = 'standard';
@@ -88,22 +97,27 @@ async function switchEngine(mode) {
   } else if (mode === 'standard') {
     engine = webEngine;
   }
+  // detach the departing engine so a late event from it can't drive the queue
+  if (prev !== engine) {
+    prev.peekNext = prev.onTrackEnd = prev.onTrackStarted = prev.onError = prev.onTimeUpdate = null;
+  }
   attachEngineCallbacks(engine);
   spectrum.engine = engine;
   spectrum.buffer = new Uint8Array(engine.analyser.frequencyBinCount);
   vu.engine = engine;
-  // carry DSP state over
-  engine.setVolume(webEngine.volume);
-  engine.applyEqGains([...webEngine.eqGains]);
-  engine.setEqEnabled(webEngine.eqEnabled);
-  engine.setReplayGainMode(webEngine.replayGainMode);
+  // carry DSP state over from the departing engine
+  engine.setVolume(prev.volume);
+  engine.applyEqGains([...prev.eqGains]);
+  engine.setEqEnabled(prev.eqEnabled);
+  engine.setReplayGainMode(prev.replayGainMode);
+  if ('gapless' in prev && 'gapless' in engine) engine.gapless = prev.gapless;
   engine.setSpeakerCorrection?.(correctionConfig());
   if (playingTrack) {
     try {
-      const ok = await engine.play(playingTrack);
+      const ok = await engine.play(playingTrack, pos > 1 ? pos : 0);
+      if (gen !== switchGen) return;
       if (ok) {
         onTrackStarted(playingTrack);
-        if (pos > 1) engine.seek(pos);
       } else {
         updatePlayButton(false);
       }
@@ -357,6 +371,7 @@ function renderAlbumDetail() {
             Play
           </button>
           <button class="btn" id="hero-shuffle">Shuffle</button>
+          <button class="btn" id="hero-export">Export…</button>
           ${qualityBadgeClass(album.best) ? `<span class="badge ${qualityBadgeClass(album.best)}">${esc(qualityLabel(album.best))}</span>` : ''}
         </div>
       </div>
@@ -370,6 +385,7 @@ function renderAlbumDetail() {
     updateTransportUi();
     playTracks(album.tracks, Math.floor(Math.random() * album.tracks.length));
   });
+  $('#hero-export').addEventListener('click', () => openExportModal(album.tracks, album.album));
   bindTrackTable(album.tracks);
 }
 
@@ -1051,11 +1067,13 @@ function renderPlaylist() {
       <span class="spacer"></span>
       <button class="btn primary" id="pl-play">Play</button>
       ${p.smart ? '<button class="btn" id="pl-edit">Edit Rules</button>' : ''}
+      ${tracks.length ? '<button class="btn" id="pl-export">Export…</button>' : ''}
       <button class="btn danger" id="pl-delete">Delete</button>
     </div>
     ${tracks.length ? trackTable(tracks) : `<p style="color:var(--text-3)">${p.smart ? 'No tracks match these rules yet.' : 'Right-click any track → “Add to Playlist”.'}</p>`}`;
   $('#pl-play').addEventListener('click', () => tracks.length && playTracks(tracks, 0));
   $('#pl-edit')?.addEventListener('click', () => openSmartPlaylistBuilder(p));
+  $('#pl-export')?.addEventListener('click', () => openExportModal(tracks, p.name));
   $('#pl-delete').addEventListener('click', async () => {
     state.playlists = state.playlists.filter((x) => x.id !== p.id);
     await savePlaylists();
@@ -1153,6 +1171,7 @@ async function renderSettings() {
         <div style="display:flex;gap:10px;margin-top:12px">
           <button class="btn primary" id="settings-add-folder">Add Folder</button>
           <button class="btn" id="settings-rescan">Rescan Library</button>
+          <button class="btn" id="settings-export-library" ${state.library.tracks.length ? '' : 'disabled'}>Export Library…</button>
         </div>
       </div>
 
@@ -1764,6 +1783,7 @@ async function renderSettings() {
 
   $('#settings-add-folder').addEventListener('click', addFolders);
   $('#settings-rescan').addEventListener('click', rescan);
+  $('#settings-export-library')?.addEventListener('click', () => openExportModal(state.library.tracks, 'Library'));
   content.querySelectorAll('.rm[data-folder]').forEach((b) =>
     b.addEventListener('click', async () => {
       const folders = state.library.folders.filter((f) => f !== b.dataset.folder);
@@ -2114,6 +2134,123 @@ window.auralis.library.onScanProgress((p) => {
   }
 });
 
+// ── Library export ───────────────────────────────────────────────────────
+
+const EXPORT_FORMATS = [
+  ['copy', 'Keep original (copy)'],
+  ['flac', 'FLAC (lossless)'],
+  ['alac', 'ALAC (lossless, Apple)'],
+  ['mp3_320', 'MP3 320 kbps'],
+  ['mp3_v0', 'MP3 V0 (VBR, ~245 kbps)'],
+  ['aac_256', 'AAC 256 kbps'],
+];
+
+let exportStrip = null;
+function showExportStrip(text, pct) {
+  if (!exportStrip) {
+    exportStrip = document.createElement('div');
+    exportStrip.id = 'export-strip';
+    exportStrip.innerHTML = `<div class="spin"></div><span class="es-text"></span><span class="pct"></span><button class="es-cancel" id="export-strip-cancel">Cancel</button>`;
+    document.body.appendChild(exportStrip);
+    $('#export-strip-cancel').addEventListener('click', () => window.auralis.library.cancelExport());
+  }
+  exportStrip.querySelector('.es-text').textContent = text;
+  exportStrip.querySelector('.pct').textContent = pct != null ? `${pct}%` : '';
+}
+function hideExportStrip() {
+  exportStrip?.remove();
+  exportStrip = null;
+}
+
+let exportActive = false;
+
+window.auralis.library.onExportProgress((p) => {
+  if (!exportActive) return;
+  const pct = p.total ? Math.round((p.done / p.total) * 100) : 0;
+  showExportStrip(p.file ? `Exporting — ${p.file}` : `Exporting ${p.done}/${p.total}…`, pct);
+});
+
+function openExportModal(tracks, label) {
+  if (!tracks.length) return;
+  const root = $('#modal-root');
+  let destDir = null;
+  root.innerHTML = `
+    <div class="modal export-modal">
+      <h3>Export “${esc(label)}”</h3>
+      <div class="desc">${tracks.length} track${tracks.length === 1 ? '' : 's'}. Files are organized as Artist/Album/Track — Title, with cover.jpg per album.</div>
+      <div class="setting-row" style="padding-top:0">
+        <div><div class="lbl">Quality</div></div>
+        <select class="styled" id="export-format" style="width:200px">
+          ${EXPORT_FORMATS.map(([k, l]) => `<option value="${k}">${esc(l)}</option>`).join('')}
+        </select>
+      </div>
+      <div class="setting-row">
+        <div><div class="lbl">Downsample to 16-bit/44.1kHz</div>
+          <div class="hint">Smaller files for phones and DAPs. Ignored when keeping originals.</div></div>
+        <button class="toggle disabled" id="export-downsample"></button>
+      </div>
+      <div class="setting-row">
+        <div><div class="lbl">Destination</div>
+          <div class="hint" id="export-dest-path" style="word-break:break-all">No folder chosen.</div></div>
+        <button class="btn" id="export-choose-folder">Choose…</button>
+      </div>
+      <div class="modal-actions">
+        <button class="btn" id="export-cancel">Cancel</button>
+        <button class="btn primary" id="export-start" disabled>Export</button>
+      </div>
+    </div>`;
+  root.classList.remove('hidden');
+  const close = () => { root.classList.add('hidden'); root.innerHTML = ''; };
+  $('#export-cancel').addEventListener('click', close);
+
+  const updateStartEnabled = () => { $('#export-start').disabled = !destDir; };
+
+  $('#export-format').addEventListener('change', (e) => {
+    const copy = e.target.value === 'copy';
+    $('#export-downsample').classList.toggle('disabled', copy);
+  });
+
+  $('#export-downsample').addEventListener('click', (e) => {
+    if (e.target.classList.contains('disabled')) return;
+    e.target.classList.toggle('on');
+  });
+
+  $('#export-choose-folder').addEventListener('click', async () => {
+    const picked = await window.auralis.library.chooseExportFolder();
+    if (!picked) return;
+    destDir = picked;
+    $('#export-dest-path').textContent = destDir;
+    updateStartEnabled();
+  });
+
+  $('#export-start').addEventListener('click', async () => {
+    if (!destDir) return;
+    const format = $('#export-format').value;
+    const downsample = $('#export-downsample').classList.contains('on') && format !== 'copy';
+    const trackIds = tracks.map((t) => t.id);
+    close();
+    exportActive = true;
+    showExportStrip('Exporting…', 0);
+    try {
+      const res = await window.auralis.library.export({ trackIds, destDir, format, downsample });
+      exportActive = false;
+      hideExportStrip();
+      if (res.cancelled) {
+        toast(`Export cancelled — ${res.exported} track${res.exported === 1 ? '' : 's'} written`);
+        return;
+      }
+      const bits = [`${res.exported} exported`];
+      if (res.skipped) bits.push(`${res.skipped} already present`);
+      if (res.failed) bits.push(`${res.failed} failed`);
+      toast(bits.join(', '), res.failed > 0, { label: 'Show in Folder', fn: () => window.auralis.shell.showItem(res.destDir) });
+    } catch (err) {
+      exportActive = false;
+      hideExportStrip();
+      toast('Export failed: ' + err.message, true);
+    }
+  });
+}
+
 // ── Queue & transport ────────────────────────────────────────────────────
 
 function playTracks(tracks, startIdx) {
@@ -2371,7 +2508,7 @@ $('#btn-repeat').addEventListener('click', () => {
 
 // media keys
 if ('mediaSession' in navigator) {
-  navigator.mediaSession.setActionHandler('play', () => engine.toggle().then(updatePlayButton));
+  navigator.mediaSession.setActionHandler('play', () => $('#btn-play').click());
   navigator.mediaSession.setActionHandler('pause', () => engine.toggle().then(updatePlayButton));
   navigator.mediaSession.setActionHandler('nexttrack', () => $('#btn-next').click());
   navigator.mediaSession.setActionHandler('previoustrack', () => $('#btn-prev').click());
@@ -2690,6 +2827,7 @@ function openTrackMenu(e, tracks, idx, playlistCtx = null) {
         render();
       } }] : []),
     { sep: true },
+    { label: 'Export…', fn: () => openExportModal([track], track.title) },
     { label: 'Show in File Explorer', fn: () => window.auralis.shell.showItem(track.path) },
   ];
   ctxMenu.innerHTML = items.map((it, i) =>

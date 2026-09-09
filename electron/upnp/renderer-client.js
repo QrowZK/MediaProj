@@ -25,6 +25,7 @@ function httpFetch(urlStr, { method = 'GET', headers = {}, body = null, timeout 
       let data = '';
       res.on('data', (c) => { data += c; });
       res.on('end', () => resolve({ status: res.statusCode, body: data }));
+      res.on('close', () => { if (!res.complete) reject(new Error('connection closed')); });
     });
     req.on('error', reject);
     req.setTimeout(timeout, () => req.destroy(new Error('timeout')));
@@ -155,6 +156,7 @@ class RendererEngine {
     if (!this.device) throw new Error('No renderer selected');
     const { uri, didl } = this.buildTrackUrl(track);
     this.currentTrack = track;
+    const hadNext = !!this.nextUri;
     this.nextUri = null;
     this.ohNextId = null;
     // a stale high lastPos from the previous track would make the OH poll's
@@ -162,9 +164,16 @@ class RendererEngine {
     this.lastPos = 0;
     if (this.mode === 'avtransport') {
       const ctl = this.device.avTransport.controlUrl;
+      this.currentUri = uri;
       await soapCall(ctl, AVT, 'SetAVTransportURI', {
         InstanceID: 0, CurrentURI: escapeXml(uri), CurrentURIMetaData: xmlArg(didl),
       });
+      if (hadNext) {
+        // a next queued for the previous track must not fire after this one
+        await soapCall(ctl, AVT, 'SetNextAVTransportURI', {
+          InstanceID: 0, NextURI: '', NextURIMetaData: '',
+        }).catch(() => { /* best effort */ });
+      }
       await soapCall(ctl, AVT, 'Play', { InstanceID: 0, Speed: 1 });
       if (startAt > 1) {
         await soapCall(ctl, AVT, 'Seek', {
@@ -257,6 +266,11 @@ class RendererEngine {
       : soapCall(this.device.ohPlaylist.controlUrl, OH_PLAYLIST, 'Play', {});
     await call.catch(() => {});
     this.playing = true;
+    if (this.currentTrack && !this.pollTimer) {
+      // poll was torn down at natural end; resuming must bring it back
+      this.lastPos = 0;
+      this._startPoll();
+    }
     this.emit('upnp:state', { playing: true });
     return true;
   }
@@ -291,10 +305,31 @@ class RendererEngine {
 
   _startPoll() {
     clearInterval(this.pollTimer);
-    this.pollTimer = setInterval(() => this._poll().catch(() => {}), 1000);
+    this._pollFails = 0;
+    this.pollTimer = setInterval(() => this._poll(), 1000);
   }
 
   async _poll() {
+    if (this._polling) return; // a slow renderer must not stack overlapping polls
+    this._polling = true;
+    try {
+      await this._pollOnce();
+      this._pollFails = 0;
+    } catch {
+      this._pollFails = (this._pollFails || 0) + 1;
+      if (this._pollFails >= 10) {
+        clearInterval(this.pollTimer);
+        this.pollTimer = null;
+        this.playing = false;
+        this.emit('upnp:error', { message: 'Renderer not responding' });
+        this.emit('upnp:state', { playing: false });
+      }
+    } finally {
+      this._polling = false;
+    }
+  }
+
+  async _pollOnce() {
     if (!this.device || !this.currentTrack) return;
     if (this.mode === 'avtransport') {
       const ctl = this.device.avTransport.controlUrl;
@@ -304,18 +339,28 @@ class RendererEngine {
       const info = await soapCall(ctl, AVT, 'GetTransportInfo', { InstanceID: 0 });
       const stateVal = xmlValue(info, 'CurrentTransportState') || '';
 
-      // gapless handoff detection: renderer moved to the queued next URI
-      if (this.nextUri && trackUri && trackUri === this.nextUri) {
+      // gapless handoff detection: renderer moved to the queued next URI.
+      // When next === current (repeat-one) the URI can't tell us anything,
+      // so fall back to the position wrapping back to the start.
+      const handedOff = this.nextUri && (
+        this.nextUri !== this.currentUri
+          ? (trackUri && trackUri === this.nextUri)
+          : (rel < 2 && this.lastPos > 2 && stateVal === 'PLAYING'));
+      if (handedOff) {
         const next = this.nextTrack;
         this.currentTrack = next;
+        this.currentUri = this.nextUri;
         this.nextTrack = null;
         this.nextUri = null;
         this.emit('upnp:track-ended', { advancedTo: next?.id || null });
         this.emit('upnp:track-changed', { trackId: next?.id || null });
-      } else if (stateVal === 'STOPPED' && this.playing && rel === 0 && this.lastPos > 1) {
-        // natural end without a queued next
+      } else if (stateVal === 'STOPPED' && this.playing && this.lastPos > 1
+        && (rel === 0 || rel >= this.lastPos - 1)) {
+        // natural end without a queued next (some renderers leave RelTime at
+        // the final position rather than resetting to 0)
         this.playing = false;
         clearInterval(this.pollTimer);
+        this.pollTimer = null;
         this.emit('upnp:track-ended', { advancedTo: null });
         this.emit('upnp:state', { playing: false });
         return;
@@ -327,8 +372,15 @@ class RendererEngine {
       const seconds = Number(xmlValue(time, 'Seconds') || 0);
       const dur = this.currentTrack?.duration || Number(xmlValue(time, 'Duration') || 0);
       if (this.playing && this.lastPos > 1 && seconds < 2 && seconds < this.lastPos - 2) {
-        if (this.nextUri) {
-          // playlist advanced to the queued next entry (position wrapped to 0)
+        // position wrapped — confirm with the playlist before calling it a
+        // track change: a seek-to-start or restart wraps too
+        const ohCtl = this.device.ohPlaylist.controlUrl;
+        const idRes = await soapCall(ohCtl, OH_PLAYLIST, 'Id', {});
+        const curId = Number(xmlValue(idRes, 'Value') || 0);
+        if (curId === this.ohCurrentId) {
+          // same entry still playing: a seek/restart, not an end
+        } else if (this.nextUri && curId === this.ohNextId) {
+          // playlist advanced to the queued next entry
           const next = this.nextTrack;
           this.currentTrack = next;
           this.nextTrack = null;
@@ -338,11 +390,16 @@ class RendererEngine {
           this.emit('upnp:track-ended', { advancedTo: next?.id || null });
           this.emit('upnp:track-changed', { trackId: next?.id || null });
         } else {
-          this.playing = false;
-          clearInterval(this.pollTimer);
-          this.emit('upnp:track-ended', { advancedTo: null });
-          this.emit('upnp:state', { playing: false });
-          return;
+          const st = await soapCall(ohCtl, OH_PLAYLIST, 'TransportState', {});
+          if (xmlValue(st, 'Value') === 'Stopped') {
+            this.playing = false;
+            clearInterval(this.pollTimer);
+            this.pollTimer = null;
+            this.emit('upnp:track-ended', { advancedTo: null });
+            this.emit('upnp:state', { playing: false });
+            return;
+          }
+          // still playing: treat as a seek
         }
       }
       this.lastPos = seconds;
