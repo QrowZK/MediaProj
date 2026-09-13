@@ -94,6 +94,18 @@ export class ZoneEngineProxy {
     return true;
   }
 
+  // Prepare a track on the renderer but leave it paused (engine switch while
+  // paused). A network renderer has no "load without playing", so start it and
+  // immediately pause — pressing play then resumes via zoneResume.
+  async load(track, startAt = 0) {
+    const ok = await this.play(track, startAt);
+    if (ok) {
+      try { await window.auralis.upnp.zonePause(); } catch { /* renderer will catch up */ }
+      this.paused = true;
+    }
+    return ok;
+  }
+
   _syncNext() {
     const next = this.peekNext?.();
     const id = next?.id || null;

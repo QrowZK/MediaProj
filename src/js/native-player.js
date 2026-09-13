@@ -105,6 +105,22 @@ export class NativeEngineProxy {
     return true;
   }
 
+  // Prepare a track but leave the transport paused (engine switch while paused).
+  // The main engine primes its decoder + device paused; resume() starts them.
+  async load(track, startAt = 0) {
+    this.currentTrack = track;
+    this.duration = track.duration || 0;
+    this.currentTime = startAt || 0;
+    this._lastSyncedNextId = null;
+    const res = await window.auralis.native.play(this._slim(track), startAt || 0, true);
+    if (!res.ok) {
+      this.onError?.(track, res.error || 'Native playback failed');
+      return false;
+    }
+    this.paused = true;
+    return true;
+  }
+
   _slim(t) {
     return {
       id: t.id, path: t.path, title: t.title, artist: t.artist, album: t.album,

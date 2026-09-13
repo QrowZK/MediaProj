@@ -46,7 +46,12 @@ export class AudioEngine {
 
     this.preamp = this.ctx.createGain();
     this.analyser = this.ctx.createAnalyser();
-    this.analyser.fftSize = 4096;
+    // 8192-pt (~5.4 Hz/bin at 48 kHz) so the bass region has roughly one FFT
+    // bin per display bar. At 4096 (~10.8 Hz/bin) ~25 log-spaced bars below
+    // 150 Hz shared only ~11 bins, so several adjacent bars interpolated the
+    // same near-equal pair and the per-octave tilt fanned that flat cluster
+    // into the rigid slanted ramp that kept resurfacing on the left edge.
+    this.analyser.fftSize = 8192;
     this.analyser.smoothingTimeConstant = 0.82;
     // Web Audio's default display window is -100..-30 dB — music's bass/mid
     // bins sit above -30 dBFS nearly all the time, so they peg at 255 and the
@@ -117,7 +122,16 @@ export class AudioEngine {
       });
       el.addEventListener('timeupdate', () => {
         if (idx !== this.active) return;
-        this.onTimeUpdate?.(el.currentTime, el.duration || 0);
+        const c = this.currentTrack;
+        // Cue segment: the shared file plays past this track's end, so the
+        // real 'ended' never fires — detect the segment boundary and advance.
+        if (c && c.cue && c.cueEnd != null && !this._cueEnding &&
+            el.currentTime >= c.cueEnd - 0.02) {
+          this._cueEnding = true;
+          this._handleEnded();
+          return;
+        }
+        this.onTimeUpdate?.(this.currentTime, this.duration);
         this._maybePreloadNext();
       });
       el.addEventListener('error', () => {
@@ -166,6 +180,28 @@ export class AudioEngine {
       }
       return false;
     }
+  }
+
+  // Prepare a track WITHOUT starting playback — used when the output engine is
+  // switched while the transport is paused, so pressing play resumes exactly
+  // where the departing engine left off instead of the switch starting audio
+  // on its own.
+  async load(track, startAt = 0) {
+    await this.ctx.resume();
+    this.preloadedTrack = null;
+    this.currentTrack = track;
+    this._errorReportedFor = null;
+    const el = this.el;
+    this.idleEl.removeAttribute('src');
+    this._applyReplayGain(this.sourceGains[this.active], track);
+    el.src = track.url;
+    el.load();
+    if (startAt > 0 && isFinite(startAt)) {
+      const seek = () => { try { el.currentTime = startAt; } catch { /* not seekable yet */ } };
+      if (el.readyState >= 1) seek();
+      else el.addEventListener('loadedmetadata', seek, { once: true });
+    }
+    return true;
   }
 
   _maybePreloadNext() {

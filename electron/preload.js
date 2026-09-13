@@ -21,6 +21,13 @@ contextBridge.exposeInMainWorld('auralis', {
       ipcRenderer.on('export:progress', listener);
       return () => ipcRenderer.removeListener('export:progress', listener);
     },
+    analyzeLoudness: (payload) => ipcRenderer.invoke('library:analyze-loudness', payload),
+    cancelLoudness: () => ipcRenderer.invoke('library:cancel-loudness'),
+    onLoudnessProgress: (cb) => {
+      const listener = (_e, data) => cb(data);
+      ipcRenderer.on('loudness:progress', listener);
+      return () => ipcRenderer.removeListener('loudness:progress', listener);
+    },
   },
   settings: {
     get: () => ipcRenderer.invoke('settings:get'),
@@ -73,7 +80,7 @@ contextBridge.exposeInMainWorld('auralis', {
     apis: () => ipcRenderer.invoke('native:apis'),
     devices: (apiId) => ipcRenderer.invoke('native:devices', apiId),
     config: (partial) => ipcRenderer.invoke('native:config', partial),
-    play: (track, startAt) => ipcRenderer.invoke('native:play', track, startAt),
+    play: (track, startAt, startPaused) => ipcRenderer.invoke('native:play', track, startAt, startPaused),
     pause: () => ipcRenderer.invoke('native:pause'),
     resume: () => ipcRenderer.invoke('native:resume'),
     seek: (time) => ipcRenderer.invoke('native:seek', time),

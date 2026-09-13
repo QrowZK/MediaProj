@@ -547,6 +547,12 @@ class NativeAudioEngine {
     const seq = this._playSeq;
     this.stopDecoder();
     this.pcmQueue = [];
+    // On a gapless join, hold the outgoing track's sub-frame tail so the
+    // boundary frame can be completed with THIS track's first samples rather
+    // than a padded frame of silence. Restored after needOpen is known below
+    // (and dropped on a reopen, where the leftover input bytes wouldn't match
+    // the new stream's format/rate/channels).
+    const carriedResidual = gaplessJoin ? this.residual : null;
     this.residual = Buffer.alloc(0);
     this.decodeEnded = false;
     this.ended = false;
@@ -592,6 +598,11 @@ class NativeAudioEngine {
       // seamless handoff.
       this._outFlush();
     }
+
+    // Same-format gapless join: prepend the outgoing tail so the next decoder's
+    // first _onPcm completes the boundary frame with real audio. On a reopen
+    // the bytes are incompatible, so it stays dropped.
+    if (carriedResidual && !needOpen) this.residual = carriedResidual;
 
     this._buildDsp(plan.outRate, plan.channels);
     // The exclusive addon may negotiate a different wire format than requested
@@ -851,7 +862,11 @@ class NativeAudioEngine {
       // decodeEnded first: _fill's exclusive-mode "start on all-there-is"
       // condition must see it when the residual is the only audio left.
       this.decodeEnded = true;
-      this._flushResidual();
+      // Skip the silence-padded flush when a same-format gapless track is
+      // queued — the tail is carried into that track's first frame instead
+      // (see play()/_maybeAdvance). Otherwise pad it so end-of-track advance
+      // isn't stuck forever behind a partial frame.
+      if (!(this.nextTrack && !this._wouldReopen(this.nextTrack))) this._flushResidual();
       if (code !== 0 && errBuf && this.pcmQueue.length === 0 && this.framesWritten === 0) {
         this.emit('native:error', { message: errBuf.split('\n')[0] });
       }
@@ -1099,7 +1114,12 @@ class NativeAudioEngine {
   }
 
   _maybeAdvance() {
-    if (!this.decodeEnded || this.pcmQueue.length > 0 || this.residual.length > 0) return;
+    if (!this.decodeEnded || this.pcmQueue.length > 0) return;
+    // A leftover sub-frame tail normally blocks advance, EXCEPT when it's being
+    // carried into a same-format gapless join — there the next decoder consumes
+    // `residual` as its first bytes (see play()/close handler).
+    const carryJoin = this.nextTrack && !this._wouldReopen(this.nextTrack);
+    if (this.residual.length > 0 && !carryJoin) return;
     if (!this.playing) return;
     const next = this.nextTrack;
     // The device still holds the last ~150ms (RtAudio) / ~500ms (exclusive)
@@ -1113,11 +1133,23 @@ class NativeAudioEngine {
       // Gapless continuation: same stream when format matches, else reopen
       const track = next;
       this.nextTrack = null;
-      const pos = 0;
-      this.emit('native:track-ended', { advancedTo: track.id });
-      this.play(track, pos, true).then(() => {
+      this.play(track, 0, true).then(() => {
+        // announce the advance only once the join actually started, so the
+        // renderer never advances its queue for a track that failed to play
+        this.emit('native:track-ended', { advancedTo: track.id });
         this.emit('native:track-changed', { trackId: track.id });
-      }).catch((err) => this.emit('native:error', { message: err.message }));
+      }).catch((err) => {
+        // join failed (e.g. device rejected a reopen) — surface it and report
+        // a plain end-of-track so the renderer's normal path picks the next
+        // track or stops, instead of stranding the UI on the finished one
+        this.emit('native:error', { message: err.message });
+        this.playing = false;
+        this.ended = true;
+        this._outStop();
+        this._stopProgress();
+        this.emit('native:track-ended', { advancedTo: null });
+        this.emit('native:state', { playing: false });
+      });
     } else {
       this.playing = false;
       this.ended = true;

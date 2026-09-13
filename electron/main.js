@@ -31,6 +31,7 @@ const ART_CACHE_DIR = () => path.join(app.getPath('userData'), 'art-cache');
 let mainWindow = null;
 let scanCancelled = false;
 let activeExporter = null;
+let activeLoudness = null;
 
 // ---------------------------------------------------------------------------
 // Privileged protocol for streaming local audio / artwork with Range support
@@ -591,6 +592,35 @@ function registerIpc() {
   });
   ipcMain.handle('library:cancel-export', () => { activeExporter?.cancel(); });
 
+  // Analyze loudness (EBU R128) and derive/write ReplayGain for a selection,
+  // then merge the measured values into the library so playback normalizes and
+  // the dynamics are surfaced in the UI. Returns the updated library so the
+  // renderer can swap state and re-render, exactly like a scan.
+  ipcMain.handle('library:analyze-loudness', async (_e, { trackIds, writeTags, force }) => {
+    if (activeLoudness) return { ok: false, error: 'A loudness analysis is already running' };
+    const { LoudnessAnalyzer } = require('./loudness');
+    const lib = await readJson(LIBRARY_FILE(), { folders: [], tracks: [] });
+    const byId = new Map(lib.tracks.map((t) => [t.id, t]));
+    const tracks = (trackIds || []).map((id) => byId.get(id)).filter(Boolean);
+    if (!tracks.length) return { ok: false, error: 'No matching tracks to analyze' };
+    activeLoudness = new LoudnessAnalyzer();
+    try {
+      const res = await activeLoudness.run(tracks, { writeTags: !!writeTags, force: !!force }, (p) => {
+        mainWindow?.webContents.send('loudness:progress', p);
+      });
+      // Merge measured fields into the library and persist.
+      const merged = lib.tracks.map((t) => (res.results[t.id] ? { ...t, ...res.results[t.id] } : t));
+      const updated = { ...lib, folders: lib.folders || [], tracks: merged, updated: Date.now() };
+      await writeJson(LIBRARY_FILE(), updated);
+      cachedLibrary = updated;
+      mediaServer?.bumpUpdateId();
+      return { ...res, library: updated };
+    } finally {
+      activeLoudness = null;
+    }
+  });
+  ipcMain.handle('library:cancel-loudness', () => { activeLoudness?.cancel(); });
+
   ipcMain.handle('settings:get', () => readJson(SETTINGS_FILE(), {}));
   ipcMain.handle('settings:set', async (_e, settings) => writeJson(SETTINGS_FILE(), settings));
 
@@ -771,8 +801,8 @@ function registerNativeIpc() {
   ipcMain.handle('native:apis', () => getNativeEngine().listApis());
   ipcMain.handle('native:devices', (_e, apiId) => getNativeEngine().listDevices(apiId));
   ipcMain.handle('native:config', (_e, partial) => getNativeEngine().setConfig(partial));
-  ipcMain.handle('native:play', async (_e, track, startAt) => {
-    try { await getNativeEngine().play(track, startAt || 0); return { ok: true }; }
+  ipcMain.handle('native:play', async (_e, track, startAt, startPaused) => {
+    try { await getNativeEngine().play(track, startAt || 0, false, { startPaused: !!startPaused }); return { ok: true }; }
     catch (err) { return { ok: false, error: err.message }; }
   });
   ipcMain.handle('native:pause', () => getNativeEngine().pause());

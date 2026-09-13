@@ -59,6 +59,16 @@ async function switchEngine(mode) {
   const prev = engine;
   const playingTrack = prev.currentTrack;
   const pos = prev.currentTime;
+  const wasPaused = prev.paused; // captured before teardown pauses the old engine
+  // Detach a departing native/zone engine's queue-driving callbacks up front.
+  // Those engines are always fully torn down here, and their IPC events can
+  // still arrive during the awaits below (device stop, renderer handshake) —
+  // a late native:track-ended would otherwise advance the queue and restart
+  // playback on the engine we're discarding. (The web engine is exempt: it may
+  // survive as the zone-unreachable fallback, and it fires no events paused.)
+  if (prev === nativeEngine || prev === zoneEngine) {
+    prev.peekNext = prev.onTrackEnd = prev.onTrackStarted = prev.onError = prev.onTimeUpdate = null;
+  }
   // Fully release the departing engine's output device — pausing is not
   // enough: a native stream (especially WASAPI-exclusive) keeps the endpoint
   // locked, leaving the other engine silent until the app restarts.
@@ -107,18 +117,31 @@ async function switchEngine(mode) {
   vu.engine = engine;
   // carry DSP state over from the departing engine
   engine.setVolume(prev.volume);
-  engine.applyEqGains([...prev.eqGains]);
-  engine.setEqEnabled(prev.eqEnabled);
-  engine.setReplayGainMode(prev.replayGainMode);
+  // EQ/ReplayGain must come from persisted settings, not `prev`: a departing
+  // zone engine's DSP setters are no-ops and its eqGains/eqEnabled/replayGain
+  // fields never leave their constructor defaults, so sourcing from `prev`
+  // silently flattens EQ and disables ReplayGain on the way back from a zone.
+  engine.applyEqGains(state.settings.eqGains ? [...state.settings.eqGains] : [...prev.eqGains]);
+  engine.setEqEnabled(state.settings.eqEnabled != null ? state.settings.eqEnabled : prev.eqEnabled);
+  engine.setReplayGainMode(state.settings.replayGain || prev.replayGainMode);
   if ('gapless' in prev && 'gapless' in engine) engine.gapless = prev.gapless;
   engine.setSpeakerCorrection?.(correctionConfig());
   if (playingTrack) {
     try {
-      const ok = await engine.play(playingTrack, pos > 1 ? pos : 0);
+      const startAt = pos > 1 ? pos : 0;
+      // If the transport was paused, load the track paused on the new engine
+      // rather than starting it — switching output must not begin playback.
+      const ok = wasPaused
+        ? await engine.load(playingTrack, startAt)
+        : await engine.play(playingTrack, startAt);
       if (gen !== switchGen) return;
-      if (ok) {
+      if (ok && !wasPaused) {
         onTrackStarted(playingTrack);
       } else {
+        // paused (or failed): reflect a paused transport. The seek bar/time
+        // already show this same track at this same position from before the
+        // switch, so there's nothing else to refresh and no play-count/scrobble
+        // side effects to trigger.
         updatePlayButton(false);
       }
     } catch (err) {
@@ -168,6 +191,16 @@ function qualityBadgeClass(t) {
   if (t.lossless && (t.sampleRate > 48000 || (t.bitsPerSample || 16) > 16)) return 'hires';
   if (t.lossless) return 'lossless';
   return '';
+}
+
+// EBU R128 dynamics readout — present only after a loudness analysis has run.
+// LRA (loudness range) is the honest "dynamics" figure; true peak is headroom.
+function dynamicsBadges(t) {
+  const out = [];
+  if (t.loudnessRange != null) out.push(`<span class="badge" title="EBU R128 loudness range — higher is more dynamic">LRA ${t.loudnessRange.toFixed(1)} LU</span>`);
+  if (t.truePeakDb != null) out.push(`<span class="badge" title="True peak level (headroom to 0 dBFS)">TP ${t.truePeakDb > 0 ? '+' : ''}${t.truePeakDb.toFixed(1)} dB</span>`);
+  if (t.loudnessLufs != null) out.push(`<span class="badge" title="Integrated loudness">${t.loudnessLufs.toFixed(1)} LUFS</span>`);
+  return out;
 }
 
 function shortFmt(t) {
@@ -365,6 +398,7 @@ function renderAlbumDetail() {
         <div class="hero-kicker">Album${album.year ? ` · ${album.year}` : ''}</div>
         <div class="hero-title">${esc(album.album)}</div>
         <div class="hero-sub"><b><a class="artist-link" id="hero-artist" title="Go to artist">${esc(album.artist)}</a></b> · ${album.tracks.length} tracks · ${fmtLongTime(album.duration)}</div>
+        ${albumLoudnessLine(album.tracks)}
         <div class="hero-actions">
           <button class="btn primary" id="hero-play">
             <svg viewBox="0 0 24 24" width="15" height="15"><path d="M8 5v14l11-7z" fill="currentColor"/></svg>
@@ -372,6 +406,7 @@ function renderAlbumDetail() {
           </button>
           <button class="btn" id="hero-shuffle">Shuffle</button>
           <button class="btn" id="hero-export">Export…</button>
+          <button class="btn" id="hero-analyze">Analyze</button>
           ${qualityBadgeClass(album.best) ? `<span class="badge ${qualityBadgeClass(album.best)}">${esc(qualityLabel(album.best))}</span>` : ''}
         </div>
       </div>
@@ -386,7 +421,25 @@ function renderAlbumDetail() {
     playTracks(album.tracks, Math.floor(Math.random() * album.tracks.length));
   });
   $('#hero-export').addEventListener('click', () => openExportModal(album.tracks, album.album));
+  $('#hero-analyze').addEventListener('click', () => analyzeLoudness(album.tracks, album.album));
   bindTrackTable(album.tracks);
+}
+
+// Album-level R128 line for the album hero — shown only once the album's tracks
+// carry analysis data. Album loudness is derived from the stored album gain
+// (gain = ref − loudness), LRA is averaged across measured tracks.
+function albumLoudnessLine(tracks) {
+  const rg = tracks.find((t) => t.replayGainAlbum != null);
+  if (!rg) return '';
+  const albumLufs = -18 - rg.replayGainAlbum; // RG2.0 reference is −18 LUFS
+  const lras = tracks.map((t) => t.loudnessRange).filter((v) => v != null);
+  const parts = [`R128 ${albumLufs.toFixed(1)} LUFS`];
+  if (lras.length) parts.push(`LRA ${(lras.reduce((a, b) => a + b, 0) / lras.length).toFixed(1)} LU avg`);
+  if (rg.rgAlbumPeak != null) {
+    const dbtp = 20 * Math.log10(rg.rgAlbumPeak);
+    parts.push(`Peak ${dbtp > 0 ? '+' : ''}${dbtp.toFixed(1)} dBTP`);
+  }
+  return `<div class="hero-sub hero-loudness" style="opacity:.75">${parts.join(' · ')}</div>`;
 }
 
 // ── Track table (shared) ──
@@ -1176,6 +1229,20 @@ async function renderSettings() {
       </div>
 
       <div class="settings-card">
+        <h3>ReplayGain &amp; Loudness</h3>
+        <div class="desc">Measures each track's loudness (EBU R128) and derives ReplayGain so albums play at a consistent level, and surfaces dynamics — loudness range and true peak — across the app. Reference level is −18 LUFS (ReplayGain 2.0).</div>
+        <div class="setting-row" style="padding-top:0">
+          <div><div class="lbl">Write ReplayGain tags to files</div>
+            <div class="hint">Embeds the values into the files (FLAC, OGG, Opus, MP3) so other players and DAPs read them. Other formats are measured and stored in Auralis only. Off keeps every change inside Auralis's library.</div></div>
+          <button class="toggle ${s.loudness?.writeTags ? 'on' : ''}" id="toggle-rg-write"></button>
+        </div>
+        <div style="display:flex;gap:10px;margin-top:12px">
+          <button class="btn" id="settings-analyze-library" ${state.library.tracks.length ? '' : 'disabled'}>Analyze Library…</button>
+          <button class="btn" id="settings-reanalyze-library" ${state.library.tracks.length ? '' : 'disabled'}>Re-analyze All</button>
+        </div>
+      </div>
+
+      <div class="settings-card">
         <h3>Audio Output</h3>
         <div class="desc">Route playback to a specific DAC or interface. Auralis resamples nothing in software — the Web Audio pipeline runs at the device's shared-mode rate.</div>
         <select class="styled" id="output-device">
@@ -1784,6 +1851,15 @@ async function renderSettings() {
   $('#settings-add-folder').addEventListener('click', addFolders);
   $('#settings-rescan').addEventListener('click', rescan);
   $('#settings-export-library')?.addEventListener('click', () => openExportModal(state.library.tracks, 'Library'));
+
+  $('#toggle-rg-write')?.addEventListener('click', (e) => {
+    const l = state.settings.loudness || (state.settings.loudness = { writeTags: false });
+    l.writeTags = !l.writeTags;
+    e.target.classList.toggle('on', l.writeTags);
+    saveSettingsDebounced();
+  });
+  $('#settings-analyze-library')?.addEventListener('click', () => analyzeLoudness(state.library.tracks, 'Library'));
+  $('#settings-reanalyze-library')?.addEventListener('click', () => analyzeLoudness(state.library.tracks, 'Library', { force: true }));
   content.querySelectorAll('.rm[data-folder]').forEach((b) =>
     b.addEventListener('click', async () => {
       const folders = state.library.folders.filter((f) => f !== b.dataset.folder);
@@ -2251,6 +2327,59 @@ function openExportModal(tracks, label) {
   });
 }
 
+// ── Loudness analysis (EBU R128 → ReplayGain) ─────────────────────────────
+
+let loudnessStrip = null;
+function showLoudnessStrip(text, pct) {
+  if (!loudnessStrip) {
+    loudnessStrip = document.createElement('div');
+    loudnessStrip.id = 'loudness-strip';
+    loudnessStrip.innerHTML = `<div class="spin"></div><span class="es-text"></span><span class="pct"></span><button class="es-cancel" id="loudness-strip-cancel">Cancel</button>`;
+    document.body.appendChild(loudnessStrip);
+    $('#loudness-strip-cancel').addEventListener('click', () => window.auralis.library.cancelLoudness());
+  }
+  loudnessStrip.querySelector('.es-text').textContent = text;
+  loudnessStrip.querySelector('.pct').textContent = pct != null ? `${pct}%` : '';
+}
+function hideLoudnessStrip() { loudnessStrip?.remove(); loudnessStrip = null; }
+
+let loudnessActive = false;
+
+window.auralis.library.onLoudnessProgress((p) => {
+  if (!loudnessActive) return;
+  const pct = p.total ? Math.round((p.done / p.total) * 100) : 0;
+  showLoudnessStrip(p.file ? p.file : `Analyzing ${p.done}/${p.total}…`, pct);
+});
+
+// Analyze loudness for a set of tracks, then swap in the returned library so
+// the new ReplayGain/dynamics show up everywhere. `force` re-measures tracks
+// that already carry analysis (used by the explicit per-track/re-analyze
+// actions); the library-wide "Analyze" skips already-done tracks.
+async function analyzeLoudness(tracks, label, { force = false } = {}) {
+  if (!tracks.length || loudnessActive) return;
+  const writeTags = !!state.settings.loudness?.writeTags;
+  const trackIds = tracks.map((t) => t.id);
+  loudnessActive = true;
+  showLoudnessStrip(`Analyzing “${label}”…`, 0);
+  try {
+    const res = await window.auralis.library.analyzeLoudness({ trackIds, writeTags, force });
+    loudnessActive = false;
+    hideLoudnessStrip();
+    if (!res.ok && res.error) { toast(res.error, true); return; }
+    if (res.library) { state.library = res.library; render(); }
+    if (res.cancelled) { toast(`Analysis cancelled — ${res.analyzed} analyzed`); return; }
+    const bits = [`${res.analyzed} analyzed`];
+    if (res.skipped) bits.push(`${res.skipped} already done`);
+    if (writeTags && res.tagged) bits.push(`${res.tagged} tagged`);
+    if (res.failed) bits.push(`${res.failed} failed`);
+    toast(bits.join(' · '), res.failed > 0);
+  } catch (err) {
+    loudnessActive = false;
+    hideLoudnessStrip();
+    toast('Loudness analysis failed: ' + err.message, true);
+  }
+}
+
 // ── Queue & transport ────────────────────────────────────────────────────
 
 function playTracks(tracks, startIdx) {
@@ -2415,6 +2544,7 @@ function onTrackStarted(track) {
   if (track.channels) badges.push(`<span class="badge">${track.channels === 2 ? 'STEREO' : track.channels + ' CH'}</span>`);
   if (track.bitrate && track.lossless) badges.push(`<span class="badge">${track.bitrate} kbps</span>`);
   if (track.genre) badges.push(`<span class="badge">${esc(track.genre.toUpperCase())}</span>`);
+  badges.push(...dynamicsBadges(track));
   $('#np-quality').innerHTML = badges.join('');
 
   // MediaSession (OS media keys / overlay). Artwork is omitted: MediaImage
@@ -2828,6 +2958,7 @@ function openTrackMenu(e, tracks, idx, playlistCtx = null) {
       } }] : []),
     { sep: true },
     { label: 'Export…', fn: () => openExportModal([track], track.title) },
+    { label: 'Analyze loudness', fn: () => analyzeLoudness([track], track.title, { force: true }) },
     { label: 'Show in File Explorer', fn: () => window.auralis.shell.showItem(track.path) },
   ];
   ctxMenu.innerHTML = items.map((it, i) =>
