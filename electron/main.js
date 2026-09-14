@@ -25,6 +25,7 @@ const LIBRARY_FILE = () => path.join(app.getPath('userData'), 'library.json');
 const SETTINGS_FILE = () => path.join(app.getPath('userData'), 'settings.json');
 const PLAYLISTS_FILE = () => path.join(app.getPath('userData'), 'playlists.json');
 const STATS_FILE = () => path.join(app.getPath('userData'), 'stats.json');
+const SESSION_FILE = () => path.join(app.getPath('userData'), 'session.json');
 const ARTIST_INFO_FILE = () => path.join(app.getPath('userData'), 'artist-info.json');
 const ART_CACHE_DIR = () => path.join(app.getPath('userData'), 'art-cache');
 
@@ -629,6 +630,9 @@ function registerIpc() {
 
   ipcMain.handle('stats:get', () => readJson(STATS_FILE(), { plays: {}, lastPlayed: {} }));
   ipcMain.handle('stats:set', async (_e, data) => writeJson(STATS_FILE(), data));
+
+  ipcMain.handle('session:get', () => readJson(SESSION_FILE(), null));
+  ipcMain.handle('session:set', async (_e, data) => writeJson(SESSION_FILE(), data));
 
   ipcMain.handle('artist:info', (_e, name) => getArtistInfo(String(name)));
   ipcMain.handle('artist:cached-map', () => getCachedArtistMap());

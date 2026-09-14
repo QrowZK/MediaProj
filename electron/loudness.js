@@ -97,9 +97,20 @@ class LoudnessAnalyzer {
   }
 
   async _measure(track) {
+    // Cue segment: measure only [cueStart, cueEnd) of the shared file, not the
+    // whole thing, or every track on the disc reports the same loudness.
+    const pre = [];
+    if (track.cue) {
+      const start = track.cueStart || 0;
+      if (start > 0.05) pre.push('-ss', String(start));
+    }
+    const post = [];
+    if (track.cue && track.cueEnd != null) {
+      post.push('-t', String(Math.max(0.001, track.cueEnd - (track.cueStart || 0))));
+    }
     const out = await this._runFfmpeg([
-      '-nostdin', '-hide_banner', '-i', track.path,
-      '-map', 'a:0', '-af', 'ebur128=peak=true', '-f', 'null', '-',
+      '-nostdin', '-hide_banner', ...pre, '-i', track.path,
+      '-map', 'a:0', '-af', 'ebur128=peak=true', ...post, '-f', 'null', '-',
     ]);
     const { integrated, lra, truePeak } = parseEbur128(out);
     if (integrated == null) throw new Error('no loudness measured (silent or undecodable)');
@@ -119,6 +130,9 @@ class LoudnessAnalyzer {
   // Writes to a .part sibling and renames on success so a failure or cancel
   // never leaves a truncated file in place.
   async _writeTags(track, m) {
+    // A cue segment shares one physical file with the whole disc — there's no
+    // per-segment tag slot, so the values live in Auralis's library only.
+    if (track.cue) return { tagged: false, reason: 'cue segment — stored in library' };
     const ext = path.extname(track.path).toLowerCase();
     const muxer = TAGGABLE[ext];
     if (!muxer) return { tagged: false, reason: `tagging not supported for ${ext || 'this format'}` };

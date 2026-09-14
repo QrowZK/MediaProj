@@ -1255,6 +1255,11 @@ async function renderSettings() {
           <button class="toggle ${engine.gapless ? 'on' : ''}" id="toggle-gapless"></button>
         </div>
         <div class="setting-row">
+          <div><div class="lbl">Resume playback on launch</div>
+            <div class="hint">Reopens your queue and the track you left off on, paused at the same spot. Auralis never starts playing on its own at launch.</div></div>
+          <button class="toggle ${s.resumeSession !== false ? 'on' : ''}" id="toggle-resume"></button>
+        </div>
+        <div class="setting-row">
           <div><div class="lbl">Online artist info</div>
             <div class="hint">Fetches artist photos (Deezer) and biographies (Wikipedia) for artist pages. Results are cached locally.</div></div>
           <button class="toggle ${state.settings.onlineArtistInfo !== false ? 'on' : ''}" id="toggle-artistinfo"></button>
@@ -1962,6 +1967,14 @@ async function renderSettings() {
     saveSettings();
   });
 
+  $('#toggle-resume').addEventListener('click', (e) => {
+    state.settings.resumeSession = !(state.settings.resumeSession !== false);
+    e.target.classList.toggle('on', state.settings.resumeSession);
+    saveSettings();
+    if (state.settings.resumeSession) saveSession(true); // capture the current queue now
+    else window.auralis.session.set(null).catch(() => {});
+  });
+
   $('#rg-mode').addEventListener('change', (e) => {
     engine.setReplayGainMode(e.target.value);
     state.settings.replayGain = e.target.value;
@@ -2471,6 +2484,7 @@ function maybeAutoplayExtend(atTrackEnd = false) {
   const artist = state.queue[state.queue.length - 1]?.artist;
   state.queue.push(...batch);
   renderQueue();
+  saveSession();
   toast(mode === 'sameArtist'
     ? `Autoplay: more from ${artist || 'this artist'}`
     : `Autoplay: ${batch.length} random track${batch.length === 1 ? '' : 's'} queued`);
@@ -2483,6 +2497,8 @@ function enginePeekNext() {
 }
 
 function engineOnTrackEnd() {
+  // Sleep timer set to "end of track": stop here instead of advancing.
+  if (sleepTimer.endOfTrack) { cancelSleep(); updatePlayButton(false); return null; }
   maybeAutoplayExtend(true);
   const idx = nextIndex(true);
   if (idx < 0) { updatePlayButton(false); return null; }
@@ -2517,15 +2533,31 @@ function engineOnError(track, msg, transient = false) {
   }
 }
 
+let cueZoneWarned = false;
+
 function onTrackStarted(track) {
   playCountedFor = null;
   errorStreak = 0;
+  // Network renderers can't be told to stop at a cue point — the segment plays
+  // on into the rest of the shared file. Say so once, honestly.
+  if (track.cue && engine === zoneEngine && !cueZoneWarned) {
+    cueZoneWarned = true;
+    toast('Cue tracks aren’t split on network renderers — playback continues past the track', true);
+  }
   sessionPlayed.add(track.id);
   trackStartedAt = Math.floor(Date.now() / 1000);
   updatePlayButton(true);
-  updateMiniUi(track);
   if (!$('#now-playing').classList.contains('hidden')) refreshLyrics(track);
   sendNowPlaying(track);
+  paintNowPlaying(track);
+  saveSession();
+}
+
+// Paint every "what's playing" surface (player bar, Now Playing overlay, mini,
+// MediaSession, queue highlight) for a track. Pure UI — no scrobble, play-count,
+// or history side effects — so it's safe to call on session restore too.
+function paintNowPlaying(track) {
+  updateMiniUi(track);
   $('#pb-title').textContent = track.title;
   $('#pb-artist').textContent = `${track.artist} — ${track.album}`;
   $('#pb-art').style.backgroundImage = track.artUrl ? `url("${track.artUrl}")` : 'none';
@@ -2572,6 +2604,69 @@ function onTrackStarted(track) {
     if (num) num.innerHTML = '<span class="eq-bars"><i></i><i></i><i></i></span>';
   }
 }
+
+// ── Session persistence (resume the queue + position on next launch) ───────
+
+let _sessionSaveTimer = null;
+let _lastSessionPos = 0;
+
+// Persist the current queue (ids), index, and playhead. Coalesced by default so
+// the periodic position updates don't hammer the disk; pass immediate for
+// discrete events (queue cleared, quitting).
+function saveSession(immediate = false) {
+  if (state.settings.resumeSession === false) return;
+  const write = () => {
+    _sessionSaveTimer = null;
+    const q = state.queue || [];
+    if (!q.length || state.queueIndex < 0) {
+      window.auralis.session.set(null).catch(() => {});
+      return;
+    }
+    window.auralis.session.set({
+      trackIds: q.map((t) => t.id),
+      queueIndex: state.queueIndex,
+      position: engine.currentTrack ? engine.currentTime : 0,
+      shuffle: state.shuffle,
+      repeat: state.repeat,
+      savedAt: Date.now(),
+    }).catch(() => {});
+  };
+  if (immediate) { clearTimeout(_sessionSaveTimer); write(); return; }
+  if (_sessionSaveTimer) return; // a save is already pending — coalesce
+  _sessionSaveTimer = setTimeout(write, 1500);
+}
+
+// Rebuild the queue from a saved session and load the current track PAUSED at
+// its saved position. Never auto-plays — launching into sound is a surprise.
+async function restoreSession(session) {
+  if (!session || !Array.isArray(session.trackIds) || !session.trackIds.length) return false;
+  const byId = new Map(state.library.tracks.map((t) => [t.id, t]));
+  const q = session.trackIds.map((id) => byId.get(id)).filter(Boolean);
+  if (!q.length) return false;
+  state.queue = q;
+  state.shuffle = !!session.shuffle;
+  state.repeat = session.repeat || 'off';
+  let idx = session.queueIndex;
+  if (idx == null || idx < 0 || idx >= q.length) idx = 0;
+  state.queueIndex = idx;
+  const track = q[idx];
+  const dur = track.duration || 0;
+  const pos = (session.position > 1 && (!dur || session.position < dur)) ? session.position : 0;
+  try {
+    if (!(await engine.load(track, pos))) return false;
+  } catch { return false; }
+  paintNowPlaying(track);
+  updatePlayButton(false);
+  // reflect the saved position on the seek bar without play-count side effects
+  const pct = dur ? Math.min(100, (pos / dur) * 100) : 0;
+  $('#seek-fill').style.width = pct + '%';
+  $('#seek-thumb').style.left = pct + '%';
+  $('#time-elapsed').textContent = fmtTime(pos);
+  return true;
+}
+
+// Best-effort flush on quit (the periodic saves cover the common case).
+window.addEventListener('beforeunload', () => saveSession(true));
 
 function updatePlayButton(playing) {
   $('#icon-play').classList.toggle('hidden', playing);
@@ -2629,11 +2724,105 @@ $('#btn-shuffle').addEventListener('click', () => {
     renderQueue();
   }
   updateTransportUi();
+  saveSession();
 });
 
 $('#btn-repeat').addEventListener('click', () => {
   state.repeat = state.repeat === 'off' ? 'all' : state.repeat === 'all' ? 'one' : 'off';
   updateTransportUi();
+  saveSession();
+});
+
+// ── Sleep timer ────────────────────────────────────────────────────────────
+// Ephemeral (per session): pause after N minutes, or when the current track
+// ends. A short fade avoids a jarring cut-off in a quiet room.
+const sleepTimer = { deadline: 0, endOfTrack: false };
+let _sleepTick = null;
+
+function cancelSleep() {
+  sleepTimer.deadline = 0;
+  sleepTimer.endOfTrack = false;
+  clearInterval(_sleepTick);
+  _sleepTick = null;
+  updateSleepBadge();
+}
+
+function armSleepMinutes(min) {
+  sleepTimer.endOfTrack = false;
+  sleepTimer.deadline = Date.now() + min * 60000;
+  clearInterval(_sleepTick);
+  _sleepTick = setInterval(() => {
+    if (sleepTimer.deadline && Date.now() >= sleepTimer.deadline) fireSleep();
+    updateSleepBadge();
+  }, 1000);
+  updateSleepBadge();
+  toast(`Sleep timer: ${min} min`);
+}
+
+function armSleepEndOfTrack() {
+  cancelSleep();
+  sleepTimer.endOfTrack = true;
+  updateSleepBadge();
+  toast('Sleep timer: end of track');
+}
+
+// Ease the volume down over a few seconds, pause, then restore the stored
+// volume so the next play starts at the level the user set.
+async function fireSleep() {
+  cancelSleep();
+  const target = engine.volume;
+  const steps = 20, dt = 250;
+  for (let i = steps - 1; i >= 0 && !engine.paused; i--) {
+    engine.setVolume(target * (i / steps));
+    await new Promise((r) => setTimeout(r, dt));
+  }
+  engine.pause();
+  updatePlayButton(false);
+  engine.setVolume(target); // leave the user's level intact for next time
+  toast('Paused by sleep timer');
+}
+
+function updateSleepBadge() {
+  const btn = $('#btn-sleep');
+  const badge = $('#sleep-badge');
+  if (!btn || !badge) return;
+  const active = sleepTimer.deadline || sleepTimer.endOfTrack;
+  btn.classList.toggle('active', !!active);
+  if (sleepTimer.endOfTrack) {
+    badge.textContent = '♪';
+    btn.title = 'Sleep at end of track';
+  } else if (sleepTimer.deadline) {
+    const left = Math.max(0, sleepTimer.deadline - Date.now());
+    const m = Math.ceil(left / 60000);
+    badge.textContent = m > 0 ? String(m) : '';
+    btn.title = `Sleep in ~${m} min`;
+  } else {
+    badge.textContent = '';
+    btn.title = 'Sleep timer';
+  }
+}
+
+$('#btn-sleep').addEventListener('click', (e) => {
+  e.stopPropagation();
+  const active = sleepTimer.deadline || sleepTimer.endOfTrack;
+  const opts = [
+    ['15 minutes', () => armSleepMinutes(15)],
+    ['30 minutes', () => armSleepMinutes(30)],
+    ['45 minutes', () => armSleepMinutes(45)],
+    ['1 hour', () => armSleepMinutes(60)],
+    ['90 minutes', () => armSleepMinutes(90)],
+    ['End of current track', () => armSleepEndOfTrack()],
+    ...(active ? [['Cancel timer', () => { cancelSleep(); toast('Sleep timer off'); }]] : []),
+  ];
+  const menu = $('#context-menu');
+  menu.innerHTML = opts.map((o, i) => `<button class="cm-item" data-i="${i}">${esc(o[0])}</button>`).join('');
+  menu.querySelectorAll('.cm-item').forEach((b) =>
+    b.addEventListener('click', () => { opts[Number(b.dataset.i)][1](); closeMenu(); }));
+  menu.classList.remove('hidden');
+  const rect = $('#btn-sleep').getBoundingClientRect();
+  const mr = menu.getBoundingClientRect();
+  menu.style.left = Math.max(8, rect.right - mr.width) + 'px';
+  menu.style.top = (rect.top - mr.height - 6) + 'px';
 });
 
 // media keys
@@ -2701,6 +2890,8 @@ function engineOnTimeUpdate(time, duration) {
   countPlayIfEligible(time, duration);
   syncLyrics(time);
   updateMiniProgress(time, duration);
+  // persist the playhead roughly every 5s so a resume lands near where we left
+  if (Math.abs(time - _lastSessionPos) >= 5) { _lastSessionPos = time; saveSession(); }
   if (seeking) return;
   const pct = duration ? (time / duration) * 100 : 0;
   $('#seek-fill').style.width = pct + '%';
@@ -2766,6 +2957,7 @@ $('#queue-clear').addEventListener('click', () => {
   engine.clearNext?.();
   autoplayHold = true;
   renderQueue();
+  saveSession(true);
 });
 
 function renderQueue() {
@@ -2941,12 +3133,14 @@ function openTrackMenu(e, tracks, idx, playlistCtx = null) {
         state.queue.splice(state.queueIndex + 1, 0, track);
         engine.preloadedTrack = null;
         renderQueue();
+        saveSession();
         toast('Playing next');
       } },
     { label: 'Add to Queue', fn: () => {
         if (!state.queue.length) return playTracks([track], 0);
         state.queue.push(track);
         renderQueue();
+        saveSession();
         toast('Added to queue');
       } },
     { sep: true },
@@ -3171,11 +3365,12 @@ $$('.nav-item[data-view]').forEach((btn) =>
 // ── Boot ────────────────────────────────────────────────────────────────
 
 (async function boot() {
-  const [lib, pls, settings, stats] = await Promise.all([
+  const [lib, pls, settings, stats, session] = await Promise.all([
     window.auralis.library.get(),
     window.auralis.playlists.get(),
     window.auralis.settings.get(),
     window.auralis.stats.get(),
+    window.auralis.session.get(),
   ]);
   state.library = lib;
   state.playlists = pls.playlists || [];
@@ -3206,6 +3401,11 @@ $$('.nav-item[data-view]').forEach((btn) =>
   } else if (bootMode === 'zone') {
     // don't block boot on an offline renderer — connect in the background
     switchEngine('zone').catch(() => {});
+  }
+  // Restore the previous session (queue + paused playhead) on the now-active
+  // engine, unless the user turned it off.
+  if (settings.resumeSession !== false) {
+    try { await restoreSession(session); } catch { /* stale/missing session */ }
   }
   updateEqButton();
   updateTransportUi();

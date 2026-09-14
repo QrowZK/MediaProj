@@ -41,6 +41,10 @@ contextBridge.exposeInMainWorld('auralis', {
     get: () => ipcRenderer.invoke('stats:get'),
     set: (d) => ipcRenderer.invoke('stats:set', d),
   },
+  session: {
+    get: () => ipcRenderer.invoke('session:get'),
+    set: (d) => ipcRenderer.invoke('session:set', d),
+  },
   artist: {
     info: (name) => ipcRenderer.invoke('artist:info', name),
     cachedMap: () => ipcRenderer.invoke('artist:cached-map'),

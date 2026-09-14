@@ -160,17 +160,49 @@ export class AudioEngine {
     this.onError?.(track, message);
   }
 
+  // seconds into the shared file where this track's audio begins (0 for a
+  // normal standalone file).
+  _cueBase(track) { return track && track.cue ? (track.cueStart || 0) : 0; }
+
+  // resolve once the element knows its duration (so a seek will stick), or on
+  // error (so a bad file doesn't hang the caller forever)
+  _whenSeekable(el) {
+    return new Promise((res) => {
+      if (el.readyState >= 1) return res();
+      const done = () => { el.removeEventListener('loadedmetadata', done); el.removeEventListener('error', done); res(); };
+      el.addEventListener('loadedmetadata', done);
+      el.addEventListener('error', done);
+      el.load();
+    });
+  }
+
+  _seekTo(el, seconds) {
+    if (!(seconds > 0)) return;
+    const doSeek = () => { try { el.currentTime = seconds; } catch { /* not seekable yet */ } };
+    if (el.readyState >= 1) doSeek();
+    else el.addEventListener('loadedmetadata', doSeek, { once: true });
+  }
+
   async play(track, startAt = 0) {
     await this.ctx.resume();
     this.preloadedTrack = null;
     this.currentTrack = track;
     this._errorReportedFor = null;
+    this._cueEnding = false;
     const el = this.el;
     this.idleEl.removeAttribute('src');
     this._applyReplayGain(this.sourceGains[this.active], track);
     el.src = track.url;
-    if (startAt > 0 && isFinite(startAt)) el.currentTime = startAt;
+    const seekTo = this._cueBase(track) + (startAt > 0 && isFinite(startAt) ? startAt : 0);
     try {
+      if (track.cue && seekTo > 0) {
+        // seek to the segment start BEFORE playing, or the head of the shared
+        // file (the previous track's audio) briefly leaks out
+        await this._whenSeekable(el);
+        try { el.currentTime = seekTo; } catch { /* clamped */ }
+      } else if (seekTo > 0) {
+        el.currentTime = seekTo;
+      }
       await el.play();
       return true;
     } catch (err) {
@@ -196,30 +228,47 @@ export class AudioEngine {
     this._applyReplayGain(this.sourceGains[this.active], track);
     el.src = track.url;
     el.load();
-    if (startAt > 0 && isFinite(startAt)) {
-      const seek = () => { try { el.currentTime = startAt; } catch { /* not seekable yet */ } };
-      if (el.readyState >= 1) seek();
-      else el.addEventListener('loadedmetadata', seek, { once: true });
-    }
+    this._cueEnding = false;
+    this._seekTo(el, this._cueBase(track) + (startAt > 0 && isFinite(startAt) ? startAt : 0));
     return true;
   }
 
   _maybePreloadNext() {
     if (!this.gapless || this.preloadedTrack) return;
     const el = this.el;
-    if (!el.duration || el.duration - el.currentTime > PRELOAD_AHEAD_SECONDS) return;
+    if (!el.duration) return;
+    const c = this.currentTrack;
+    // measure "time left" against the cue segment end, not the shared file's
+    const segEnd = c && c.cue && c.cueEnd != null ? c.cueEnd : el.duration;
+    if (segEnd - el.currentTime > PRELOAD_AHEAD_SECONDS) return;
     const next = this.peekNext?.();
     if (!next) return;
+    // Contiguous cue segments in the same file continue seamlessly in place
+    // (see _handleEnded) — nothing to preload.
+    if (c && c.cue && next.cue && next.path === c.path) return;
     this.preloadedTrack = next;
     const idle = this.idleEl;
     this._applyReplayGain(this.sourceGains[1 - this.active], next);
     idle.src = next.url;
     idle.load();
+    if (next.cue) this._seekTo(idle, next.cueStart || 0); // pre-position for a clean handoff
   }
 
   async _handleEnded() {
     const next = this.onTrackEnd?.();
     if (!next) { this.currentTrack = null; return; }
+    const c = this.currentTrack;
+    // Same physical file, contiguous cue segments: the element is already
+    // playing across the boundary — just adopt the next segment. Truly gapless.
+    if (c && c.cue && next.cue && next.path === c.path &&
+        Math.abs((next.cueStart || 0) - (c.cueEnd || 0)) < 0.05 && !this.el.paused) {
+      this.currentTrack = next;
+      this.preloadedTrack = null;
+      this._cueEnding = false;
+      this._errorReportedFor = null;
+      this.onTrackStarted?.(next);
+      return;
+    }
     if (this.gapless && this.preloadedTrack && this.preloadedTrack.id === next.id &&
         this.idleEl.readyState >= 2) {
       // Instant handoff to the preloaded element
@@ -227,6 +276,8 @@ export class AudioEngine {
       this.currentTrack = next;
       this.preloadedTrack = null;
       this._errorReportedFor = null;
+      this._cueEnding = false;
+      if (next.cue) this._seekTo(this.el, next.cueStart || 0);
       try {
         await this.el.play();
         this.onTrackStarted?.(next);
@@ -251,9 +302,19 @@ export class AudioEngine {
 
   pause() { this.el.pause(); }
   get paused() { return this.el.paused; }
-  get currentTime() { return this.el.currentTime; }
-  get duration() { return this.el.duration || 0; }
-  seek(time) { if (isFinite(time)) this.el.currentTime = time; }
+  get currentTime() {
+    const c = this.currentTrack;
+    return c && c.cue ? Math.max(0, this.el.currentTime - (c.cueStart || 0)) : this.el.currentTime;
+  }
+  get duration() {
+    const c = this.currentTrack;
+    if (c && c.cue) return c.duration || Math.max(0, (c.cueEnd ?? this.el.duration || 0) - (c.cueStart || 0));
+    return this.el.duration || 0;
+  }
+  seek(time) {
+    if (!isFinite(time)) return;
+    this.el.currentTime = this._cueBase(this.currentTrack) + Math.max(0, time);
+  }
 
   get buffered() {
     const el = this.el;

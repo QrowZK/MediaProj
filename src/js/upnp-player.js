@@ -27,12 +27,19 @@ export class ZoneEngineProxy {
 
     this._pendingNext = null;
     this._lastSyncedNextId = null;
+    this._cueStart = 0; // file offset of the active cue segment, if any
 
     this._offs = [
       window.auralis.upnp.on('upnp:progress', (p) => {
-        this.currentTime = p.time;
-        this.duration = p.duration || this.duration;
-        this.onTimeUpdate?.(p.time, this.duration);
+        // Cue segment: the renderer reports position within the whole shared
+        // file — shift it to be segment-relative, and keep the segment length
+        // as duration rather than the file's. (No hard cue end is enforced on a
+        // network renderer; it plays on past the segment — see the note in the
+        // app when a cue track starts on a zone.)
+        const t = Math.max(0, p.time - (this._cueStart || 0));
+        this.currentTime = t;
+        if (!this.currentTrack?.cue) this.duration = p.duration || this.duration;
+        this.onTimeUpdate?.(t, this.duration);
         this._syncNext();
       }),
       window.auralis.upnp.on('upnp:track-ended', (p) => {
@@ -84,8 +91,11 @@ export class ZoneEngineProxy {
     this.currentTrack = track;
     this.duration = track.duration || 0;
     this.currentTime = startAt || 0;
+    this._cueStart = track.cue ? (track.cueStart || 0) : 0;
     this._lastSyncedNextId = null;
-    const res = await window.auralis.upnp.zonePlay(this._slim(track), startAt || 0);
+    // For a cue segment the URL is the whole file, so start the renderer at the
+    // segment's file offset.
+    const res = await window.auralis.upnp.zonePlay(this._slim(track), this._cueStart + (startAt || 0));
     if (!res.ok) {
       this.onError?.(track, res.error || 'Renderer refused playback');
       return false;
@@ -131,7 +141,11 @@ export class ZoneEngineProxy {
   }
 
   pause() { window.auralis.upnp.zonePause(); this.paused = true; }
-  seek(time) { if (isFinite(time)) { this.currentTime = time; window.auralis.upnp.zoneSeek(time); } }
+  seek(time) {
+    if (!isFinite(time)) return;
+    this.currentTime = time; // segment-relative; the renderer seeks in file time
+    window.auralis.upnp.zoneSeek((this._cueStart || 0) + time);
+  }
 
   setVolume(v) { this.volume = v; window.auralis.upnp.zoneVolume(Math.round(v * 100)); }
 

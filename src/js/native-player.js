@@ -126,6 +126,7 @@ export class NativeEngineProxy {
       id: t.id, path: t.path, title: t.title, artist: t.artist, album: t.album,
       duration: t.duration, sampleRate: t.sampleRate, channels: t.channels,
       dsd: t.dsd, replayGainTrack: t.replayGainTrack, replayGainAlbum: t.replayGainAlbum,
+      cue: t.cue, cueStart: t.cueStart, cueEnd: t.cueEnd,
     };
   }
 

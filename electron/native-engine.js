@@ -613,8 +613,16 @@ class NativeAudioEngine {
 
     await this.probeSoxr();
     if (seq !== this._playSeq) return; // superseded while awaiting — don't spawn
+    // Cue segment: decode from cueStart (+ any intra-segment offset) and cap
+    // the span at the segment length. The position clock stays segment-relative
+    // because startOffset is the segment offset, not the file offset.
+    const cueStart = track.cue ? (track.cueStart || 0) : 0;
+    const fileSeek = cueStart + startAt;
+    const limitSec = (track.cue && track.cueEnd != null)
+      ? Math.max(0.001, (track.cueEnd - cueStart) - startAt)
+      : null;
     if (plan.mode === 'dop') this._startDopReader(track, startAt, plan);
-    else this._spawnDecoder(track, startAt, plan);
+    else this._spawnDecoder(track, fileSeek, plan, limitSec);
 
     if (opts.startPaused) {
       // decoder fills pcmQueue up to its backpressure limit and waits;
@@ -809,10 +817,14 @@ class NativeAudioEngine {
 
   // ── decode: ffmpeg with SoX resampling + FIR room convolution ──
 
-  _spawnDecoder(track, startAt, plan) {
+  // `fileSeek` is the absolute position in the file to start decoding (cueStart
+  // + intra-segment offset for a cue track; just the offset otherwise).
+  // `limitSec`, when set, caps how much audio is decoded — a cue segment stops
+  // at its cueEnd instead of running to the end of the shared file.
+  _spawnDecoder(track, fileSeek, plan, limitSec = null) {
     const c = this.config;
     const args = ['-v', 'error', '-nostdin'];
-    if (startAt > 0.05) args.push('-ss', String(startAt));
+    if (fileSeek > 0.05) args.push('-ss', String(fileSeek));
     args.push('-i', track.path);
 
     const irPath = plan.mode === 'dsp' && c.correction?.enabled && c.correction.irPath;
@@ -842,6 +854,8 @@ class NativeAudioEngine {
       }
       args.push('-f', 'f64le', '-acodec', 'pcm_f64le');
     }
+    // Cap the decoded span to the cue segment length (output-side duration).
+    if (limitSec != null && limitSec > 0) args.push('-t', String(limitSec));
     args.push('-');
     const child = spawn(ffmpegPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
     this.decoder = child;
