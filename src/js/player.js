@@ -308,7 +308,7 @@ export class AudioEngine {
   }
   get duration() {
     const c = this.currentTrack;
-    if (c && c.cue) return c.duration || Math.max(0, (c.cueEnd ?? this.el.duration || 0) - (c.cueStart || 0));
+    if (c && c.cue) return c.duration || Math.max(0, (c.cueEnd ?? (this.el.duration || 0)) - (c.cueStart || 0));
     return this.el.duration || 0;
   }
   seek(time) {
