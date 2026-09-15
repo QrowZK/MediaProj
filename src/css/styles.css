@@ -1009,6 +1009,41 @@ select.styled:focus { border-color: var(--accent-2); }
 }
 .np-quality .badge { font-size: 11px; padding: 4px 10px; }
 
+/* Portrait / vertical monitors: there's no room for a third column, so the
+   lyrics drop below the art + info row instead of squeezing it. */
+@media (orientation: portrait) {
+  #now-playing.with-lyrics .np-content {
+    flex-wrap: wrap;
+    align-items: center;
+    align-content: center;
+    gap: 22px 32px;
+    padding: 0 5vw;
+    max-width: 900px;
+    max-height: 100%;
+  }
+  #now-playing.with-lyrics .np-art {
+    width: min(280px, 26vh, 38vw);
+    height: min(280px, 26vh, 38vw);
+  }
+  #now-playing.with-lyrics .np-meta {
+    flex: 1 1 220px;
+    max-width: 560px;
+  }
+  #now-playing.with-lyrics .np-title { font-size: clamp(22px, 4.2vw, 34px); margin-bottom: 8px; }
+  #now-playing.with-lyrics .np-album { margin-bottom: 16px; }
+  #now-playing.with-lyrics .np-lyrics {
+    flex: 1 1 100%;
+    width: 100%;
+    max-height: 52vh;
+  }
+  #now-playing.with-lyrics .np-lyrics-scroll {
+    max-height: 48vh;
+    padding: 20px 0;
+  }
+  #now-playing.with-lyrics .lyric-line { text-align: center; transform-origin: center center; }
+  #now-playing.with-lyrics .np-lyrics-source { text-align: center; }
+}
+
 /* ═══════════ Player bar ═══════════ */
 
 #player-bar {
