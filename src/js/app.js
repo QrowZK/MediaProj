@@ -1804,7 +1804,9 @@ async function renderSettings() {
   // ── Media server ──
 
   const upnpStatusText = (s) => s.running
-    ? `Running at ${s.address} — streamers can browse the library now.`
+    ? (s.zoneOnly
+      ? 'Off — streaming only to the selected network zone, hidden from other devices.'
+      : `Running at ${s.address} — streamers can browse the library now.`)
     : (s.error ? `Failed to start: ${s.error}` : 'Stopped.');
 
   window.auralis.upnp.serverStatus().then((s) => {

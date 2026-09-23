@@ -20,6 +20,13 @@ const MIME = {
   '.dsf': 'audio/x-dsf', '.dff': 'audio/x-dff', '.alac': 'audio/mp4',
 };
 
+// Socket addresses arrive as IPv4-mapped IPv6 ("::ffff:192.168.1.20") on a
+// dual-stack listener; compare them in plain IPv4 form.
+function normalizeIp(a) {
+  if (!a) return '';
+  return a.toLowerCase().startsWith('::ffff:') && a.includes('.') ? a.slice(7) : a.toLowerCase();
+}
+
 function mimeFor(p) { return MIME[path.extname(p).toLowerCase()] || 'application/octet-stream'; }
 
 function hmmss(seconds) {
@@ -60,6 +67,11 @@ class MediaServer {
     this.config = { enabled: false, name: 'Auralis', port: 47700 };
     this.uuid = null;
     this.updateId = 1;
+    // null: serve every client (the media server the user enabled). A set of
+    // addresses: zone-only mode, where just the selected renderer may pull
+    // audio and nothing else is exposed.
+    this.allowedClients = null;
+    this.sockets = new Set();
   }
 
   bumpUpdateId() { this.updateId = (this.updateId % 2000000000) + 1; }
@@ -70,14 +82,34 @@ class MediaServer {
       address: this.httpServer ? `http://${localIPv4()}:${this.config.port}` : null,
       name: this.config.name,
       port: this.config.port,
+      zoneOnly: !!(this.httpServer && this.allowedClients),
+      advertising: !!this.ssdp,
     };
   }
 
-  async start(config, uuid) {
+  _clientAllowed(address) {
+    return !this.allowedClients || this.allowedClients.has(normalizeIp(address));
+  }
+
+  // scope: { advertise, allowedClients }. The defaults are the full media
+  // server: announced over SSDP and open to any client on the network.
+  // Calling start() again on the same port only swaps the scope, so a
+  // renderer's stream in flight survives the user turning the server on or
+  // off while a zone is playing.
+  async start(config, uuid, scope = {}) {
+    const next = { ...this.config, ...config };
+    if (this.httpServer && (next.port || 47700) === (this.config.port || 47700)) {
+      this.config = next;
+      this.uuid = uuid;
+      this._applyScope(scope);
+      return this.status();
+    }
     this.stop();
-    this.config = { ...this.config, ...config };
+    this.config = next;
     this.uuid = uuid;
     const port = this.config.port || 47700;
+    // set before listening so no connection is accepted under the wrong scope
+    this.allowedClients = scope.allowedClients ? new Set(scope.allowedClients.map(normalizeIp)) : null;
 
     this.httpServer = http.createServer((req, res) => {
       this._handle(req, res).catch((err) => {
@@ -86,6 +118,11 @@ class MediaServer {
           res.end('Internal error: ' + err.message);
         } catch { /* socket gone */ }
       });
+    });
+    this.httpServer.on('connection', (socket) => {
+      if (!this._clientAllowed(socket.remoteAddress)) return socket.destroy();
+      this.sockets.add(socket);
+      socket.on('close', () => this.sockets.delete(socket));
     });
 
     try {
@@ -100,13 +137,27 @@ class MediaServer {
       throw err;
     }
 
-    this.ssdp = new SsdpAdvertiser({
-      uuid,
-      location: `http://${localIPv4()}:${port}/device.xml`,
-      serverName: this.config.name,
-    });
-    this.ssdp.start();
+    this._applyScope(scope);
     return this.status();
+  }
+
+  _applyScope({ advertise = true, allowedClients = null } = {}) {
+    this.allowedClients = allowedClients ? new Set(allowedClients.map(normalizeIp)) : null;
+    // cut off anyone the new scope no longer admits (e.g. a streamer that was
+    // browsing before the user switched the server off while a zone plays)
+    for (const socket of this.sockets) {
+      if (!this._clientAllowed(socket.remoteAddress)) socket.destroy();
+    }
+    // restart the advertiser so a renamed server re-announces itself
+    if (this.ssdp) { this.ssdp.stop(); this.ssdp = null; }
+    if (advertise) {
+      this.ssdp = new SsdpAdvertiser({
+        uuid: this.uuid,
+        location: `http://${localIPv4()}:${this.config.port || 47700}/device.xml`,
+        serverName: this.config.name,
+      });
+      this.ssdp.start();
+    }
   }
 
   stop() {
@@ -115,6 +166,11 @@ class MediaServer {
       try { this.httpServer.close(); } catch { /* fine */ }
       this.httpServer = null;
     }
+    // close() only stops new connections: end open streams too, so a stopped
+    // server really stops serving
+    for (const socket of this.sockets) socket.destroy();
+    this.sockets.clear();
+    this.allowedClients = null;
   }
 
   _baseUrl(req) {
@@ -125,6 +181,13 @@ class MediaServer {
   async _handle(req, res) {
     const url = new URL(req.url, this._baseUrl(req));
     const p = url.pathname;
+
+    // Zone-only mode: the renderer only needs its audio and album art; the
+    // library itself is not browseable.
+    if (this.allowedClients && !p.startsWith('/stream/') && !p.startsWith('/art/')) {
+      res.writeHead(404, { 'Content-Type': 'text/plain' });
+      return res.end('Not found');
+    }
 
     if (p === '/device.xml') return this._deviceXml(req, res);
     if (p === '/cds/scpd.xml') return this._scpd(res, CDS_SCPD);

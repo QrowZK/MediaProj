@@ -721,17 +721,41 @@ async function upnpConfig() {
   return { enabled: false, name: 'Auralis', port: 47700, ...cfg };
 }
 
+// Addresses the selected network zone's renderer may pull audio from, while
+// a zone is selected (null otherwise).
+let zoneClients = null;
+let zoneGen = 0; // bumped per select/stop so a slow renderer handshake can't win late
+let mediaServerSync = Promise.resolve();
+
+// Bring the media server in line with the user's setting and the zone:
+// enabled → the full server, advertised to the whole network; disabled with a
+// zone selected → zone-only, unadvertised and serving just that renderer;
+// otherwise stopped. Runs one at a time so a quick zone switch can't race two
+// listeners onto the port.
+function syncMediaServer() {
+  const run = mediaServerSync.then(async () => {
+    const cfg = await upnpConfig();
+    const server = getMediaServer();
+    if (!cfg.enabled && !zoneClients) { server.stop(); return server.status(); }
+    await getCachedLibrary();
+    try {
+      return await server.start({ enabled: cfg.enabled, name: cfg.name, port: cfg.port }, cfg.uuid,
+        cfg.enabled ? { advertise: true } : { advertise: false, allowedClients: zoneClients });
+    } catch (err) {
+      server.stop();
+      throw err;
+    }
+  });
+  mediaServerSync = run.catch(() => {});
+  return run;
+}
+
 async function applyUpnpConfig(partial) {
   const cfg = { ...(await upnpConfig()), ...partial };
   await writeJson(UPNP_FILE(), cfg);
-  const server = getMediaServer();
-  await getCachedLibrary();
   try {
-    if (cfg.enabled) await server.start({ enabled: true, name: cfg.name, port: cfg.port }, cfg.uuid);
-    else server.stop();
-    return { ok: true, ...server.status() };
+    return { ok: true, ...(await syncMediaServer()) };
   } catch (err) {
-    server.stop();
     return { ok: false, error: err.message, running: false };
   }
 }
@@ -741,6 +765,9 @@ async function applyUpnpConfig(partial) {
 const { RendererEngine, discoverRenderers } = require('./upnp/renderer-client');
 const { trackItemXml } = require('./upnp/media-server');
 const { localIPv4: upnpLocalIp } = require('./upnp/ssdp');
+const os = require('os');
+const net = require('net');
+const dnsPromises = require('dns').promises;
 let rendererEngine = null;
 
 function getRendererEngine() {
@@ -758,14 +785,24 @@ function getRendererEngine() {
   return rendererEngine;
 }
 
+// The host in the renderer's description URL is where it pulls audio from.
+// A renderer on this PC may connect from any of our own addresses instead.
+async function rendererAddresses(location) {
+  const host = new URL(location).hostname.replace(/^\[|\]$/g, '');
+  const addrs = net.isIP(host) ? [host]
+    : (await dnsPromises.lookup(host, { all: true })).map((a) => a.address);
+  const own = Object.values(os.networkInterfaces()).flat().filter(Boolean).map((a) => a.address);
+  if (addrs.some((a) => own.includes(a) || a.startsWith('127.') || a === '::1')) {
+    addrs.push(...own, '127.0.0.1', '::1');
+  }
+  return addrs;
+}
+
 // The renderer pulls audio from our HTTP server — make sure it's up even if
-// the user hasn't enabled the media server explicitly (not persisted).
+// the user hasn't enabled the media server (zone-only; see syncMediaServer).
 async function ensureServerForZone() {
-  const server = getMediaServer();
-  if (server.status().running) return;
-  const cfg = await upnpConfig();
-  await getCachedLibrary();
-  await server.start({ name: cfg.name, port: cfg.port }, cfg.uuid);
+  if (getMediaServer().status().running) return;
+  await syncMediaServer();
 }
 
 function registerUpnpIpc() {
@@ -780,8 +817,19 @@ function registerUpnpIpc() {
 
   ipcMain.handle('upnp:discover-renderers', () => discoverRenderers());
   ipcMain.handle('upnp:zone-select', async (_e, location) => {
-    if (location) await ensureServerForZone();
-    return getRendererEngine().select(location);
+    const gen = ++zoneGen;
+    let info;
+    try {
+      info = await getRendererEngine().select(location);
+      const addrs = info ? await rendererAddresses(location) : null;
+      if (gen === zoneGen) zoneClients = addrs;
+    } catch (err) {
+      if (gen === zoneGen) zoneClients = null;
+      await syncMediaServer().catch(() => {});
+      throw err;
+    }
+    await syncMediaServer();
+    return info;
   });
   ipcMain.handle('upnp:zone-play', async (_e, track, startAt) => {
     try {
@@ -795,7 +843,15 @@ function registerUpnpIpc() {
   ipcMain.handle('upnp:zone-seek', (_e, s) => getRendererEngine().seek(s));
   ipcMain.handle('upnp:zone-set-next', (_e, track) => getRendererEngine().setNext(track));
   ipcMain.handle('upnp:zone-volume', (_e, v) => getRendererEngine().setVolume(v));
-  ipcMain.handle('upnp:zone-stop', () => getRendererEngine().stopAll());
+  // Sent when the app leaves the zone: stop the renderer, forget it, and take
+  // the zone-only server down with it. (Cleared before any await so a
+  // zone-select for the next zone, sent right behind this, always wins.)
+  ipcMain.handle('upnp:zone-stop', async () => {
+    zoneGen++;
+    zoneClients = null;
+    await getRendererEngine().select(null);
+    await syncMediaServer().catch(() => {});
+  });
 }
 
 // ---------------------------------------------------------------------------
