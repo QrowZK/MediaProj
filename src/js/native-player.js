@@ -126,6 +126,7 @@ export class NativeEngineProxy {
       id: t.id, path: t.path, title: t.title, artist: t.artist, album: t.album,
       duration: t.duration, sampleRate: t.sampleRate, channels: t.channels,
       dsd: t.dsd, replayGainTrack: t.replayGainTrack, replayGainAlbum: t.replayGainAlbum,
+      rgTrackPeak: t.rgTrackPeak, rgAlbumPeak: t.rgAlbumPeak,
       cue: t.cue, cueStart: t.cueStart, cueEnd: t.cueEnd,
     };
   }
@@ -137,6 +138,13 @@ export class NativeEngineProxy {
     this._lastSyncedNextId = id;
     this._pendingNext = next || null;
     window.auralis.native.setNext(next ? this._slim(next) : null);
+  }
+
+  // library re-read (Analyze, rescan): keep our copies current. The main
+  // process refreshes its own copies of the playing/next track after Analyze.
+  refreshTracks(byId) {
+    if (this.currentTrack) this.currentTrack = byId.get(this.currentTrack.id) || this.currentTrack;
+    if (this._pendingNext) this._pendingNext = byId.get(this._pendingNext.id) || this._pendingNext;
   }
 
   // queue cleared: disarm the synced next NOW — waiting for the next progress

@@ -125,6 +125,21 @@ function parseCue(text, cueDir) {
   return album;
 }
 
+// Cue sheets are plain text in whatever encoding the ripper used: UTF-8
+// (often with a BOM) from modern tools, but EAC and older rippers write the
+// Windows ANSI code page, whose accented letters are invalid UTF-8 and came
+// out as U+FFFD. Decode strictly as UTF-8 first, then fall back to
+// Windows-1252. A UTF-16 BOM is honoured too.
+function decodeCueText(buf) {
+  if (buf.length >= 2 && buf[0] === 0xFF && buf[1] === 0xFE) return new TextDecoder('utf-16le').decode(buf.subarray(2));
+  if (buf.length >= 2 && buf[0] === 0xFE && buf[1] === 0xFF) return new TextDecoder('utf-16be').decode(buf.subarray(2));
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(buf); // strips a UTF-8 BOM
+  } catch {
+    return new TextDecoder('windows-1252').decode(buf);
+  }
+}
+
 // Cue sheets very often name a file that was converted after ripping
 // (FILE "Album.wav" with Album.flac on disk), or differ in case. Resolve to
 // the real file: exact path, then a case-insensitive match, then the same
@@ -154,6 +169,34 @@ async function cacheAlbumArt(pictures, albumKey) {
   } catch {
     return null;
   }
+}
+
+// ReplayGain peaks from tags (linear, 1.0 = full scale). Playback caps a
+// positive gain at 1/peak so it can't clip; without the peak it can't.
+function tagPeaks(c) {
+  const lin = (p) => (p && Number.isFinite(p.ratio) && p.ratio > 0 ? p.ratio : null);
+  return { rgTrackPeak: lin(c.replaygain_track_peak), rgAlbumPeak: lin(c.replaygain_album_peak) };
+}
+
+// Entries scanned before peaks were read carry a tagged gain but no peak
+// field at all — re-read those once so their gain gets clipping protection.
+// (Tracks Auralis analyzed always have rgTrackPeak.)
+const needsPeakReread = (t) => t.rgTrackPeak === undefined && t.replayGainTrack != null;
+
+// Re-reading an entry whose audio is unchanged (it had no art, or needed its
+// peaks) rebuilt it from the tags alone, dropping Auralis's loudness analysis
+// and resetting its "added" date — so an art-less album lost its ReplayGain on
+// every rescan. Carry those over; a changed file (or a cue edit that moved the
+// segment's end) is measured afresh.
+const ANALYSIS_KEYS = ['loudnessLufs', 'loudnessRange', 'truePeakDb', 'replayGainTrack',
+  'replayGainAlbum', 'rgTrackPeak', 'rgAlbumPeak', 'loudnessAnalyzedAt', 'rgTagged', 'rgTagReason'];
+function keepFromPrev(prev, fresh) {
+  if (!prev || prev.mtime !== fresh.mtime) return fresh;
+  if (prev.added) fresh.added = prev.added;
+  if (prev.loudnessAnalyzedAt && (prev.cueEnd ?? null) === (fresh.cueEnd ?? null)) {
+    for (const k of ANALYSIS_KEYS) if (k in prev) fresh[k] = prev[k];
+  }
+  return fresh;
 }
 
 async function extractTrack(mm, filePath, existingArtByAlbum) {
@@ -203,6 +246,7 @@ async function extractTrack(mm, filePath, existingArtByAlbum) {
     dsd: ext === '.dsf' || ext === '.dff',
     replayGainTrack: c.replaygain_track_gain?.dB ?? null,
     replayGainAlbum: c.replaygain_album_gain?.dB ?? null,
+    ...tagPeaks(c),
     artUrl: artUrl || null,
     fileSize: stat.size,
     mtime: stat.mtimeMs,
@@ -245,8 +289,9 @@ async function extractCueTracks(mm, album, fileEntry, artByAlbum, byId) {
     const prev = byId.get(id);
     // reuse only if neither the audio nor the .cue changed (a cue edit can
     // change titles or the next track's INDEX, i.e. this track's cueEnd)
-    if (prev && prev.mtime === stat.mtimeMs && prev.cueMtime === album.cueMtime && prev.artUrl) { out.push(prev); continue; }
-    out.push({
+    if (prev && prev.mtime === stat.mtimeMs && prev.cueMtime === album.cueMtime && prev.artUrl &&
+        !needsPeakReread(prev)) { out.push(prev); continue; }
+    out.push(keepFromPrev(prev, {
       id, path: filePath, url: toMediaUrl(filePath),
       title: t.title || `Track ${t.no}`,
       artist: t.performer || albumArtist,
@@ -265,12 +310,13 @@ async function extractCueTracks(mm, album, fileEntry, artByAlbum, byId) {
       dsd: ext === '.dsf' || ext === '.dff',
       replayGainTrack: c.replaygain_track_gain?.dB ?? null,
       replayGainAlbum: c.replaygain_album_gain?.dB ?? null,
+      ...tagPeaks(c),
       artUrl: artUrl || null,
       fileSize: stat.size, mtime: stat.mtimeMs, added: Date.now(),
       // cue segment of a shared file: url points at the whole file; playback
       // seeks to cueStart and stops at cueEnd (null cueEnd = play to file end).
       cue: true, cueStart: start, cueEnd: isLast ? null : end, cueMtime: album.cueMtime,
-    });
+    }));
   }
   return out;
 }
@@ -305,19 +351,27 @@ async function extractCueTracks(mm, album, fileEntry, artByAlbum, byId) {
   // Parse cue sheets first so their referenced audio files aren't ALSO indexed
   // as one giant standalone track.
   const cueAlbums = [];
-  const cueReferenced = new Set();
+  const cueReferenced = new Set(); // fileKey()s of audio files cue sheets cover
+  // Windows paths are case-insensitive: a sheet spelling the file name in a
+  // different case must still claim the file the folder walk found.
+  const fileKey = (p) => (process.platform === 'win32' ? p.toLowerCase() : p);
+  // Sorted so the same sheet wins every scan when several point at one file.
+  cueFiles.sort();
   for (const cuePath of cueFiles) {
     try {
-      const album = parseCue(await fsp.readFile(cuePath, 'utf8'), path.dirname(cuePath));
+      const album = parseCue(decodeCueText(await fsp.readFile(cuePath)), path.dirname(cuePath));
       album.cueMtime = (await fsp.stat(cuePath)).mtimeMs;
       // keep only entries that resolve to a real file AND have segments — a
-      // file marked cue-covered but yielding no tracks would vanish entirely
+      // file marked cue-covered but yielding no tracks would vanish entirely.
+      // A file an earlier sheet already claimed is skipped: two sheets for one
+      // image (a UTF-8 and an ANSI copy, say) made every track twice, with the
+      // same ids, so the album listed each track twice and id lookups collided.
       album.files = album.files.filter((fe) => {
         const real = fe.tracks.length ? resolveCueAudio(fe.file) : null;
         if (real) fe.file = real;
-        return !!real;
+        return !!real && !cueReferenced.has(fileKey(real));
       });
-      for (const fe of album.files) cueReferenced.add(fe.file);
+      for (const fe of album.files) cueReferenced.add(fileKey(fe.file));
       if (album.files.length) cueAlbums.push(album);
     } catch { /* unreadable / malformed cue */ }
   }
@@ -326,13 +380,13 @@ async function extractCueTracks(mm, album, fileEntry, artByAlbum, byId) {
   for (let i = 0; i < allFiles.length; i++) {
     if (cancelled) { parentPort.postMessage({ type: 'cancelled' }); return; }
     const file = allFiles[i];
-    if (cueReferenced.has(file)) continue; // represented by cue segments instead
+    if (cueReferenced.has(fileKey(file))) continue; // represented by cue segments instead
     const prev = byPath.get(file);
     try {
-      if (prev && prev.mtime === (await fsp.stat(file)).mtimeMs && prev.artUrl) {
+      if (prev && prev.mtime === (await fsp.stat(file)).mtimeMs && prev.artUrl && !needsPeakReread(prev)) {
         tracks.push(prev);
       } else {
-        tracks.push(await extractTrack(mm, file, artByAlbum));
+        tracks.push(keepFromPrev(prev, await extractTrack(mm, file, artByAlbum)));
       }
     } catch {
       // skip unreadable file
