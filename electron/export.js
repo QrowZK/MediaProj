@@ -49,6 +49,26 @@ function sanitizeSegment(s) {
   return (cleaned || 'Unknown').slice(0, 120);
 }
 
+// A cue-sheet track is a [cueStart, cueEnd) slice of a shared disc image:
+// trim to that span (input-side -ss is sample-accurate when transcoding) and
+// write the segment's own tags — -map_metadata alone would stamp every track
+// with the disc file's title/track number.
+function cueSegmentArgs(track) {
+  if (!track.cue) return { inputArgs: [], outputArgs: [] };
+  const start = Number(track.cueStart) || 0;
+  const inputArgs = start > 0 ? ['-ss', start.toFixed(6)] : [];
+  const outputArgs = [];
+  if (track.cueEnd != null) outputArgs.push('-t', Math.max(0.001, track.cueEnd - start).toFixed(6));
+  const tags = {
+    title: track.title, artist: track.artist, album: track.album,
+    album_artist: track.albumArtist, track: track.trackNo, date: track.year, genre: track.genre,
+  };
+  for (const [k, v] of Object.entries(tags)) {
+    if (v != null && v !== '') outputArgs.push('-metadata', `${k}=${v}`);
+  }
+  return { inputArgs, outputArgs };
+}
+
 function buildDestPath(destDir, track, fmt) {
   const artist = sanitizeSegment(track.albumArtist || track.artist);
   const album = sanitizeSegment(track.album);
@@ -130,9 +150,10 @@ class LibraryExporter {
           } else {
             // the .part name hides the extension from ffmpeg, so name the muxer
             const muxer = { flac: 'flac', m4a: 'ipod', mp3: 'mp3' }[fmt.ext];
+            const { inputArgs, outputArgs } = cueSegmentArgs(track);
             await this._runFfmpeg([
-              '-y', '-v', 'error', '-i', track.path, '-map_metadata', '0', '-vn',
-              ...fmt.args(!!opts.downsample), '-f', muxer, partPath,
+              '-y', '-v', 'error', ...inputArgs, '-i', track.path, '-map_metadata', '0', '-vn',
+              ...outputArgs, ...fmt.args(!!opts.downsample), '-f', muxer, partPath,
             ]);
           }
           await fsp.rename(partPath, filePath);
