@@ -7,6 +7,7 @@ const fsp = fs.promises;
 const http = require('http');
 const https = require('https');
 const crypto = require('crypto');
+const { createJobQueue } = require('./library-jobs');
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -30,7 +31,6 @@ const ARTIST_INFO_FILE = () => path.join(app.getPath('userData'), 'artist-info.j
 const ART_CACHE_DIR = () => path.join(app.getPath('userData'), 'art-cache');
 
 let mainWindow = null;
-let scanCancelled = false;
 let activeExporter = null;
 let activeLoudness = null;
 
@@ -164,27 +164,32 @@ function hashString(str) {
 // The scan runs in a WORKER THREAD: music-metadata parsing is CPU-heavy, and
 // on the main loop it starves the audio pump (WASAPI ring refills, IPC,
 // progress) — a rescan during playback caused pops and error cascades.
-let activeScan = null; // { worker, promise } — a second Rescan click joins it
+let activeScan = null; // { worker, promise, abort } — a second Rescan click joins it
+
+// Scans and loudness analysis both rewrite library.json from a snapshot taken
+// when they start, so they take turns; the second one waits in this queue.
+const libraryJobs = createJobQueue();
 
 function scanFolders(folders) {
   if (activeScan) return activeScan.promise;
-  scanCancelled = false;
+  const abort = new AbortController();
   const { Worker } = require('worker_threads');
 
-  const promise = (async () => {
-    const existing = await readJson(LIBRARY_FILE(), { folders: [], tracks: [] });
-    const worker = new Worker(path.join(__dirname, 'scan-worker.js'), {
-      workerData: {
-        folders,
-        existingTracks: existing.tracks,
-        artCacheDir: ART_CACHE_DIR(),
-      },
-    });
-    if (activeScan) activeScan.worker = worker;
-    // cancel-scan may have arrived while the library was still being read
-    if (scanCancelled) worker.postMessage({ type: 'cancel' });
-
+  const promise = libraryJobs.run('scan', async () => {
+    let worker = null;
     try {
+      const existing = await readJson(LIBRARY_FILE(), { folders: [], tracks: [] });
+      worker = new Worker(path.join(__dirname, 'scan-worker.js'), {
+        workerData: {
+          folders,
+          existingTracks: existing.tracks,
+          artCacheDir: ART_CACHE_DIR(),
+        },
+      });
+      if (activeScan) activeScan.worker = worker;
+      // cancel-scan may have arrived while the library was still being read
+      if (abort.signal.aborted) worker.postMessage({ type: 'cancel' });
+
       const tracks = await new Promise((resolve, reject) => {
         worker.on('message', (m) => {
           if (m.type === 'progress') {
@@ -206,12 +211,18 @@ function scanFolders(folders) {
       mediaServer?.bumpUpdateId();
       return library;
     } finally {
-      worker.terminate().catch(() => {});
-      activeScan = null;
+      worker?.terminate().catch(() => {});
     }
-  })();
+  }, {
+    signal: abort.signal,
+    cancelledValue: null,
+    onWait: (ahead) => mainWindow?.webContents.send('scan:progress', { phase: 'waiting', for: ahead }),
+  });
+  // also covers a scan cancelled while waiting, which settles without running
+  const done = () => { if (activeScan?.promise === promise) activeScan = null; };
+  promise.then(done, done);
 
-  activeScan = { worker: null, promise };
+  activeScan = { worker: null, promise, abort };
   return promise;
 }
 
@@ -578,7 +589,7 @@ function registerIpc() {
 
   ipcMain.handle('library:scan', async (_e, folders) => scanFolders(folders));
   ipcMain.handle('library:cancel-scan', () => {
-    scanCancelled = true;
+    activeScan?.abort.abort();
     activeScan?.worker?.postMessage({ type: 'cancel' });
   });
 
@@ -614,22 +625,32 @@ function registerIpc() {
   ipcMain.handle('library:analyze-loudness', async (_e, { trackIds, writeTags, force }) => {
     if (activeLoudness) return { ok: false, error: 'A loudness analysis is already running' };
     const { LoudnessAnalyzer } = require('./loudness');
-    const lib = await readJson(LIBRARY_FILE(), { folders: [], tracks: [] });
-    const byId = new Map(lib.tracks.map((t) => [t.id, t]));
-    const tracks = (trackIds || []).map((id) => byId.get(id)).filter(Boolean);
-    if (!tracks.length) return { ok: false, error: 'No matching tracks to analyze' };
-    activeLoudness = new LoudnessAnalyzer();
+    const analyzer = new LoudnessAnalyzer();
+    const abort = new AbortController();
+    // Set before queueing so Cancel and quit reach it while it waits its turn.
+    activeLoudness = { cancel: () => { abort.abort(); analyzer.cancel(); } };
     try {
-      const res = await activeLoudness.run(tracks, { writeTags: !!writeTags, force: !!force }, (p) => {
-        mainWindow?.webContents.send('loudness:progress', p);
+      return await libraryJobs.run('loudness', async () => {
+        // Read only now, after any scan ahead of us has written its result.
+        const lib = await readJson(LIBRARY_FILE(), { folders: [], tracks: [] });
+        const byId = new Map(lib.tracks.map((t) => [t.id, t]));
+        const tracks = (trackIds || []).map((id) => byId.get(id)).filter(Boolean);
+        if (!tracks.length) return { ok: false, error: 'No matching tracks to analyze' };
+        const res = await analyzer.run(tracks, { writeTags: !!writeTags, force: !!force }, (p) => {
+          mainWindow?.webContents.send('loudness:progress', p);
+        });
+        // Merge measured fields into the library and persist.
+        const merged = lib.tracks.map((t) => (res.results[t.id] ? { ...t, ...res.results[t.id] } : t));
+        const updated = { ...lib, folders: lib.folders || [], tracks: merged, updated: Date.now() };
+        await writeJson(LIBRARY_FILE(), updated);
+        cachedLibrary = updated;
+        mediaServer?.bumpUpdateId();
+        return { ...res, library: updated };
+      }, {
+        signal: abort.signal,
+        cancelledValue: { ok: false, cancelled: true, analyzed: 0, skipped: 0, tagged: 0, failed: 0, failures: [], results: {} },
+        onWait: (ahead) => mainWindow?.webContents.send('loudness:progress', { waiting: ahead }),
       });
-      // Merge measured fields into the library and persist.
-      const merged = lib.tracks.map((t) => (res.results[t.id] ? { ...t, ...res.results[t.id] } : t));
-      const updated = { ...lib, folders: lib.folders || [], tracks: merged, updated: Date.now() };
-      await writeJson(LIBRARY_FILE(), updated);
-      cachedLibrary = updated;
-      mediaServer?.bumpUpdateId();
-      return { ...res, library: updated };
     } finally {
       activeLoudness = null;
     }
@@ -1002,6 +1023,7 @@ app.whenReady().then(async () => {
 app.on('before-quit', () => {
   try { activeExporter?.cancel(); } catch {}
   try { activeLoudness?.cancel(); } catch {} // else its ffmpeg can outlive us and strand a .rgpart
+  try { activeScan?.abort.abort(); } catch {} // a scan still waiting never starts
   try { activeScan?.worker?.terminate(); } catch {}
   try { nativeEngine?.stopAll(); } catch {}
   try { rendererEngine?.stopAll(); } catch {}
