@@ -607,11 +607,11 @@ function registerIpc() {
   });
   ipcMain.handle('library:cancel-export', () => { activeExporter?.cancel(); });
 
-  // Analyze loudness (EBU R128) and derive/write ReplayGain for a selection,
-  // then merge the measured values into the library so playback normalizes and
-  // the dynamics are surfaced in the UI. Returns the updated library so the
+  // Analyze loudness (EBU R128) and derive ReplayGain for a selection, then
+  // merge the measured values into the library so playback normalizes and the
+  // dynamics are surfaced in the UI. Source files are never modified. Returns the updated library so the
   // renderer can swap state and re-render, exactly like a scan.
-  ipcMain.handle('library:analyze-loudness', async (_e, { trackIds, writeTags, force }) => {
+  ipcMain.handle('library:analyze-loudness', async (_e, { trackIds, force }) => {
     if (activeLoudness) return { ok: false, error: 'A loudness analysis is already running' };
     const { LoudnessAnalyzer } = require('./loudness');
     const lib = await readJson(LIBRARY_FILE(), { folders: [], tracks: [] });
@@ -620,7 +620,7 @@ function registerIpc() {
     if (!tracks.length) return { ok: false, error: 'No matching tracks to analyze' };
     activeLoudness = new LoudnessAnalyzer();
     try {
-      const res = await activeLoudness.run(tracks, { writeTags: !!writeTags, force: !!force }, (p) => {
+      const res = await activeLoudness.run(tracks, { force: !!force }, (p) => {
         mainWindow?.webContents.send('loudness:progress', p);
       });
       // Merge measured fields into the library and persist.

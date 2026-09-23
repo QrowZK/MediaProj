@@ -210,6 +210,22 @@ async function extractTrack(mm, filePath, existingArtByAlbum) {
   };
 }
 
+// Loudness analysis results live only in the library (files are never
+// tagged), so a re-read of an unchanged file must carry them over or a rescan
+// silently throws the analysis away. Tracks that are re-read to pick up art
+// hit this on every scan.
+const LOUDNESS_FIELDS = [
+  'loudnessLufs', 'loudnessRange', 'truePeakDb', 'replayGainTrack', 'rgTrackPeak',
+  'replayGainAlbum', 'rgAlbumPeak', 'loudnessAnalyzedAt',
+];
+function keepLoudness(prev, track) {
+  if (!prev || prev.loudnessAnalyzedAt == null) return track;
+  // A changed file (or .cue, which can move a segment's end) needs re-analysis.
+  if (prev.mtime !== track.mtime || prev.cueMtime !== track.cueMtime) return track;
+  for (const k of LOUDNESS_FIELDS) if (prev[k] !== undefined) track[k] = prev[k];
+  return track;
+}
+
 // Build the virtual tracks for one physical file referenced by a cue sheet.
 // Metadata (format, art, duration) is read once and shared across the file's
 // segments. Unchanged segments are reused from the previous scan (keyed by id,
@@ -246,7 +262,7 @@ async function extractCueTracks(mm, album, fileEntry, artByAlbum, byId) {
     // reuse only if neither the audio nor the .cue changed (a cue edit can
     // change titles or the next track's INDEX, i.e. this track's cueEnd)
     if (prev && prev.mtime === stat.mtimeMs && prev.cueMtime === album.cueMtime && prev.artUrl) { out.push(prev); continue; }
-    out.push({
+    out.push(keepLoudness(prev, {
       id, path: filePath, url: toMediaUrl(filePath),
       title: t.title || `Track ${t.no}`,
       artist: t.performer || albumArtist,
@@ -270,7 +286,7 @@ async function extractCueTracks(mm, album, fileEntry, artByAlbum, byId) {
       // cue segment of a shared file: url points at the whole file; playback
       // seeks to cueStart and stops at cueEnd (null cueEnd = play to file end).
       cue: true, cueStart: start, cueEnd: isLast ? null : end, cueMtime: album.cueMtime,
-    });
+    }));
   }
   return out;
 }
@@ -332,7 +348,7 @@ async function extractCueTracks(mm, album, fileEntry, artByAlbum, byId) {
       if (prev && prev.mtime === (await fsp.stat(file)).mtimeMs && prev.artUrl) {
         tracks.push(prev);
       } else {
-        tracks.push(await extractTrack(mm, file, artByAlbum));
+        tracks.push(keepLoudness(prev, await extractTrack(mm, file, artByAlbum)));
       }
     } catch {
       // skip unreadable file
