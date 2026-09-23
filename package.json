@@ -14,7 +14,9 @@
     "start": "electron .",
     "dist:win": "electron-builder --win nsis",
     "dist:win:portable": "electron-builder --win portable",
-    "pack": "electron-builder --dir"
+    "pack": "electron-builder --dir",
+    "test": "node --test test/*.test.js",
+    "test:electron": "electron test/electron-smoke.js"
   },
   "dependencies": {
     "audify": "^1.10.1",

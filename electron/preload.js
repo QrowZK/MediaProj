@@ -110,14 +110,18 @@ contextBridge.exposeInMainWorld('auralis', {
       return () => ipcRenderer.removeListener('update:ready', listener);
     },
   },
+  // Credentials stay in main; the page only learns whether it's connected.
   lastfm: {
-    startAuth: (creds) => ipcRenderer.invoke('lastfm:start-auth', creds),
-    completeAuth: (creds) => ipcRenderer.invoke('lastfm:complete-auth', creds),
-    nowPlaying: (creds, track) => ipcRenderer.invoke('lastfm:now-playing', creds, track),
-    scrobble: (creds, scrobble) => ipcRenderer.invoke('lastfm:scrobble', creds, scrobble),
+    status: () => ipcRenderer.invoke('lastfm:status'),
+    startAuth: (input) => ipcRenderer.invoke('lastfm:start-auth', input),
+    completeAuth: () => ipcRenderer.invoke('lastfm:complete-auth'),
+    disconnect: () => ipcRenderer.invoke('lastfm:disconnect'),
+    nowPlaying: (track) => ipcRenderer.invoke('lastfm:now-playing', track),
+    scrobble: (scrobble) => ipcRenderer.invoke('lastfm:scrobble', scrobble),
   },
   shell: {
-    showItem: (p) => ipcRenderer.invoke('shell:show-item', p),
+    showTrack: (id) => ipcRenderer.invoke('shell:show-track', id),
+    showFolder: (dir) => ipcRenderer.invoke('shell:show-folder', dir),
   },
   win: {
     minimize: () => ipcRenderer.invoke('window:minimize'),
