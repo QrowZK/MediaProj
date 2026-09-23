@@ -584,8 +584,11 @@ class NativeAudioEngine {
       } catch (err) {
         if (!useWex) throw err;
         // exclusive mode refused (format/rate/device busy) → shared fallback
+        // informational: playback continues on shared output, so the renderer
+        // must not treat this as a failed track and skip it
         this.emit('native:error', {
           message: `Exclusive mode unavailable (${err.message}) — using shared output`,
+          transient: true,
         });
         if (plan.format !== 'f32' && plan.mode === 'dsp' && (this.config.outputFormat || 'f32') === 'f32') {
           plan.format = 'f32'; // undo the exclusive-only int coercion
@@ -604,7 +607,13 @@ class NativeAudioEngine {
     // the bytes are incompatible, so it stays dropped.
     if (carriedResidual && !needOpen) this.residual = carriedResidual;
 
-    this._buildDsp(plan.outRate, plan.channels);
+    // A same-stream gapless join keeps the DSP state: rebuilding zeroes the
+    // EQ biquad history (a step transient on a continuous signal) and the
+    // speaker-correction delay line (drops the outgoing track's delayed tail
+    // on that channel). Config changes still rebuild via setConfig().
+    const keepDsp = gaplessJoin && !needOpen && this.dspState &&
+      this.dspState.fs === plan.outRate && this.dspState.channels === plan.channels;
+    if (!keepDsp) this._buildDsp(plan.outRate, plan.channels);
     // The exclusive addon may negotiate a different wire format than requested
     const wireFormat = this.stream.wireFormat || plan.format;
     this.quantizer = (wireFormat === 'f32' || plan.mode !== 'dsp')
@@ -621,7 +630,7 @@ class NativeAudioEngine {
     const limitSec = (track.cue && track.cueEnd != null)
       ? Math.max(0.001, (track.cueEnd - cueStart) - startAt)
       : null;
-    if (plan.mode === 'dop') this._startDopReader(track, startAt, plan);
+    if (plan.mode === 'dop') this._startDopReader(track, fileSeek, plan, track.cue && track.cueEnd != null ? track.cueEnd : null);
     else this._spawnDecoder(track, fileSeek, plan, limitSec);
 
     if (opts.startPaused) {
@@ -905,9 +914,13 @@ class NativeAudioEngine {
 
   // ── native DSD: stream DSF blocks, pack as DoP ──
 
-  _startDopReader(track, startAt, plan) {
+  // `startAt` is the absolute file position (cueStart + offset for a cue
+  // segment); `endSec`, when set, is the absolute file position to stop at.
+  // Both round DOWN to a DSF block, so contiguous cue segments neither
+  // overlap nor leave a gap (block granularity ≈ 11.6ms at DSD64).
+  _startDopReader(track, startAt, plan, endSec = null) {
     const engine = this;
-    const state = { cancelled: false, markerPhase: 0 };
+    const state = { cancelled: false, markerPhase: 0, carry: Buffer.alloc(0) };
     this.dop = state;
     (async () => {
       let fh = null;
@@ -922,10 +935,12 @@ class NativeAudioEngine {
         // seek: bytes per channel per second = dsdRate / 8
         const bytesPerChanSec = info.sampleRate / 8;
         let blockIndex = Math.floor((startAt * bytesPerChanSec) / blockSize);
+        const endBlock = endSec != null ? Math.floor((endSec * bytesPerChanSec) / blockSize) : Infinity;
         let offset = dataStart + blockIndex * blockSize * channels;
         const blockPair = Buffer.alloc(blockSize * channels);
-        while (!state.cancelled) {
+        while (!state.cancelled && blockIndex < endBlock) {
           const { bytesRead } = await fh.read(blockPair, 0, blockPair.length, offset);
+          blockIndex++;
           // re-check after the await: a seek/restart may have cancelled us and
           // reset pcmQueue for a new stream while this read was in flight
           if (state.cancelled || bytesRead < blockPair.length) break; // EOF / cancelled
@@ -941,12 +956,18 @@ class NativeAudioEngine {
           }
           const packed = packDop(perCh, state.markerPhase);
           state.markerPhase = packed.markerPhase;
-          // split into stream frames
+          // split into stream frames, carrying the remainder into the next
+          // block — dropping it broke the DoP stream on any buffer size that
+          // doesn't divide a block's 2048 frames (and queued NOTHING when the
+          // device frame is larger than a block, e.g. WASAPI-exclusive)
           const s = engine.stream;
           const frameBytes = s.frameSize * s.channels * 4;
-          for (let off = 0; off + frameBytes <= packed.buffer.length; off += frameBytes) {
-            engine.pcmQueue.push(Buffer.from(packed.buffer.subarray(off, off + frameBytes)));
+          const buf = state.carry.length ? Buffer.concat([state.carry, packed.buffer]) : packed.buffer;
+          let off = 0;
+          for (; off + frameBytes <= buf.length; off += frameBytes) {
+            engine.pcmQueue.push(Buffer.from(buf.subarray(off, off + frameBytes)));
           }
+          state.carry = Buffer.from(buf.subarray(off));
           engine._fill();
           // backpressure: keep ~2s decoded
           while (!state.cancelled &&
@@ -958,6 +979,17 @@ class NativeAudioEngine {
         if (!state.cancelled) engine.emit('native:error', { message: 'DSD: ' + err.message });
       } finally {
         if (fh) await fh.close().catch(() => {});
+        if (!state.cancelled && state.carry.length && engine.stream) {
+          // pad the last partial frame with DSD silence (0x69), keeping the
+          // DoP marker alternation intact so the DAC holds lock to the end
+          const s = engine.stream;
+          const frameBytes = s.frameSize * s.channels * 4;
+          const missing = (frameBytes - state.carry.length) / (s.channels * 4);
+          const sil = Array.from({ length: s.channels }, () => Buffer.alloc(missing * 2, 0x69));
+          const pad = packDop(sil, state.markerPhase);
+          engine.pcmQueue.push(Buffer.concat([state.carry, pad.buffer]));
+          state.carry = Buffer.alloc(0);
+        }
         if (!state.cancelled) {
           if (engine.dop === state) engine.dop = null;
           engine.decodeEnded = true;
@@ -1133,7 +1165,14 @@ class NativeAudioEngine {
     // carried into a same-format gapless join — there the next decoder consumes
     // `residual` as its first bytes (see play()/close handler).
     const carryJoin = this.nextTrack && !this._wouldReopen(this.nextTrack);
-    if (this.residual.length > 0 && !carryJoin) return;
+    if (this.residual.length > 0 && !carryJoin) {
+      // The close handler skipped the padded flush because a same-format next
+      // was queued at the time — but the next has since been cleared or
+      // changed to one that needs a reopen. Pad it now, or advance is stuck
+      // forever behind a sub-frame tail (_flushResidual re-enters via _fill).
+      this._flushResidual();
+      return;
+    }
     if (!this.playing) return;
     const next = this.nextTrack;
     // The device still holds the last ~150ms (RtAudio) / ~500ms (exclusive)
@@ -1155,8 +1194,10 @@ class NativeAudioEngine {
       }).catch((err) => {
         // join failed (e.g. device rejected a reopen) — surface it and report
         // a plain end-of-track so the renderer's normal path picks the next
-        // track or stops, instead of stranding the UI on the finished one
-        this.emit('native:error', { message: err.message });
+        // track or stops, instead of stranding the UI on the finished one.
+        // transient: the track-ended below drives the advance — a non-transient
+        // error would ALSO advance the queue (skipping a playable track).
+        this.emit('native:error', { message: err.message, transient: true });
         this.playing = false;
         this.ended = true;
         this._outStop();

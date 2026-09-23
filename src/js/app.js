@@ -2625,6 +2625,7 @@ function saveSession(immediate = false) {
     window.auralis.session.set({
       trackIds: q.map((t) => t.id),
       queueIndex: state.queueIndex,
+      currentTrackId: q[state.queueIndex]?.id ?? null,
       position: engine.currentTrack ? engine.currentTime : 0,
       shuffle: state.shuffle,
       repeat: state.repeat,
@@ -2646,12 +2647,25 @@ async function restoreSession(session) {
   state.queue = q;
   state.shuffle = !!session.shuffle;
   state.repeat = session.repeat || 'off';
-  let idx = session.queueIndex;
-  if (idx == null || idx < 0 || idx >= q.length) idx = 0;
+  // Resolve the current track by id: tracks removed from the library since the
+  // save are filtered out above, so the saved index no longer lines up.
+  const savedIdx = session.queueIndex;
+  const currentId = session.currentTrackId != null ? session.currentTrackId
+    : (savedIdx >= 0 && savedIdx < session.trackIds.length ? session.trackIds[savedIdx] : null);
+  // the saved slot mapped through the filter (kept tracks that precede it) —
+  // preferred when it still holds the current id, so a track queued twice
+  // resolves to the right occurrence
+  const kept = savedIdx > 0
+    ? session.trackIds.slice(0, savedIdx).filter((id) => byId.has(id)).length : 0;
+  let idx = currentId == null ? -1
+    : q[kept]?.id === currentId ? kept : q.findIndex((t) => t.id === currentId);
+  const sameTrack = idx >= 0;
+  // current track is gone: land on whatever now sits nearest its old slot
+  if (!sameTrack) idx = Math.min(kept, q.length - 1);
   state.queueIndex = idx;
   const track = q[idx];
   const dur = track.duration || 0;
-  const pos = (session.position > 1 && (!dur || session.position < dur)) ? session.position : 0;
+  const pos = (sameTrack && session.position > 1 && (!dur || session.position < dur)) ? session.position : 0;
   try {
     if (!(await engine.load(track, pos))) return false;
   } catch { return false; }

@@ -88,10 +88,17 @@ class MediaServer {
       });
     });
 
-    await new Promise((resolve, reject) => {
-      this.httpServer.once('error', reject);
-      this.httpServer.listen(port, '0.0.0.0', resolve);
-    });
+    try {
+      await new Promise((resolve, reject) => {
+        this.httpServer.once('error', reject);
+        this.httpServer.listen(port, '0.0.0.0', resolve);
+      });
+    } catch (err) {
+      // e.g. EADDRINUSE: don't leave a dead server that status() reports as
+      // running (ensureServerForZone would then hand renderers dead URLs)
+      this.stop();
+      throw err;
+    }
 
     this.ssdp = new SsdpAdvertiser({
       uuid,
@@ -176,11 +183,28 @@ class MediaServer {
   }
 
   async _soap(req, res, service) {
+    // Any LAN host can POST here: cap the body (real SOAP requests are a few
+    // KB) so an endless upload can't grow a string until the main process
+    // dies, and settle on a dropped connection instead of hanging.
+    const MAX_SOAP_BODY = 64 * 1024;
     const body = await new Promise((resolve) => {
       let data = '';
-      req.on('data', (c) => { data += c; });
-      req.on('end', () => resolve(data));
+      let done = false;
+      const finish = (v) => { if (!done) { done = true; resolve(v); } };
+      req.on('data', (c) => {
+        if (done) return;
+        data += c;
+        if (data.length > MAX_SOAP_BODY) {
+          finish(null);
+          try { res.writeHead(413, { Connection: 'close' }); res.end(); } catch { /* gone */ }
+          req.destroy();
+        }
+      });
+      req.on('end', () => finish(data));
+      req.on('error', () => finish(null));
+      req.on('close', () => finish(null));
     });
+    if (body == null) return;
     const actionMatch = (req.headers.soapaction || '').match(/#(\w+)"?$/) ||
       body.match(/<u:(\w+)[\s>]/);
     const action = actionMatch ? actionMatch[1] : null;

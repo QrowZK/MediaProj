@@ -68,7 +68,12 @@ function registerAuralisProtocol() {
       const encoded = url.pathname.replace(/^\//, '');
       const filePath = Buffer.from(encoded, 'base64url').toString('utf8');
       const ext = path.extname(filePath).toLowerCase();
-      if (!AUDIO_EXTENSIONS.has(ext) && !filePath.startsWith(ART_CACHE_DIR())) {
+      // Containment check on the RESOLVED path: a raw startsWith let
+      // "<art-cache>/../settings.json" (and sibling dirs like "art-cache-x")
+      // through, since fs resolves the ".." afterwards.
+      const rel = path.relative(ART_CACHE_DIR(), path.resolve(filePath));
+      const inArtCache = rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
+      if (!AUDIO_EXTENSIONS.has(ext) && !inArtCache) {
         return new Response('Forbidden', { status: 403 });
       }
 
@@ -417,7 +422,7 @@ let pendingAuthToken = null;
 async function lastfmStartAuth(creds) {
   const { token } = await lastfmCall('auth.getToken', {}, creds);
   pendingAuthToken = token;
-  shell.openExternal(
+  await shell.openExternal(
     `https://www.last.fm/api/auth/?api_key=${encodeURIComponent(creds.apiKey)}&token=${encodeURIComponent(token)}`);
   return true;
 }
@@ -448,8 +453,17 @@ async function lastfmScrobble(creds, scrobbles) {
   await lastfmCall('track.scrobble', params, creds, { post: true });
 }
 
-// Queue scrobbles on disk so offline listens are submitted later.
-async function submitScrobble(creds, scrobble) {
+// Queue scrobbles on disk so offline listens are submitted later. Calls are
+// serialized: two overlapping read-modify-writes of the queue file lost
+// scrobbles (a failed submit's queued entry overwritten by a successful one).
+let scrobbleChain = Promise.resolve();
+function submitScrobble(creds, scrobble) {
+  const run = scrobbleChain.then(() => submitScrobbleNow(creds, scrobble));
+  scrobbleChain = run.catch(() => {});
+  return run;
+}
+
+async function submitScrobbleNow(creds, scrobble) {
   const queue = await readJson(SCROBBLE_QUEUE_FILE(), []);
   queue.push(scrobble);
   // Last.fm accepts up to 50 per batch
@@ -931,6 +945,15 @@ function createWindow() {
     },
   });
 
+  // The window only ever shows the bundled UI. Without this, dropping a file
+  // or a browser link onto the window navigates it away (frameless, no menu —
+  // no way back), and the loaded page would inherit the preload API.
+  const appUrl = require('url').pathToFileURL(path.join(__dirname, '..', 'src', 'index.html')).href;
+  mainWindow.webContents.on('will-navigate', (e, url) => {
+    if (url !== appUrl) e.preventDefault();
+  });
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+
   mainWindow.loadFile(path.join(__dirname, '..', 'src', 'index.html'));
   mainWindow.once('ready-to-show', () => {
     mainWindow.show();
@@ -978,6 +1001,7 @@ app.whenReady().then(async () => {
 
 app.on('before-quit', () => {
   try { activeExporter?.cancel(); } catch {}
+  try { activeLoudness?.cancel(); } catch {} // else its ffmpeg can outlive us and strand a .rgpart
   try { activeScan?.worker?.terminate(); } catch {}
   try { nativeEngine?.stopAll(); } catch {}
   try { rendererEngine?.stopAll(); } catch {}

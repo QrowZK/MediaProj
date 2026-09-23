@@ -85,21 +85,61 @@ function parseCue(text, cueDir) {
     } else if (cmd === 'PERFORMER') {
       if (curTrack) curTrack.performer = unquote(arg); else album.performer = unquote(arg);
     } else if (cmd === 'FILE') {
-      // FILE "name.flac" WAVE  → strip the trailing format token
-      const m = /^"(.+)"\s+\S+$/.exec(arg) || /^(\S+)\s+\S+$/.exec(arg);
+      // FILE "name.flac" WAVE  → strip the trailing format token. Unquoted
+      // names may contain spaces (FILE my disc.flac WAVE): drop only the last
+      // token.
+      const m = /^"(.+)"(?:\s+\S+)?$/.exec(arg) || /^(.+?)\s+\S+$/.exec(arg);
       const name = m ? m[1] : unquote(arg);
       curFile = { file: path.resolve(cueDir, name), tracks: [] };
       album.files.push(curFile);
-      curTrack = null;
+      // NOT resetting curTrack: in multi-file cues with gaps appended to the
+      // previous track (EAC "noncompliant"), a track's INDEX 01 follows the
+      // FILE line of the file where its audio actually starts.
     } else if (cmd === 'TRACK') {
-      curTrack = { no: parseInt(parts[1], 10) || (curFile ? curFile.tracks.length + 1 : 1), title: '', performer: '', startSec: 0 };
+      curTrack = { no: parseInt(parts[1], 10) || (curFile ? curFile.tracks.length + 1 : 1), title: '', performer: '', startSec: null, pregapSec: null, file: curFile };
       if (curFile) curFile.tracks.push(curTrack);
-    } else if (cmd === 'INDEX' && curTrack && parts[1] === '01') {
-      // INDEX 01 is where the track's audio begins (INDEX 00 is pregap)
-      curTrack.startSec = cueTimeToSec(parts[2] || '0:0:0');
+    } else if (cmd === 'INDEX' && curTrack && (parts[1] === '01' || parts[1] === '00')) {
+      const t = cueTimeToSec(parts[2] || '0:0:0');
+      if (parts[1] === '00') { curTrack.pregapSec = t; continue; }
+      // INDEX 01 is where the track's audio begins (INDEX 00 is pregap). If it
+      // appears under a later FILE than the TRACK line, the track's audio
+      // lives in that file — move it there.
+      curTrack.startSec = t;
+      if (curFile && curTrack.file !== curFile) {
+        const from = curTrack.file;
+        if (from) from.tracks = from.tracks.filter((x) => x !== curTrack);
+        curFile.tracks.push(curTrack);
+        curTrack.file = curFile;
+      }
     }
   }
+  // A track with no INDEX 01 falls back to its INDEX 00; with neither it has
+  // no defined start and is dropped (a default of 0 duplicated track 1's start).
+  for (const f of album.files) {
+    f.tracks = f.tracks.filter((t) => {
+      if (t.startSec == null) t.startSec = t.pregapSec;
+      delete t.file;
+      return t.startSec != null;
+    });
+  }
   return album;
+}
+
+// Cue sheets very often name a file that was converted after ripping
+// (FILE "Album.wav" with Album.flac on disk), or differ in case. Resolve to
+// the real file: exact path, then a case-insensitive match, then the same
+// basename with any supported audio extension.
+function resolveCueAudio(file) {
+  if (fs.existsSync(file)) return file;
+  let entries;
+  try { entries = fs.readdirSync(path.dirname(file)); } catch { return null; }
+  const want = path.basename(file).toLowerCase();
+  const exact = entries.find((e) => e.toLowerCase() === want);
+  if (exact) return path.join(path.dirname(file), exact);
+  const stem = path.basename(file, path.extname(file)).toLowerCase();
+  const alt = entries.find((e) => AUDIO_EXTENSIONS.has(path.extname(e).toLowerCase()) &&
+    path.basename(e, path.extname(e)).toLowerCase() === stem);
+  return alt ? path.join(path.dirname(file), alt) : null;
 }
 
 async function cacheAlbumArt(pictures, albumKey) {
@@ -203,7 +243,9 @@ async function extractCueTracks(mm, album, fileEntry, artByAlbum, byId) {
     const end = isLast ? fileDur : trs[i + 1].startSec;
     const id = hashString(`${filePath}#${t.no}@${start.toFixed(3)}`);
     const prev = byId.get(id);
-    if (prev && prev.mtime === stat.mtimeMs && prev.artUrl) { out.push(prev); continue; }
+    // reuse only if neither the audio nor the .cue changed (a cue edit can
+    // change titles or the next track's INDEX, i.e. this track's cueEnd)
+    if (prev && prev.mtime === stat.mtimeMs && prev.cueMtime === album.cueMtime && prev.artUrl) { out.push(prev); continue; }
     out.push({
       id, path: filePath, url: toMediaUrl(filePath),
       title: t.title || `Track ${t.no}`,
@@ -227,7 +269,7 @@ async function extractCueTracks(mm, album, fileEntry, artByAlbum, byId) {
       fileSize: stat.size, mtime: stat.mtimeMs, added: Date.now(),
       // cue segment of a shared file: url points at the whole file; playback
       // seeks to cueStart and stops at cueEnd (null cueEnd = play to file end).
-      cue: true, cueStart: start, cueEnd: isLast ? null : end,
+      cue: true, cueStart: start, cueEnd: isLast ? null : end, cueMtime: album.cueMtime,
     });
   }
   return out;
@@ -235,7 +277,10 @@ async function extractCueTracks(mm, album, fileEntry, artByAlbum, byId) {
 
 (async () => {
   const mm = await import('music-metadata');
-  const byPath = new Map(existingTracks.map((t) => [t.path, t]));
+  // standalone-file reuse only: a cue segment's `path` is the whole disc file,
+  // so if its cue later disappears, reusing the segment would put one stray
+  // slice in the library instead of the full file
+  const byPath = new Map(existingTracks.filter((t) => !t.cue).map((t) => [t.path, t]));
   const byId = new Map(existingTracks.map((t) => [t.id, t]));
   const artByAlbum = new Map();
   for (const t of existingTracks) {
@@ -264,11 +309,16 @@ async function extractCueTracks(mm, album, fileEntry, artByAlbum, byId) {
   for (const cuePath of cueFiles) {
     try {
       const album = parseCue(await fsp.readFile(cuePath, 'utf8'), path.dirname(cuePath));
-      let referencesReal = false;
-      for (const fe of album.files) {
-        if (fs.existsSync(fe.file)) { cueReferenced.add(fe.file); referencesReal = true; }
-      }
-      if (referencesReal) cueAlbums.push(album);
+      album.cueMtime = (await fsp.stat(cuePath)).mtimeMs;
+      // keep only entries that resolve to a real file AND have segments — a
+      // file marked cue-covered but yielding no tracks would vanish entirely
+      album.files = album.files.filter((fe) => {
+        const real = fe.tracks.length ? resolveCueAudio(fe.file) : null;
+        if (real) fe.file = real;
+        return !!real;
+      });
+      for (const fe of album.files) cueReferenced.add(fe.file);
+      if (album.files.length) cueAlbums.push(album);
     } catch { /* unreadable / malformed cue */ }
   }
 

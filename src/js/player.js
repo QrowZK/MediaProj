@@ -106,6 +106,9 @@ export class AudioEngine {
     this.onTimeUpdate = null;
     this.onError = null;
     this._errorReportedFor = null; // track id whose error was already reported
+    // bumped whenever an element gets a new src, so a deferred seek scheduled
+    // for an earlier load can't land on whatever replaced it
+    this._loadGen = 0;
 
     this.setVolume(this.volume);
     this._bindElementEvents();
@@ -178,12 +181,17 @@ export class AudioEngine {
 
   _seekTo(el, seconds) {
     if (!(seconds > 0)) return;
-    const doSeek = () => { try { el.currentTime = seconds; } catch { /* not seekable yet */ } };
+    const gen = this._loadGen;
+    const doSeek = () => {
+      if (gen !== this._loadGen) return; // superseded by a newer load
+      try { el.currentTime = seconds; } catch { /* not seekable yet */ }
+    };
     if (el.readyState >= 1) doSeek();
     else el.addEventListener('loadedmetadata', doSeek, { once: true });
   }
 
   async play(track, startAt = 0) {
+    const gen = ++this._loadGen;
     await this.ctx.resume();
     this.preloadedTrack = null;
     this.currentTrack = track;
@@ -199,6 +207,7 @@ export class AudioEngine {
         // seek to the segment start BEFORE playing, or the head of the shared
         // file (the previous track's audio) briefly leaks out
         await this._whenSeekable(el);
+        if (gen !== this._loadGen) return false; // superseded by a newer load
         try { el.currentTime = seekTo; } catch { /* clamped */ }
       } else if (seekTo > 0) {
         el.currentTime = seekTo;
@@ -219,6 +228,7 @@ export class AudioEngine {
   // where the departing engine left off instead of the switch starting audio
   // on its own.
   async load(track, startAt = 0) {
+    ++this._loadGen;
     await this.ctx.resume();
     this.preloadedTrack = null;
     this.currentTrack = track;
@@ -249,6 +259,7 @@ export class AudioEngine {
     this.preloadedTrack = next;
     const idle = this.idleEl;
     this._applyReplayGain(this.sourceGains[1 - this.active], next);
+    ++this._loadGen;
     idle.src = next.url;
     idle.load();
     if (next.cue) this._seekTo(idle, next.cueStart || 0); // pre-position for a clean handoff
@@ -256,7 +267,13 @@ export class AudioEngine {
 
   async _handleEnded() {
     const next = this.onTrackEnd?.();
-    if (!next) { this.currentTrack = null; return; }
+    if (!next) {
+      // a cue segment's shared file would otherwise play on into the
+      // following segments (no-op for an element that really ended)
+      this.el.pause();
+      this.currentTrack = null;
+      return;
+    }
     const c = this.currentTrack;
     // Same physical file, contiguous cue segments: the element is already
     // playing across the boundary — just adopt the next segment. Truly gapless.
@@ -266,13 +283,21 @@ export class AudioEngine {
       this.preloadedTrack = null;
       this._cueEnding = false;
       this._errorReportedFor = null;
+      this._applyReplayGain(this.sourceGains[this.active], next);
       this.onTrackStarted?.(next);
       return;
     }
     if (this.gapless && this.preloadedTrack && this.preloadedTrack.id === next.id &&
         this.idleEl.readyState >= 2) {
       // Instant handoff to the preloaded element
+      const old = this.el;
       this.active = 1 - this.active;
+      // Release the departing element: a cue segment's shared file is still
+      // playing past cueEnd and would keep mixing under the new track. Its
+      // listeners now bail (idx !== active; 'error' also on empty src).
+      old.pause();
+      old.removeAttribute('src');
+      old.load();
       this.currentTrack = next;
       this.preloadedTrack = null;
       this._errorReportedFor = null;
@@ -445,6 +470,7 @@ export class AudioEngine {
 
   // the queued "next" is gone (queue cleared) — drop the preload
   clearNext() {
+    ++this._loadGen;
     this.preloadedTrack = null;
     this.idleEl.removeAttribute('src');
   }

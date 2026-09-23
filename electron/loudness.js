@@ -41,7 +41,13 @@ const TAGGABLE = {
 
 // ffmpeg prints the ebur128 summary to stderr at end-of-stream. Pull the
 // integrated loudness, loudness range, and (peak=true) true peak out of it.
-function parseEbur128(stderr) {
+function parseEbur128(raw) {
+  // ebur128 also logs a running "… I: x LUFS  LRA: y LU" line every 100ms;
+  // only the final Summary block holds the measured values. Parsing the whole
+  // tail took the first per-frame line — for short tracks the t=0.1s reading
+  // of -70 LUFS, i.e. a +52 dB "gain".
+  const at = raw.lastIndexOf('Summary:');
+  const stderr = at >= 0 ? raw.slice(at) : '';
   const num = (re) => {
     const m = stderr.match(re);
     if (!m) return null;
