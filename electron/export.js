@@ -52,21 +52,74 @@ function sanitizeSegment(s) {
 // A cue-sheet track is a [cueStart, cueEnd) slice of a shared disc image:
 // trim to that span (input-side -ss is sample-accurate when transcoding) and
 // write the segment's own tags — -map_metadata alone would stamp every track
-// with the disc file's title/track number.
-function cueSegmentArgs(track) {
+// with the disc file's title/track number. Disc-wide tags that are wrong for a
+// single track (the embedded cue sheet, the whole disc's track gain) are
+// cleared; an empty -metadata value deletes the key. If Auralis measured this
+// segment's loudness, its own track gain goes in instead.
+function cueSegmentArgs(track, muxer) {
   if (!track.cue) return { inputArgs: [], outputArgs: [] };
   const start = Number(track.cueStart) || 0;
   const inputArgs = start > 0 ? ['-ss', start.toFixed(6)] : [];
   const outputArgs = [];
   if (track.cueEnd != null) outputArgs.push('-t', Math.max(0.001, track.cueEnd - start).toFixed(6));
+  const rgKey = (n) => (muxer === 'mp3' ? `replaygain_${n}` : `REPLAYGAIN_${n.toUpperCase()}`);
+  const measured = track.loudnessLufs != null && track.replayGainTrack != null;
   const tags = {
     title: track.title, artist: track.artist, album: track.album,
     album_artist: track.albumArtist, track: track.trackNo, date: track.year, genre: track.genre,
   };
+  if (measured) {
+    tags[rgKey('track_gain')] = `${track.replayGainTrack.toFixed(2)} dB`;
+    if (track.rgTrackPeak != null) tags[rgKey('track_peak')] = track.rgTrackPeak.toFixed(6);
+  }
   for (const [k, v] of Object.entries(tags)) {
     if (v != null && v !== '') outputArgs.push('-metadata', `${k}=${v}`);
   }
+  for (const k of ['cuesheet', rgKey('track_gain'), rgKey('track_peak')]) {
+    if (!(k in tags)) outputArgs.push('-metadata', `${k}=`);
+  }
   return { inputArgs, outputArgs };
+}
+
+// "Keep original" can't byte-copy one track out of a disc image, so a cue
+// track from a lossless image is re-encoded to FLAC trimmed to the track: the
+// decoded samples are identical, only the container changes. FLAC takes
+// integer PCM up to 24-bit; anything else (lossy images, DSD, 32-bit PCM)
+// falls back to copying the whole image and its .cue once per album.
+const CUE_LOSSLESS = {
+  label: 'FLAC (lossless, trimmed from disc image)', ext: 'flac',
+  args: () => ['-c:a', 'flac', '-compression_level', '8'], // never resample: bit-perfect
+};
+
+function cueTrimsToFlac(track) {
+  return !!track.lossless && !track.dsd && !(track.bitsPerSample > 24);
+}
+
+// The scanner doesn't record which .cue a segment came from, so find it the
+// way the scanner matched it: a .cue beside the image whose FILE line names
+// the image (or the same stem with another extension, e.g. FILE "x.wav" for
+// x.flac).
+async function findCueSheet(imagePath) {
+  const dir = path.dirname(imagePath);
+  const stem = (p) => path.basename(p, path.extname(p)).toLowerCase();
+  const want = path.basename(imagePath).toLowerCase();
+  let names;
+  try { names = await fsp.readdir(dir); } catch { return null; }
+  let byStem = null;
+  for (const name of names) {
+    if (path.extname(name).toLowerCase() !== '.cue') continue;
+    let buf;
+    try { buf = await fsp.readFile(path.join(dir, name)); } catch { continue; }
+    // cue sheets are UTF-8 or a legacy code page; try both readings
+    for (const text of [buf.toString('utf8'), buf.toString('latin1')]) {
+      for (const m of text.matchAll(/^\s*FILE\s+(?:"([^"]+)"|(\S+))/gim)) {
+        const ref = path.basename((m[1] || m[2]).replace(/\\/g, '/')).toLowerCase();
+        if (ref === want) return path.join(dir, name);
+        if (!byStem && stem(ref) === stem(want)) byStem = path.join(dir, name);
+      }
+    }
+  }
+  return byStem;
 }
 
 function buildDestPath(destDir, track, fmt) {
@@ -120,10 +173,58 @@ class LibraryExporter {
     } catch { /* non-fatal — the audio file is what matters */ }
   }
 
+  // Write `filePath` via a .part sibling renamed on success, so a cancelled or
+  // failed export never leaves a truncated file that looks "already exported".
+  // Returns 'skipped' when a non-empty file is already there.
+  async _writeAtomic(filePath, produce) {
+    try {
+      if ((await fsp.stat(filePath)).size > 0) return 'skipped';
+    } catch { /* doesn't exist yet */ }
+    const partPath = filePath + '.part';
+    await fsp.unlink(partPath).catch(() => {}); // stale from a previous run
+    try {
+      await produce(partPath);
+      await fsp.rename(partPath, filePath);
+    } catch (err) {
+      await fsp.unlink(partPath).catch(() => {});
+      throw err;
+    }
+    return 'exported';
+  }
+
+  // Copy a cue track's whole disc image and its .cue into the album folder,
+  // once per image; every track of the disc reports the same outcome. The
+  // image keeps its name so the .cue's FILE line still points at it. Two
+  // different images with the same name in one album folder (EAC's
+  // CDImage.ape per disc) go in numbered subfolders instead of colliding.
+  _copyDisc(track, albumDir, discs) {
+    if (!discs.byImage.has(track.path)) {
+      discs.byImage.set(track.path, (async () => {
+        let dir = albumDir;
+        for (let n = 2; ; n++) {
+          const owner = discs.claimed.get(path.join(dir, path.basename(track.path)).toLowerCase());
+          if (!owner || owner === track.path) break;
+          dir = path.join(albumDir, `Disc ${n}`);
+        }
+        discs.claimed.set(path.join(dir, path.basename(track.path)).toLowerCase(), track.path);
+        await fsp.mkdir(dir, { recursive: true });
+        const status = await this._writeAtomic(path.join(dir, path.basename(track.path)),
+          (part) => fsp.copyFile(track.path, part));
+        const cuePath = await findCueSheet(track.path);
+        if (cuePath) {
+          await this._writeAtomic(path.join(dir, path.basename(cuePath)), (part) => fsp.copyFile(cuePath, part));
+        }
+        return status;
+      })());
+    }
+    return discs.byImage.get(track.path);
+  }
+
   // opts: { format: 'copy'|'flac'|'alac'|'mp3_320'|'mp3_v0'|'aac_256', downsample: bool }
   async run(tracks, destDir, opts, onProgress) {
     const fmt = FORMATS[opts.format] || FORMATS.copy;
     const doneArtDirs = new Set();
+    const discs = { byImage: new Map(), claimed: new Map() };
     let exported = 0, skipped = 0, failed = 0;
     const failures = [];
 
@@ -132,36 +233,28 @@ class LibraryExporter {
       const track = tracks[i];
       onProgress({ done: i, total: tracks.length, file: `${track.artist} — ${track.title}` });
       try {
-        const { albumDir, filePath } = buildDestPath(destDir, track, fmt);
+        let trackFmt = fmt;
+        if (fmt === FORMATS.copy && track.cue) trackFmt = cueTrimsToFlac(track) ? CUE_LOSSLESS : null;
+        const { albumDir, filePath } = buildDestPath(destDir, track, trackFmt || fmt);
         await fsp.mkdir(albumDir, { recursive: true });
         await this._writeAlbumArt(track, albumDir, doneArtDirs);
 
-        let already = false;
-        try { already = (await fsp.stat(filePath)).size > 0; } catch { /* doesn't exist yet */ }
-        if (already) { skipped++; continue; }
-
-        // Write to a .part file and rename on success so a cancelled or failed
-        // export never leaves a truncated file that looks "already exported".
-        const partPath = filePath + '.part';
-        await fsp.unlink(partPath).catch(() => {}); // stale from a previous run
-        try {
-          if (opts.format === 'copy' || !fmt.args) {
-            await fsp.copyFile(track.path, partPath);
-          } else {
-            // the .part name hides the extension from ffmpeg, so name the muxer
-            const muxer = { flac: 'flac', m4a: 'ipod', mp3: 'mp3' }[fmt.ext];
-            const { inputArgs, outputArgs } = cueSegmentArgs(track);
-            await this._runFfmpeg([
-              '-y', '-v', 'error', ...inputArgs, '-i', track.path, '-map_metadata', '0', '-vn',
-              ...outputArgs, ...fmt.args(!!opts.downsample), '-f', muxer, partPath,
-            ]);
-          }
-          await fsp.rename(partPath, filePath);
-        } catch (err) {
-          await fsp.unlink(partPath).catch(() => {});
-          throw err;
+        let status;
+        if (!trackFmt) {
+          status = await this._copyDisc(track, albumDir, discs);
+        } else if (!trackFmt.args) {
+          status = await this._writeAtomic(filePath, (part) => fsp.copyFile(track.path, part));
+        } else {
+          // the .part name hides the extension from ffmpeg, so name the muxer
+          const muxer = { flac: 'flac', m4a: 'ipod', mp3: 'mp3' }[trackFmt.ext];
+          const { inputArgs, outputArgs } = cueSegmentArgs(track, muxer);
+          status = await this._writeAtomic(filePath, (part) => this._runFfmpeg([
+            '-y', '-v', 'error', ...inputArgs, '-i', track.path, '-map_metadata', '0', '-vn',
+            ...outputArgs, ...trackFmt.args(!!opts.downsample), '-f', muxer, part,
+          ]));
         }
-        exported++;
+        if (status === 'skipped') skipped++;
+        else exported++;
       } catch (err) {
         if (this.cancelled) break;
         failed++;
