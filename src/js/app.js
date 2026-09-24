@@ -2531,17 +2531,9 @@ function engineOnError(track, msg, transient = false) {
   }
 }
 
-let cueZoneWarned = false;
-
 function onTrackStarted(track) {
   playCountedFor = null;
   errorStreak = 0;
-  // Network renderers can't be told to stop at a cue point — the segment plays
-  // on into the rest of the shared file. Say so once, honestly.
-  if (track.cue && engine === zoneEngine && !cueZoneWarned) {
-    cueZoneWarned = true;
-    toast('Cue tracks aren’t split on network renderers — playback continues past the track', true);
-  }
   sessionPlayed.add(track.id);
   trackStartedAt = Math.floor(Date.now() / 1000);
   updatePlayButton(true);

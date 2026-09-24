@@ -1,16 +1,25 @@
 'use strict';
 
 // Auralis DLNA/UPnP-AV media server: streamers browse the library over
-// ContentDirectory and pull audio over HTTP with Range support. Pure Node —
-// no dependencies.
+// ContentDirectory and pull audio over HTTP with Range support. Pure Node,
+// plus the bundled ffmpeg to cut cue-sheet tracks out of their disc image.
 
 const http = require('http');
 const fs = require('fs');
+const { spawn } = require('child_process');
 const { pipeline } = require('stream');
 const fsp = fs.promises;
 const path = require('path');
 const { SsdpAdvertiser, localIPv4 } = require('./ssdp');
 const { escapeXml, xmlValue, soapEnvelope, soapFault } = require('./xml');
+
+let ffmpegPath = null;
+try {
+  ffmpegPath = require('ffmpeg-static');
+  if (ffmpegPath && ffmpegPath.includes('app.asar')) {
+    ffmpegPath = ffmpegPath.replace('app.asar', 'app.asar.unpacked');
+  }
+} catch { /* bundled binary missing on this install */ }
 
 const MIME = {
   '.flac': 'audio/flac', '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4',
@@ -35,12 +44,44 @@ function hmmss(seconds) {
   return `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}.000`;
 }
 
+// A cue-sheet track is a [cueStart, cueEnd) slice of a shared disc image. A
+// renderer handed the disc file would play the whole disc, so /stream cuts the
+// slice out with ffmpeg on the fly and sends it as FLAC. A pipe has no length,
+// so there's no byte-range seeking: renderers seek by time (DLNA
+// TimeSeekRange, OP=10) instead. A cue whose one track spans the whole file
+// is just the file.
+function isCueSegment(t) {
+  return !!(t && t.cue && ((Number(t.cueStart) || 0) > 0 || t.cueEnd != null));
+}
+
+const DLNA_FLAGS = 'DLNA.ORG_FLAGS=01700000000000000000000000000000';
+const CUE_FEATURES = `DLNA.ORG_OP=10;DLNA.ORG_CI=1;${DLNA_FLAGS}`;
+const MAX_CUE_STREAMS = 4; // a renderer holds ~2 (current + prefetched next)
+
+// PCM format of a cut: the disc's own rate and depth. DSD has no FLAC form, so
+// it becomes 24-bit / 176.4 kHz PCM.
+function cueOutputFormat(t) {
+  if (t.dsd) return { sampleRate: 176400, bits: 24 };
+  return { sampleRate: t.sampleRate || null, bits: (t.bitsPerSample || 16) > 16 ? 24 : 16 };
+}
+
+// npt time ("12.5" or "0:01:02.500") → seconds, null if malformed
+function parseNpt(s) {
+  if (!s) return null;
+  const parts = s.split(':');
+  if (parts.length > 3 || parts.some((x) => !/^\d+(\.\d+)?$/.test(x))) return null;
+  return parts.reduce((acc, x) => acc * 60 + Number(x), 0);
+}
+
+function nptString(seconds) { return Math.max(0, seconds).toFixed(3); }
+
 function trackItemXml(t, parent, base) {
-  const ext = path.extname(t.path).toLowerCase();
-  const mime = mimeFor(t.path);
+  const cut = isCueSegment(t);
+  const fmt = cut ? cueOutputFormat(t) : { sampleRate: t.sampleRate, bits: t.bitsPerSample };
+  const mime = cut ? 'audio/flac' : mimeFor(t.path);
   const url = `${base}/stream/${encodeURIComponent(t.id)}`;
   const art = t.artUrl ? `<upnp:albumArtURI>${escapeXml(`${base}/art/${encodeURIComponent(t.id)}`)}</upnp:albumArtURI>` : '';
-  const dlnaOp = 'DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000';
+  const dlnaOp = cut ? CUE_FEATURES : `DLNA.ORG_OP=01;DLNA.ORG_CI=0;${DLNA_FLAGS}`;
   return `<item id="t:${escapeXml(t.id)}" parentID="${escapeXml(parent)}" restricted="1">` +
     `<dc:title>${escapeXml(t.title)}</dc:title>` +
     `<upnp:class>object.item.audioItem.musicTrack</upnp:class>` +
@@ -51,9 +92,9 @@ function trackItemXml(t, parent, base) {
     (t.trackNo ? `<upnp:originalTrackNumber>${t.trackNo}</upnp:originalTrackNumber>` : '') +
     art +
     `<res protocolInfo="http-get:*:${mime}:${dlnaOp}" duration="${hmmss(t.duration)}"` +
-    (t.fileSize ? ` size="${t.fileSize}"` : '') +
-    (t.sampleRate ? ` sampleFrequency="${t.sampleRate}"` : '') +
-    (t.bitsPerSample ? ` bitsPerSample="${t.bitsPerSample}"` : '') +
+    (t.fileSize && !cut ? ` size="${t.fileSize}"` : '') +
+    (fmt.sampleRate ? ` sampleFrequency="${fmt.sampleRate}"` : '') +
+    (fmt.bits ? ` bitsPerSample="${fmt.bits}"` : '') +
     (t.channels ? ` nrAudioChannels="${t.channels}"` : '') +
     `>${escapeXml(url)}</res></item>`;
 }
@@ -63,6 +104,7 @@ class MediaServer {
   constructor(deps) {
     this.deps = deps;
     this.httpServer = null;
+    this.cueJobs = new Set(); // ffmpeg children cutting cue tracks
     this.ssdp = null;
     this.config = { enabled: false, name: 'Auralis', port: 47700 };
     this.uuid = null;
@@ -161,6 +203,8 @@ class MediaServer {
   }
 
   stop() {
+    for (const child of this.cueJobs) { try { child.kill('SIGKILL'); } catch { /* gone */ } }
+    this.cueJobs.clear();
     if (this.ssdp) { this.ssdp.stop(); this.ssdp = null; }
     if (this.httpServer) {
       try { this.httpServer.close(); } catch { /* fine */ }
@@ -449,6 +493,7 @@ class MediaServer {
     if (!track) { res.writeHead(404); return res.end(); }
     let stat;
     try { stat = await fsp.stat(track.path); } catch { res.writeHead(404); return res.end(); }
+    if (isCueSegment(track)) return this._streamCue(req, res, track);
 
     const mime = mimeFor(track.path);
     const headers = {
@@ -478,6 +523,80 @@ class MediaServer {
       if (req.method === 'HEAD') return res.end();
       pipeline(fs.createReadStream(track.path), res, () => {});
     }
+  }
+
+  _streamCue(req, res, track) {
+    const cueStart = Number(track.cueStart) || 0;
+    // last track (no cueEnd) runs to the end of the file: its length is only
+    // known from the scan, so it's advertised but never used to cut
+    const cueLen = track.cueEnd != null ? Math.max(0, track.cueEnd - cueStart) : null;
+    const segLen = cueLen ?? (Number(track.duration) || null);
+    const headers = {
+      'Content-Type': 'audio/flac',
+      'Accept-Ranges': 'none',
+      'transferMode.dlna.org': 'Streaming',
+      'contentFeatures.dlna.org': CUE_FEATURES,
+    };
+
+    // Byte offsets into a stream still being encoded can't be honoured. A
+    // range from 0 (most renderers' opening request) is the whole stream.
+    const range = req.headers.range && /bytes=(\d*)-(\d*)/.exec(req.headers.range);
+    if (range && (range[1] || range[2]) && range[1] !== '0') {
+      res.writeHead(416, { 'Content-Range': 'bytes */*' });
+      return res.end();
+    }
+
+    let from = 0, to = cueLen;
+    const tsr = req.headers['timeseekrange.dlna.org'];
+    if (tsr) {
+      const m = /^\s*npt\s*=\s*([\d:.]+)\s*-\s*([\d:.]*)\s*(?:\/.*)?$/i.exec(tsr);
+      const a = m ? parseNpt(m[1]) : null;
+      const b = m && m[2] ? parseNpt(m[2]) : null;
+      if (a == null || (m[2] && b == null) || (segLen != null && a >= segLen) || (b != null && b <= a)) {
+        res.writeHead(416);
+        return res.end();
+      }
+      from = a;
+      if (b != null) to = cueLen != null ? Math.min(b, cueLen) : b;
+      const shownEnd = to ?? segLen;
+      headers['TimeSeekRange.dlna.org'] =
+        `npt=${nptString(from)}-${shownEnd != null ? nptString(shownEnd) : ''}/${segLen != null ? nptString(segLen) : '*'}`;
+    }
+
+    if (!ffmpegPath || this.cueJobs.size >= MAX_CUE_STREAMS) {
+      res.writeHead(503, { 'Retry-After': '2' });
+      return res.end();
+    }
+    res.writeHead(200, headers); // DLNA answers a time seek with 200, not 206
+    if (req.method === 'HEAD') return res.end();
+
+    const fmt = cueOutputFormat(track);
+    const args = ['-v', 'error', '-nostdin'];
+    const at = cueStart + from;
+    if (at > 0) args.push('-ss', at.toFixed(6)); // input-side: sample-accurate when decoding
+    args.push('-i', track.path, '-map', '0:a:0', '-map_metadata', '-1');
+    if (to != null) args.push('-t', Math.max(0.001, to - from).toFixed(6));
+    // the segment's own tags, not the disc file's
+    const tags = {
+      title: track.title, artist: track.artist, album: track.album,
+      album_artist: track.albumArtist, track: track.trackNo, date: track.year, genre: track.genre,
+    };
+    for (const [k, v] of Object.entries(tags)) {
+      if (v != null && v !== '') args.push('-metadata', `${k}=${v}`);
+    }
+    args.push('-c:a', 'flac', '-sample_fmt', fmt.bits > 16 ? 's32' : 's16');
+    if (fmt.bits > 16) args.push('-bits_per_raw_sample', '24');
+    if (track.dsd) args.push('-ar', String(fmt.sampleRate));
+    args.push('-f', 'flac', 'pipe:1');
+
+    const child = spawn(ffmpegPath, args, { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
+    this.cueJobs.add(child);
+    const kill = () => { try { child.kill('SIGKILL'); } catch { /* gone */ } };
+    child.on('error', () => { /* ENOENT etc.: stdout just closes */ });
+    child.on('close', () => this.cueJobs.delete(child));
+    // renderer hung up (stop, seek, next track): don't keep decoding the disc
+    res.on('close', kill);
+    pipeline(child.stdout, res, kill);
   }
 
   async _art(req, res, trackId) {
@@ -525,4 +644,4 @@ const CMS_SCPD = `<?xml version="1.0" encoding="utf-8"?>
   </serviceStateTable>
 </scpd>`;
 
-module.exports = { MediaServer, trackItemXml };
+module.exports = { MediaServer, trackItemXml, isCueSegment };
