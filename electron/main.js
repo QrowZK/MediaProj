@@ -779,6 +779,8 @@ function registerIpc() {
         await writeJson(LIBRARY_FILE(), updated);
         cachedLibrary = updated;
         mediaServer?.bumpUpdateId();
+        // the native engine holds its own copies of the playing/next track
+        nativeEngine?.refreshTracks(res.results);
         return { ...res, library: updated };
       }, {
         signal: abort.signal,

@@ -137,7 +137,8 @@ async function switchEngine(mode) {
         : await engine.play(playingTrack, startAt);
       if (gen !== switchGen) return;
       if (ok && !wasPaused) {
-        onTrackStarted(playingTrack);
+        // the same listen continuing on another output: not a new play
+        onTrackStarted(playingTrack, { resumed: true });
       } else {
         // paused (or failed): reflect a paused transport. The seek bar/time
         // already show this same track at this same position from before the
@@ -2196,6 +2197,7 @@ async function runScan(folders) {
     const lib = await window.auralis.library.scan(folders);
     if (lib) {
       state.library = lib;
+      refreshQueueTracks();
       toast(`Library updated — ${lib.tracks.length.toLocaleString()} tracks`);
       render();
     }
@@ -2379,7 +2381,7 @@ async function analyzeLoudness(tracks, label, { force = false } = {}) {
     loudnessActive = false;
     hideLoudnessStrip();
     if (!res.ok && res.error) { toast(res.error, true); return; }
-    if (res.library) { state.library = res.library; render(); }
+    if (res.library) { state.library = res.library; refreshQueueTracks(); render(); }
     if (res.cancelled) { toast(`Analysis cancelled — ${res.analyzed} analyzed`); return; }
     const bits = [`${res.analyzed} analyzed`];
     if (res.skipped) bits.push(`${res.skipped} already done`);
@@ -2393,6 +2395,17 @@ async function analyzeLoudness(tracks, label, { force = false } = {}) {
 }
 
 // ── Queue & transport ────────────────────────────────────────────────────
+
+// The queue and the engine hold track objects, not ids — after the library is
+// replaced (Analyze, rescan) they'd keep playing with the old ReplayGain and
+// metadata. Swap in the fresh objects by id; tracks no longer in the library
+// stay as they were.
+function refreshQueueTracks() {
+  const byId = new Map(state.library.tracks.map((t) => [t.id, t]));
+  state.queue = state.queue.map((t) => byId.get(t.id) || t);
+  engine.refreshTracks?.(byId);
+  renderQueue();
+}
 
 function playTracks(tracks, startIdx) {
   autoplayHold = false; // explicit user start — normal autoplay behavior resumes
@@ -2532,14 +2545,18 @@ function engineOnError(track, msg, transient = false) {
   }
 }
 
-function onTrackStarted(track) {
-  playCountedFor = null;
+// resumed: the same track carrying on after an output switch — keep its
+// play-count/scrobble state, or the listen is counted (and scrobbled) twice.
+function onTrackStarted(track, { resumed = false } = {}) {
   errorStreak = 0;
   sessionPlayed.add(track.id);
-  trackStartedAt = Math.floor(Date.now() / 1000);
   updatePlayButton(true);
-  if (!$('#now-playing').classList.contains('hidden')) refreshLyrics(track);
-  sendNowPlaying(track);
+  if (!resumed) {
+    playCountedFor = null;
+    trackStartedAt = Math.floor(Date.now() / 1000);
+    if (!$('#now-playing').classList.contains('hidden')) refreshLyrics(track);
+    sendNowPlaying(track);
+  }
   paintNowPlaying(track);
   saveSession();
 }
@@ -2600,6 +2617,9 @@ function paintNowPlaying(track) {
 
 let _sessionSaveTimer = null;
 let _lastSessionPos = 0;
+// set while boot waits to restore the saved session — an empty queue then
+// means "not restored yet", and must not overwrite the saved one
+let sessionRestorePending = false;
 
 // Persist the current queue (ids), index, and playhead. Coalesced by default so
 // the periodic position updates don't hammer the disk; pass immediate for
@@ -2610,6 +2630,7 @@ function saveSession(immediate = false) {
     _sessionSaveTimer = null;
     const q = state.queue || [];
     if (!q.length || state.queueIndex < 0) {
+      if (sessionRestorePending) return;
       window.auralis.session.set(null).catch(() => {});
       return;
     }
@@ -3396,6 +3417,7 @@ $$('.nav-item[data-view]').forEach((btn) =>
   }
   engine.setSpeakerCorrection?.(correctionConfig());
   const bootMode = engineMode();
+  let zoneReady = null;
   if (bootMode === 'native') {
     const available = await window.auralis.native.available().catch(() => false);
     if (available) {
@@ -3404,12 +3426,25 @@ $$('.nav-item[data-view]').forEach((btn) =>
     }
   } else if (bootMode === 'zone') {
     // don't block boot on an offline renderer — connect in the background
-    switchEngine('zone').catch(() => {});
+    zoneReady = switchEngine('zone').catch(() => {});
   }
   // Restore the previous session (queue + paused playhead) on the now-active
-  // engine, unless the user turned it off.
+  // engine, unless the user turned it off. With a zone, wait for the renderer
+  // handshake: restoring onto the web engine first loaded the track there,
+  // and the switch (which snapshots the departing engine when it starts)
+  // handed the zone nothing — the restored session was lost.
   if (settings.resumeSession !== false) {
-    try { await restoreSession(session); } catch { /* stale/missing session */ }
+    const restore = async () => {
+      // the user may have started something while the renderer connected
+      if (engine.currentTrack || state.queue.length) return;
+      try { await restoreSession(session); } catch { /* stale/missing session */ }
+    };
+    if (zoneReady) {
+      sessionRestorePending = true;
+      zoneReady.then(restore).finally(() => { sessionRestorePending = false; });
+    } else {
+      await restore();
+    }
   }
   updateEqButton();
   updateTransportUi();
