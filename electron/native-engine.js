@@ -573,7 +573,10 @@ class NativeAudioEngine {
     const useWex = !!(this.config.wasapiExclusive && wasapiEx);
     // WASAPI-exclusive path can only carry integer formats
     if (useWex && plan.format === 'f32') plan.format = 's32';
-    const key = JSON.stringify([plan.outRate, plan.channels, plan.format, plan.mode, useWex]);
+    // the device too: a device change restarts playback, which must reopen
+    const c = this.config;
+    const key = JSON.stringify([plan.outRate, plan.channels, plan.format, plan.mode, useWex,
+      c.api, c.deviceId, c.bufferSize]);
     return { plan, useWex, key };
   }
 
@@ -977,6 +980,7 @@ class NativeAudioEngine {
   // join. The rest of the join block becomes silence — the same padding an
   // ordinary track end gets — and the new next starts via _maybeAdvance.
   _dropStaleJoin() {
+    if (!this.stream) return; // output closed (engine switched away)
     const i = this.pcmQueue.findIndex((b) => b._join);
     if (i < 0) return;
     const join = this.pcmQueue[i]._join;

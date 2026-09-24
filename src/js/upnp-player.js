@@ -165,8 +165,8 @@ export class ZoneEngineProxy {
       },
       t.cue && (t.cueStart > 0 || t.cueEnd != null) ? {
         // cut out of the disc image as FLAC: bit-perfect up to 24-bit PCM;
-        // DSD and 32-bit images are converted to 24-bit
-        kind: 'dsp', quality: t.dsd || t.bitsPerSample > 24 ? 'lossless' : 'bitperfect', label: 'Cue track cut',
+        // DSD and 32-bit images are converted to 24-bit, lossy ones decoded
+        kind: 'dsp', quality: !t.lossless || t.dsd || t.bitsPerSample > 24 ? 'lossless' : 'bitperfect', label: 'Cue track cut',
         detail: t.dsd ? 'cut from the disc image as 24-bit / 176.4 kHz FLAC' : 'cut from the disc image as FLAC',
       } : {
         kind: 'dsp', quality: 'bitperfect', label: 'HTTP serve',

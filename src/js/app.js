@@ -3441,7 +3441,7 @@ $$('.nav-item[data-view]').forEach((btn) =>
     };
     if (zoneReady) {
       sessionRestorePending = true;
-      zoneReady.then(restore).finally(() => { sessionRestorePending = false; });
+      zoneReady.then(restore).then(updateTransportUi).finally(() => { sessionRestorePending = false; });
     } else {
       await restore();
     }

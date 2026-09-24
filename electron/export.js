@@ -92,7 +92,8 @@ const CUE_LOSSLESS = {
 };
 
 function cueTrimsToFlac(track) {
-  return !!track.lossless && !track.dsd && !(track.bitsPerSample > 24);
+  // An unknown bit depth might be 32-bit or float, which FLAC can't hold.
+  return !!track.lossless && !track.dsd && track.bitsPerSample > 0 && track.bitsPerSample <= 24;
 }
 
 // The scanner doesn't record which .cue a segment came from, so find it the
@@ -201,9 +202,16 @@ class LibraryExporter {
     if (!discs.byImage.has(track.path)) {
       discs.byImage.set(track.path, (async () => {
         let dir = albumDir;
+        const srcSize = (await fsp.stat(track.path)).size;
         for (let n = 2; ; n++) {
-          const owner = discs.claimed.get(path.join(dir, path.basename(track.path)).toLowerCase());
-          if (!owner || owner === track.path) break;
+          const target = path.join(dir, path.basename(track.path));
+          const owner = discs.claimed.get(target.toLowerCase());
+          // A file left by an earlier export counts as this image only if it
+          // is the same size; otherwise it's another disc's, so move on.
+          let existing = null;
+          try { existing = await fsp.stat(target); } catch { /* free */ }
+          const taken = owner ? owner !== track.path : !!existing && existing.size !== srcSize;
+          if (!taken) break;
           dir = path.join(albumDir, `Disc ${n}`);
         }
         discs.claimed.set(path.join(dir, path.basename(track.path)).toLowerCase(), track.path);

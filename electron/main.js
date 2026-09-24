@@ -400,6 +400,12 @@ async function getArtistInfo(name) {
   // so a temporary network failure doesn't stick; offline, an expired entry
   // is still better than nothing.
   if (!deezerOk && !wikiOk) return cached ? artistInfoResult(cached) : artistInfoResult(info);
+  // Refreshing with one service down: keep what the cached entry had rather
+  // than replacing a good bio or photo with nothing.
+  if (cached && !(deezerOk && wikiOk)) {
+    if (!wikiOk && !info.bio) { info.bio = cached.bio ?? null; info.url = cached.url ?? null; }
+    if (!info.imgFile && cached.imgFile) info.imgFile = cached.imgFile;
+  }
   if (cached?.imgFile && !info.imgFile && isInsideDir(ART_CACHE_DIR(), cached.imgFile)) {
     fsp.unlink(cached.imgFile).catch(() => {}); // photo gone upstream
   }
@@ -483,14 +489,20 @@ async function readSettings() {
   const raw = await readJson(SETTINGS_FILE(), {});
   const { settings, secrets } = splitLastfmSettings(raw);
   if (!secrets) return settings;
-  await withLastfmCreds((creds) => {
-    const next = { ...creds };
-    for (const [k, v] of Object.entries(secrets)) {
-      if (v !== undefined && next[k] == null) next[k] = v;
-    }
-    return next;
-  });
-  await writeJson(SETTINGS_FILE(), settings);
+  try {
+    await withLastfmCreds((creds) => {
+      const next = { ...creds };
+      for (const [k, v] of Object.entries(secrets)) {
+        if (v !== undefined && next[k] == null) next[k] = v;
+      }
+      return next;
+    });
+    await writeJson(SETTINGS_FILE(), settings);
+  } catch (err) {
+    // e.g. a locked keyring: leave settings.json as it is so the move is
+    // retried next launch, and still let the app boot with its settings.
+    console.warn('Could not move Last.fm credentials out of settings:', err.message);
+  }
   return settings;
 }
 
@@ -499,11 +511,16 @@ async function readSettings() {
 async function writeSettings(incoming) {
   const { settings, secrets } = splitLastfmSettings(incoming || {});
   if (secrets) {
-    await withLastfmCreds((creds) => {
-      const next = { ...creds };
-      for (const [k, v] of Object.entries(secrets)) if (v) next[k] = v;
-      return next;
-    });
+    try {
+      await withLastfmCreds((creds) => {
+        const next = { ...creds };
+        for (const [k, v] of Object.entries(secrets)) if (v) next[k] = v;
+        return next;
+      });
+    } catch (err) {
+      // the rest of the settings still save
+      console.warn('Could not store Last.fm credentials:', err.message);
+    }
   }
   return writeJson(SETTINGS_FILE(), settings);
 }
@@ -993,7 +1010,11 @@ function registerUpnpIpc() {
       const addrs = info ? await rendererAddresses(location) : null;
       if (gen === zoneGen) zoneClients = addrs;
     } catch (err) {
-      if (gen === zoneGen) zoneClients = null;
+      if (gen === zoneGen) {
+        zoneClients = null;
+        // don't leave a renderer selected that the server won't serve
+        await getRendererEngine().select(null).catch(() => {});
+      }
       await syncMediaServer().catch(() => {});
       throw err;
     }
@@ -1263,7 +1284,7 @@ app.whenReady().then(async () => {
 
 app.on('before-quit', () => {
   try { activeExporter?.cancel(); } catch {}
-  try { activeLoudness?.cancel(); } catch {} // else its ffmpeg can outlive us and strand a .rgpart
+  try { activeLoudness?.cancel(); } catch {} // else its ffmpeg can outlive us
   try { activeScan?.abort.abort(); } catch {} // a scan still waiting never starts
   try { activeScan?.worker?.terminate(); } catch {}
   try { nativeEngine?.stopAll(); } catch {}
