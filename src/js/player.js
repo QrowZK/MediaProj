@@ -18,6 +18,33 @@ export const EQ_PRESETS = {
 };
 
 const PRELOAD_AHEAD_SECONDS = 20;
+// How early (element seconds) a cue segment is treated as ended — the handoff
+// to the next element takes a few ms to become audible.
+const CUE_END_LEAD = 0.02;
+
+// ReplayGain for a track as a linear factor, with the standard clipping
+// prevention: never boost past 1/peak, or a positive gain on a track whose
+// peak is already near full scale clips.
+export function replayGainLinear(track, mode) {
+  if (!track || mode === 'off') return 1;
+  let db = null, peak = null;
+  if (mode === 'track' && track.replayGainTrack != null) {
+    db = track.replayGainTrack;
+    peak = track.rgTrackPeak;
+  } else if (mode === 'album') {
+    if (track.replayGainAlbum != null) {
+      db = track.replayGainAlbum;
+      peak = track.rgAlbumPeak ?? track.rgTrackPeak;
+    } else if (track.replayGainTrack != null) {
+      db = track.replayGainTrack;
+      peak = track.rgTrackPeak;
+    }
+  }
+  if (db == null || !isFinite(db)) return 1;
+  let g = Math.pow(10, db / 20);
+  if (peak > 0 && isFinite(peak) && g * peak > 1) g = 1 / peak;
+  return g;
+}
 
 export class AudioEngine {
   constructor() {
@@ -125,15 +152,9 @@ export class AudioEngine {
       });
       el.addEventListener('timeupdate', () => {
         if (idx !== this.active) return;
-        const c = this.currentTrack;
         // Cue segment: the shared file plays past this track's end, so the
         // real 'ended' never fires — detect the segment boundary and advance.
-        if (c && c.cue && c.cueEnd != null && !this._cueEnding &&
-            el.currentTime >= c.cueEnd - 0.02) {
-          this._cueEnding = true;
-          this._handleEnded();
-          return;
-        }
+        if (this._checkCueEnd()) return;
         this.onTimeUpdate?.(this.currentTime, this.duration);
         this._maybePreloadNext();
       });
@@ -146,13 +167,34 @@ export class AudioEngine {
   }
 
   _applyReplayGain(gainNode, track) {
-    let db = 0;
-    if (track && this.replayGainMode === 'track' && track.replayGainTrack != null) {
-      db = track.replayGainTrack;
-    } else if (track && this.replayGainMode === 'album') {
-      db = track.replayGainAlbum ?? track.replayGainTrack ?? 0;
+    gainNode.gain.value = replayGainLinear(track, this.replayGainMode);
+  }
+
+  // Advance past a cue segment's end. 'timeupdate' only fires every ~250 ms,
+  // so on its own the boundary is caught up to that late and the following
+  // part of the disc image leaks out; once the end is within a second a timer
+  // aimed at the boundary takes over. Returns true if the segment ended.
+  _checkCueEnd() {
+    const c = this.currentTrack;
+    if (!c || !c.cue || c.cueEnd == null || this._cueEnding) return false;
+    const el = this.el;
+    const left = c.cueEnd - CUE_END_LEAD - el.currentTime;
+    if (left <= 0) {
+      clearTimeout(this._cueTimer);
+      this._cueTimer = null;
+      this._cueEnding = true;
+      this._handleEnded();
+      return true;
     }
-    gainNode.gain.value = Math.pow(10, db / 20);
+    // re-validated when it fires (seek, pause, track change), so a stale
+    // timer only ever re-checks; paused elements re-arm on their next
+    // 'timeupdate'. The floor keeps a stalled element from spinning.
+    if (left <= 1 && !el.paused) {
+      clearTimeout(this._cueTimer);
+      const ms = Math.max(5, (left / (el.playbackRate || 1)) * 1000);
+      this._cueTimer = setTimeout(() => { this._cueTimer = null; this._checkCueEnd(); }, ms);
+    }
+    return false;
   }
 
   // An undecodable file fires the element 'error' event AND rejects play();
@@ -467,6 +509,18 @@ export class AudioEngine {
   }
 
   getSpectrumNyquist() { return this.ctx.sampleRate / 2; }
+
+  // The library was re-read (Analyze, rescan): swap in the fresh track objects
+  // so new ReplayGain values apply to what's already playing or preloaded.
+  refreshTracks(byId) {
+    const fresh = (t) => (t && byId.get(t.id)) || t;
+    this.currentTrack = fresh(this.currentTrack);
+    if (this.preloadedTrack) {
+      this.preloadedTrack = fresh(this.preloadedTrack);
+      this._applyReplayGain(this.sourceGains[1 - this.active], this.preloadedTrack);
+    }
+    if (this.currentTrack) this._applyReplayGain(this.sourceGains[this.active], this.currentTrack);
+  }
 
   // the queued "next" is gone (queue cleared) — drop the preload
   clearNext() {

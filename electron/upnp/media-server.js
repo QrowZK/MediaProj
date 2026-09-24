@@ -1,16 +1,25 @@
 'use strict';
 
 // Auralis DLNA/UPnP-AV media server: streamers browse the library over
-// ContentDirectory and pull audio over HTTP with Range support. Pure Node —
-// no dependencies.
+// ContentDirectory and pull audio over HTTP with Range support. Pure Node,
+// plus the bundled ffmpeg to cut cue-sheet tracks out of their disc image.
 
 const http = require('http');
 const fs = require('fs');
+const { spawn } = require('child_process');
 const { pipeline } = require('stream');
 const fsp = fs.promises;
 const path = require('path');
 const { SsdpAdvertiser, localIPv4 } = require('./ssdp');
 const { escapeXml, xmlValue, soapEnvelope, soapFault } = require('./xml');
+
+let ffmpegPath = null;
+try {
+  ffmpegPath = require('ffmpeg-static');
+  if (ffmpegPath && ffmpegPath.includes('app.asar')) {
+    ffmpegPath = ffmpegPath.replace('app.asar', 'app.asar.unpacked');
+  }
+} catch { /* bundled binary missing on this install */ }
 
 const MIME = {
   '.flac': 'audio/flac', '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4',
@@ -20,6 +29,13 @@ const MIME = {
   '.dsf': 'audio/x-dsf', '.dff': 'audio/x-dff', '.alac': 'audio/mp4',
 };
 
+// Socket addresses arrive as IPv4-mapped IPv6 ("::ffff:192.168.1.20") on a
+// dual-stack listener; compare them in plain IPv4 form.
+function normalizeIp(a) {
+  if (!a) return '';
+  return a.toLowerCase().startsWith('::ffff:') && a.includes('.') ? a.slice(7) : a.toLowerCase();
+}
+
 function mimeFor(p) { return MIME[path.extname(p).toLowerCase()] || 'application/octet-stream'; }
 
 function hmmss(seconds) {
@@ -28,12 +44,44 @@ function hmmss(seconds) {
   return `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}.000`;
 }
 
+// A cue-sheet track is a [cueStart, cueEnd) slice of a shared disc image. A
+// renderer handed the disc file would play the whole disc, so /stream cuts the
+// slice out with ffmpeg on the fly and sends it as FLAC. A pipe has no length,
+// so there's no byte-range seeking: renderers seek by time (DLNA
+// TimeSeekRange, OP=10) instead. A cue whose one track spans the whole file
+// is just the file.
+function isCueSegment(t) {
+  return !!(t && t.cue && ((Number(t.cueStart) || 0) > 0 || t.cueEnd != null));
+}
+
+const DLNA_FLAGS = 'DLNA.ORG_FLAGS=01700000000000000000000000000000';
+const CUE_FEATURES = `DLNA.ORG_OP=10;DLNA.ORG_CI=1;${DLNA_FLAGS}`;
+const MAX_CUE_STREAMS = 4; // a renderer holds ~2 (current + prefetched next)
+
+// PCM format of a cut: the disc's own rate and depth. DSD has no FLAC form, so
+// it becomes 24-bit / 176.4 kHz PCM.
+function cueOutputFormat(t) {
+  if (t.dsd) return { sampleRate: 176400, bits: 24 };
+  return { sampleRate: t.sampleRate || null, bits: (t.bitsPerSample || 16) > 16 ? 24 : 16 };
+}
+
+// npt time ("12.5" or "0:01:02.500") → seconds, null if malformed
+function parseNpt(s) {
+  if (!s) return null;
+  const parts = s.split(':');
+  if (parts.length > 3 || parts.some((x) => !/^\d+(\.\d+)?$/.test(x))) return null;
+  return parts.reduce((acc, x) => acc * 60 + Number(x), 0);
+}
+
+function nptString(seconds) { return Math.max(0, seconds).toFixed(3); }
+
 function trackItemXml(t, parent, base) {
-  const ext = path.extname(t.path).toLowerCase();
-  const mime = mimeFor(t.path);
+  const cut = isCueSegment(t);
+  const fmt = cut ? cueOutputFormat(t) : { sampleRate: t.sampleRate, bits: t.bitsPerSample };
+  const mime = cut ? 'audio/flac' : mimeFor(t.path);
   const url = `${base}/stream/${encodeURIComponent(t.id)}`;
   const art = t.artUrl ? `<upnp:albumArtURI>${escapeXml(`${base}/art/${encodeURIComponent(t.id)}`)}</upnp:albumArtURI>` : '';
-  const dlnaOp = 'DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000';
+  const dlnaOp = cut ? CUE_FEATURES : `DLNA.ORG_OP=01;DLNA.ORG_CI=0;${DLNA_FLAGS}`;
   return `<item id="t:${escapeXml(t.id)}" parentID="${escapeXml(parent)}" restricted="1">` +
     `<dc:title>${escapeXml(t.title)}</dc:title>` +
     `<upnp:class>object.item.audioItem.musicTrack</upnp:class>` +
@@ -44,9 +92,9 @@ function trackItemXml(t, parent, base) {
     (t.trackNo ? `<upnp:originalTrackNumber>${t.trackNo}</upnp:originalTrackNumber>` : '') +
     art +
     `<res protocolInfo="http-get:*:${mime}:${dlnaOp}" duration="${hmmss(t.duration)}"` +
-    (t.fileSize ? ` size="${t.fileSize}"` : '') +
-    (t.sampleRate ? ` sampleFrequency="${t.sampleRate}"` : '') +
-    (t.bitsPerSample ? ` bitsPerSample="${t.bitsPerSample}"` : '') +
+    (t.fileSize && !cut ? ` size="${t.fileSize}"` : '') +
+    (fmt.sampleRate ? ` sampleFrequency="${fmt.sampleRate}"` : '') +
+    (fmt.bits ? ` bitsPerSample="${fmt.bits}"` : '') +
     (t.channels ? ` nrAudioChannels="${t.channels}"` : '') +
     `>${escapeXml(url)}</res></item>`;
 }
@@ -56,10 +104,16 @@ class MediaServer {
   constructor(deps) {
     this.deps = deps;
     this.httpServer = null;
+    this.cueJobs = new Set(); // ffmpeg children cutting cue tracks
     this.ssdp = null;
     this.config = { enabled: false, name: 'Auralis', port: 47700 };
     this.uuid = null;
     this.updateId = 1;
+    // null: serve every client (the media server the user enabled). A set of
+    // addresses: zone-only mode, where just the selected renderer may pull
+    // audio and nothing else is exposed.
+    this.allowedClients = null;
+    this.sockets = new Set();
   }
 
   bumpUpdateId() { this.updateId = (this.updateId % 2000000000) + 1; }
@@ -70,14 +124,34 @@ class MediaServer {
       address: this.httpServer ? `http://${localIPv4()}:${this.config.port}` : null,
       name: this.config.name,
       port: this.config.port,
+      zoneOnly: !!(this.httpServer && this.allowedClients),
+      advertising: !!this.ssdp,
     };
   }
 
-  async start(config, uuid) {
+  _clientAllowed(address) {
+    return !this.allowedClients || this.allowedClients.has(normalizeIp(address));
+  }
+
+  // scope: { advertise, allowedClients }. The defaults are the full media
+  // server: announced over SSDP and open to any client on the network.
+  // Calling start() again on the same port only swaps the scope, so a
+  // renderer's stream in flight survives the user turning the server on or
+  // off while a zone is playing.
+  async start(config, uuid, scope = {}) {
+    const next = { ...this.config, ...config };
+    if (this.httpServer && (next.port || 47700) === (this.config.port || 47700)) {
+      this.config = next;
+      this.uuid = uuid;
+      this._applyScope(scope);
+      return this.status();
+    }
     this.stop();
-    this.config = { ...this.config, ...config };
+    this.config = next;
     this.uuid = uuid;
     const port = this.config.port || 47700;
+    // set before listening so no connection is accepted under the wrong scope
+    this.allowedClients = scope.allowedClients ? new Set(scope.allowedClients.map(normalizeIp)) : null;
 
     this.httpServer = http.createServer((req, res) => {
       this._handle(req, res).catch((err) => {
@@ -86,6 +160,11 @@ class MediaServer {
           res.end('Internal error: ' + err.message);
         } catch { /* socket gone */ }
       });
+    });
+    this.httpServer.on('connection', (socket) => {
+      if (!this._clientAllowed(socket.remoteAddress)) return socket.destroy();
+      this.sockets.add(socket);
+      socket.on('close', () => this.sockets.delete(socket));
     });
 
     try {
@@ -100,21 +179,42 @@ class MediaServer {
       throw err;
     }
 
-    this.ssdp = new SsdpAdvertiser({
-      uuid,
-      location: `http://${localIPv4()}:${port}/device.xml`,
-      serverName: this.config.name,
-    });
-    this.ssdp.start();
+    this._applyScope(scope);
     return this.status();
   }
 
+  _applyScope({ advertise = true, allowedClients = null } = {}) {
+    this.allowedClients = allowedClients ? new Set(allowedClients.map(normalizeIp)) : null;
+    // cut off anyone the new scope no longer admits (e.g. a streamer that was
+    // browsing before the user switched the server off while a zone plays)
+    for (const socket of this.sockets) {
+      if (!this._clientAllowed(socket.remoteAddress)) socket.destroy();
+    }
+    // restart the advertiser so a renamed server re-announces itself
+    if (this.ssdp) { this.ssdp.stop(); this.ssdp = null; }
+    if (advertise) {
+      this.ssdp = new SsdpAdvertiser({
+        uuid: this.uuid,
+        location: `http://${localIPv4()}:${this.config.port || 47700}/device.xml`,
+        serverName: this.config.name,
+      });
+      this.ssdp.start();
+    }
+  }
+
   stop() {
+    for (const child of this.cueJobs) { try { child.kill('SIGKILL'); } catch { /* gone */ } }
+    this.cueJobs.clear();
     if (this.ssdp) { this.ssdp.stop(); this.ssdp = null; }
     if (this.httpServer) {
       try { this.httpServer.close(); } catch { /* fine */ }
       this.httpServer = null;
     }
+    // close() only stops new connections: end open streams too, so a stopped
+    // server really stops serving
+    for (const socket of this.sockets) socket.destroy();
+    this.sockets.clear();
+    this.allowedClients = null;
   }
 
   _baseUrl(req) {
@@ -125,6 +225,13 @@ class MediaServer {
   async _handle(req, res) {
     const url = new URL(req.url, this._baseUrl(req));
     const p = url.pathname;
+
+    // Zone-only mode: the renderer only needs its audio and album art; the
+    // library itself is not browseable.
+    if (this.allowedClients && !p.startsWith('/stream/') && !p.startsWith('/art/')) {
+      res.writeHead(404, { 'Content-Type': 'text/plain' });
+      return res.end('Not found');
+    }
 
     if (p === '/device.xml') return this._deviceXml(req, res);
     if (p === '/cds/scpd.xml') return this._scpd(res, CDS_SCPD);
@@ -386,6 +493,7 @@ class MediaServer {
     if (!track) { res.writeHead(404); return res.end(); }
     let stat;
     try { stat = await fsp.stat(track.path); } catch { res.writeHead(404); return res.end(); }
+    if (isCueSegment(track)) return this._streamCue(req, res, track);
 
     const mime = mimeFor(track.path);
     const headers = {
@@ -415,6 +523,80 @@ class MediaServer {
       if (req.method === 'HEAD') return res.end();
       pipeline(fs.createReadStream(track.path), res, () => {});
     }
+  }
+
+  _streamCue(req, res, track) {
+    const cueStart = Number(track.cueStart) || 0;
+    // last track (no cueEnd) runs to the end of the file: its length is only
+    // known from the scan, so it's advertised but never used to cut
+    const cueLen = track.cueEnd != null ? Math.max(0, track.cueEnd - cueStart) : null;
+    const segLen = cueLen ?? (Number(track.duration) || null);
+    const headers = {
+      'Content-Type': 'audio/flac',
+      'Accept-Ranges': 'none',
+      'transferMode.dlna.org': 'Streaming',
+      'contentFeatures.dlna.org': CUE_FEATURES,
+    };
+
+    // Byte offsets into a stream still being encoded can't be honoured. A
+    // range from 0 (most renderers' opening request) is the whole stream.
+    const range = req.headers.range && /bytes=(\d*)-(\d*)/.exec(req.headers.range);
+    if (range && (range[1] || range[2]) && range[1] !== '0') {
+      res.writeHead(416, { 'Content-Range': 'bytes */*' });
+      return res.end();
+    }
+
+    let from = 0, to = cueLen;
+    const tsr = req.headers['timeseekrange.dlna.org'];
+    if (tsr) {
+      const m = /^\s*npt\s*=\s*([\d:.]+)\s*-\s*([\d:.]*)\s*(?:\/.*)?$/i.exec(tsr);
+      const a = m ? parseNpt(m[1]) : null;
+      const b = m && m[2] ? parseNpt(m[2]) : null;
+      if (a == null || (m[2] && b == null) || (segLen != null && a >= segLen) || (b != null && b <= a)) {
+        res.writeHead(416);
+        return res.end();
+      }
+      from = a;
+      if (b != null) to = cueLen != null ? Math.min(b, cueLen) : b;
+      const shownEnd = to ?? segLen;
+      headers['TimeSeekRange.dlna.org'] =
+        `npt=${nptString(from)}-${shownEnd != null ? nptString(shownEnd) : ''}/${segLen != null ? nptString(segLen) : '*'}`;
+    }
+
+    if (!ffmpegPath || this.cueJobs.size >= MAX_CUE_STREAMS) {
+      res.writeHead(503, { 'Retry-After': '2' });
+      return res.end();
+    }
+    res.writeHead(200, headers); // DLNA answers a time seek with 200, not 206
+    if (req.method === 'HEAD') return res.end();
+
+    const fmt = cueOutputFormat(track);
+    const args = ['-v', 'error', '-nostdin'];
+    const at = cueStart + from;
+    if (at > 0) args.push('-ss', at.toFixed(6)); // input-side: sample-accurate when decoding
+    args.push('-i', track.path, '-map', '0:a:0', '-map_metadata', '-1');
+    if (to != null) args.push('-t', Math.max(0.001, to - from).toFixed(6));
+    // the segment's own tags, not the disc file's
+    const tags = {
+      title: track.title, artist: track.artist, album: track.album,
+      album_artist: track.albumArtist, track: track.trackNo, date: track.year, genre: track.genre,
+    };
+    for (const [k, v] of Object.entries(tags)) {
+      if (v != null && v !== '') args.push('-metadata', `${k}=${v}`);
+    }
+    args.push('-c:a', 'flac', '-sample_fmt', fmt.bits > 16 ? 's32' : 's16');
+    if (fmt.bits > 16) args.push('-bits_per_raw_sample', '24');
+    if (track.dsd) args.push('-ar', String(fmt.sampleRate));
+    args.push('-f', 'flac', 'pipe:1');
+
+    const child = spawn(ffmpegPath, args, { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
+    this.cueJobs.add(child);
+    const kill = () => { try { child.kill('SIGKILL'); } catch { /* gone */ } };
+    child.on('error', () => { /* ENOENT etc.: stdout just closes */ });
+    child.on('close', () => this.cueJobs.delete(child));
+    // renderer hung up (stop, seek, next track): don't keep decoding the disc
+    res.on('close', kill);
+    pipeline(child.stdout, res, kill);
   }
 
   async _art(req, res, trackId) {
@@ -462,4 +644,4 @@ const CMS_SCPD = `<?xml version="1.0" encoding="utf-8"?>
   </serviceStateTable>
 </scpd>`;
 
-module.exports = { MediaServer, trackItemXml };
+module.exports = { MediaServer, trackItemXml, isCueSegment };
