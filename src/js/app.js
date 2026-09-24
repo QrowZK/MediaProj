@@ -2184,6 +2184,9 @@ function hideScanStrip() {
 
 let scanActive = false;
 
+// Scans and loudness analysis take turns in main; these name the one ahead.
+const JOB_LABELS = { scan: 'the library scan', loudness: 'loudness analysis' };
+
 async function runScan(folders) {
   if (scanActive) return; // a scan is already running — main joins it anyway
   scanActive = true;
@@ -2207,7 +2210,9 @@ async function runScan(folders) {
 
 window.auralis.library.onScanProgress((p) => {
   if (!scanActive) return; // stale event racing the scan's completion
-  if (p.phase === 'discover') {
+  if (p.phase === 'waiting') {
+    showScanStrip(`Waiting for ${JOB_LABELS[p.for] || 'another job'} to finish…`);
+  } else if (p.phase === 'discover') {
     showScanStrip(`Discovering files… ${p.found.toLocaleString()}`);
   } else {
     showScanStrip(`Reading metadata — ${p.file}`, Math.round((p.done / p.total) * 100));
@@ -2351,6 +2356,10 @@ let loudnessActive = false;
 
 window.auralis.library.onLoudnessProgress((p) => {
   if (!loudnessActive) return;
+  if (p.waiting) {
+    showLoudnessStrip(`Waiting for ${JOB_LABELS[p.waiting] || 'another job'} to finish…`, null);
+    return;
+  }
   const pct = p.total ? Math.round((p.done / p.total) * 100) : 0;
   showLoudnessStrip(p.file ? p.file : `Analyzing ${p.done}/${p.total}…`, pct);
 });
