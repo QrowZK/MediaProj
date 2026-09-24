@@ -1,6 +1,6 @@
 'use strict';
 
-// Loudness analysis + ReplayGain tagging.
+// Loudness analysis + ReplayGain.
 //
 // Runs ffmpeg's `ebur128` filter once per track to measure integrated loudness
 // (I, LUFS), loudness range (LRA, LU), and true peak (dBTP), then derives
@@ -9,15 +9,11 @@
 // loudest track's peak — the standard single-decode approximation, so no track
 // is decoded twice.
 //
-// Optionally embeds the values as tags. Only containers ffmpeg can rewrite
-// losslessly with the conventional ReplayGain keys are tagged (FLAC/OGG/Opus
-// Vorbis comments, MP3 ID3 TXXX); everything else is measured and stored in the
-// library so playback still normalizes, but the file is left untouched and
-// reported as not-tagged rather than risking a bad remux.
+// The values are stored in Auralis's library only; source files are never
+// modified. (Remuxing with ffmpeg to embed tags altered other metadata:
+// merged multi-value fields, dropped FLAC/APE/ID3v1 blocks, ID3v2.3 → v2.4.)
 
 const { spawn } = require('child_process');
-const fs = require('fs');
-const fsp = fs.promises;
 const path = require('path');
 
 let ffmpegPath = null;
@@ -30,14 +26,6 @@ try {
 
 // ReplayGain 2.0 / EBU R128 reference level.
 const RG2_REF_LUFS = -18;
-
-// ext → { muxer } for the formats we can losslessly remux with RG tags.
-const TAGGABLE = {
-  '.flac': 'flac',
-  '.ogg': 'ogg',
-  '.opus': 'opus',
-  '.mp3': 'mp3',
-};
 
 // ffmpeg prints the ebur128 summary to stderr at end-of-stream. Pull the
 // integrated loudness, loudness range, and (peak=true) true peak out of it.
@@ -70,8 +58,6 @@ function parseEbur128(raw) {
 
 const round2 = (n) => Math.round(n * 100) / 100;
 const round6 = (n) => Math.round(n * 1e6) / 1e6;
-const gainStr = (db) => `${db > 0 ? '+' : ''}${db.toFixed(2)} dB`;
-const peakStr = (lin) => lin.toFixed(6);
 
 class LoudnessAnalyzer {
   constructor() {
@@ -84,14 +70,14 @@ class LoudnessAnalyzer {
     try { this.currentChild?.kill('SIGKILL'); } catch { /* already gone */ }
   }
 
-  _runFfmpeg(args, { capture = 'stderr' } = {}) {
+  _runFfmpeg(args) {
     return new Promise((resolve, reject) => {
       if (!ffmpegPath) return reject(new Error('Bundled ffmpeg is unavailable on this install'));
       const child = spawn(ffmpegPath, args, { stdio: ['ignore', 'ignore', 'pipe'] });
       this.currentChild = child;
       let buf = '';
       // ebur128's summary is at the very end; keep a generous tail.
-      child.stderr.on('data', (d) => { buf = (buf + d).slice(capture === 'stderr' ? -16000 : -4000); });
+      child.stderr.on('data', (d) => { buf = (buf + d).slice(-16000); });
       child.on('error', reject);
       child.on('close', (code) => {
         this.currentChild = null;
@@ -132,55 +118,14 @@ class LoudnessAnalyzer {
     };
   }
 
-  // Embed track+album RG into the source file (supported containers only).
-  // Writes to a .part sibling and renames on success so a failure or cancel
-  // never leaves a truncated file in place.
-  async _writeTags(track, m) {
-    // A cue segment shares one physical file with the whole disc — there's no
-    // per-segment tag slot, so the values live in Auralis's library only.
-    if (track.cue) return { tagged: false, reason: 'cue segment — stored in library' };
-    const ext = path.extname(track.path).toLowerCase();
-    const muxer = TAGGABLE[ext];
-    if (!muxer) return { tagged: false, reason: `tagging not supported for ${ext || 'this format'}` };
-    // Vorbis comments are conventionally UPPERCASE; ID3 TXXX descriptions are
-    // read lowercase by foobar2000/Rockbox/etc.
-    const key = muxer === 'mp3'
-      ? (n) => `replaygain_${n}`
-      : (n) => `REPLAYGAIN_${n.toUpperCase()}`;
-    const meta = [
-      [key('track_gain'), gainStr(m.replayGainTrack)],
-      [key('track_peak'), peakStr(m.rgTrackPeak)],
-    ];
-    if (m.replayGainAlbum != null) meta.push([key('album_gain'), gainStr(m.replayGainAlbum)]);
-    if (m.rgAlbumPeak != null) meta.push([key('album_peak'), peakStr(m.rgAlbumPeak)]);
-
-    const partPath = track.path + '.rgpart';
-    await fsp.unlink(partPath).catch(() => {}); // stale from a previous run
-    const args = ['-y', '-v', 'error', '-i', track.path, '-map', '0', '-c', 'copy', '-map_metadata', '0'];
-    for (const [k, v] of meta) args.push('-metadata', `${k}=${v}`);
-    args.push('-f', muxer, partPath);
-    try {
-      await this._runFfmpeg(args, { capture: 'err' });
-      // Preserve the original mtime so the next library rescan doesn't treat a
-      // tag-only rewrite as a content change and re-read everything.
-      const st = await fsp.stat(track.path).catch(() => null);
-      await fsp.rename(partPath, track.path);
-      if (st) await fsp.utimes(track.path, st.atime, st.mtime).catch(() => {});
-      return { tagged: true };
-    } catch (err) {
-      await fsp.unlink(partPath).catch(() => {});
-      return { tagged: false, reason: err.message };
-    }
-  }
-
-  // opts: { writeTags: bool, force: bool }
+  // opts: { force: bool }
   // onProgress({ done, total, file })
-  // Returns { ok, cancelled, analyzed, skipped, tagged, failed, failures, results }
+  // Returns { ok, cancelled, analyzed, skipped, failed, failures, results }
   // where results is a map of trackId → measured fields to merge into the library.
   async run(tracks, opts, onProgress) {
     const force = !!opts.force;
     const results = {};
-    let analyzed = 0, skipped = 0, tagged = 0, failed = 0;
+    let analyzed = 0, skipped = 0, failed = 0;
     const failures = [];
 
     // Only (re)measure what needs it, but keep every input track for album
@@ -244,24 +189,16 @@ class LoudnessAnalyzer {
       }
     }
 
-    // Assemble final per-track results and optionally write tags.
+    // Assemble final per-track results for the library.
     const analyzedAt = Date.now();
-    for (let i = 0; i < tracks.length; i++) {
-      const track = tracks[i];
+    for (const track of tracks) {
       const m = measuredById[track.id];
       if (!m) continue;
-      const merged = { ...m, ...(albumById[track.id] || {}), loudnessAnalyzedAt: analyzedAt };
-      results[track.id] = merged;
-      if (opts.writeTags && !this.cancelled) {
-        onProgress({ done: i, total, file: `Tagging — ${track.title || path.basename(track.path)}` });
-        const r = await this._writeTags(track, merged);
-        if (r.tagged) { tagged++; merged.rgTagged = true; }
-        else if (r.reason) merged.rgTagReason = r.reason;
-      }
+      results[track.id] = { ...m, ...(albumById[track.id] || {}), loudnessAnalyzedAt: analyzedAt };
     }
 
     onProgress({ done: total, total, file: '' });
-    return { ok: !this.cancelled, cancelled: this.cancelled, analyzed, skipped, tagged, failed, failures, results };
+    return { ok: !this.cancelled, cancelled: this.cancelled, analyzed, skipped, failed, failures, results };
   }
 }
 

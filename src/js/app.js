@@ -1230,12 +1230,7 @@ async function renderSettings() {
 
       <div class="settings-card">
         <h3>ReplayGain &amp; Loudness</h3>
-        <div class="desc">Measures each track's loudness (EBU R128) and derives ReplayGain so albums play at a consistent level, and surfaces dynamics — loudness range and true peak — across the app. Reference level is −18 LUFS (ReplayGain 2.0).</div>
-        <div class="setting-row" style="padding-top:0">
-          <div><div class="lbl">Write ReplayGain tags to files</div>
-            <div class="hint">Embeds the values into the files (FLAC, OGG, Opus, MP3) so other players and DAPs read them. Other formats are measured and stored in Auralis only. Off keeps every change inside Auralis's library.</div></div>
-          <button class="toggle ${s.loudness?.writeTags ? 'on' : ''}" id="toggle-rg-write"></button>
-        </div>
+        <div class="desc">Measures each track's loudness (EBU R128) and derives ReplayGain so albums play at a consistent level, and surfaces dynamics — loudness range and true peak — across the app. Reference level is −18 LUFS (ReplayGain 2.0). Results are stored in Auralis's library; your files are never modified.</div>
         <div style="display:flex;gap:10px;margin-top:12px">
           <button class="btn" id="settings-analyze-library" ${state.library.tracks.length ? '' : 'disabled'}>Analyze Library…</button>
           <button class="btn" id="settings-reanalyze-library" ${state.library.tracks.length ? '' : 'disabled'}>Re-analyze All</button>
@@ -1266,7 +1261,7 @@ async function renderSettings() {
         </div>
         <div class="setting-row">
           <div><div class="lbl">ReplayGain</div>
-            <div class="hint">Volume-matches tracks using ReplayGain tags in your files.</div></div>
+            <div class="hint">Volume-matches tracks using ReplayGain from your files' tags or from Auralis's loudness analysis.</div></div>
           <select class="styled" style="width:160px" id="rg-mode">
             <option value="off" ${engine.replayGainMode === 'off' ? 'selected' : ''}>Off</option>
             <option value="track" ${engine.replayGainMode === 'track' ? 'selected' : ''}>Track gain</option>
@@ -1857,12 +1852,6 @@ async function renderSettings() {
   $('#settings-rescan').addEventListener('click', rescan);
   $('#settings-export-library')?.addEventListener('click', () => openExportModal(state.library.tracks, 'Library'));
 
-  $('#toggle-rg-write')?.addEventListener('click', (e) => {
-    const l = state.settings.loudness || (state.settings.loudness = { writeTags: false });
-    l.writeTags = !l.writeTags;
-    e.target.classList.toggle('on', l.writeTags);
-    saveSettingsDebounced();
-  });
   $('#settings-analyze-library')?.addEventListener('click', () => analyzeLoudness(state.library.tracks, 'Library'));
   $('#settings-reanalyze-library')?.addEventListener('click', () => analyzeLoudness(state.library.tracks, 'Library', { force: true }));
   content.querySelectorAll('.rm[data-folder]').forEach((b) =>
@@ -2370,12 +2359,11 @@ window.auralis.library.onLoudnessProgress((p) => {
 // actions); the library-wide "Analyze" skips already-done tracks.
 async function analyzeLoudness(tracks, label, { force = false } = {}) {
   if (!tracks.length || loudnessActive) return;
-  const writeTags = !!state.settings.loudness?.writeTags;
   const trackIds = tracks.map((t) => t.id);
   loudnessActive = true;
   showLoudnessStrip(`Analyzing “${label}”…`, 0);
   try {
-    const res = await window.auralis.library.analyzeLoudness({ trackIds, writeTags, force });
+    const res = await window.auralis.library.analyzeLoudness({ trackIds, force });
     loudnessActive = false;
     hideLoudnessStrip();
     if (!res.ok && res.error) { toast(res.error, true); return; }
@@ -2383,7 +2371,6 @@ async function analyzeLoudness(tracks, label, { force = false } = {}) {
     if (res.cancelled) { toast(`Analysis cancelled — ${res.analyzed} analyzed`); return; }
     const bits = [`${res.analyzed} analyzed`];
     if (res.skipped) bits.push(`${res.skipped} already done`);
-    if (writeTags && res.tagged) bits.push(`${res.tagged} tagged`);
     if (res.failed) bits.push(`${res.failed} failed`);
     toast(bits.join(' · '), res.failed > 0);
   } catch (err) {
