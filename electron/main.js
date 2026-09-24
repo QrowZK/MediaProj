@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, dialog, protocol, shell, Menu } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, protocol, shell, Menu, safeStorage } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const fsp = fs.promises;
@@ -8,6 +8,11 @@ const http = require('http');
 const https = require('https');
 const crypto = require('crypto');
 const { createJobQueue } = require('./library-jobs');
+const {
+  isUncPath, isAbsolutePath, isInsideDir, findLibraryTrack, isLibraryPath,
+  isFresh, pruneCache, migrateLyricsCache, LYRICS_CACHE_LIMITS, LYRICS_MAX_ENTRY_CHARS,
+  ARTIST_CACHE_LIMITS, splitLastfmSettings, encodeSecretRecord, decodeSecretRecord,
+} = require('./hardening');
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -29,8 +34,13 @@ const STATS_FILE = () => path.join(app.getPath('userData'), 'stats.json');
 const SESSION_FILE = () => path.join(app.getPath('userData'), 'session.json');
 const ARTIST_INFO_FILE = () => path.join(app.getPath('userData'), 'artist-info.json');
 const ART_CACHE_DIR = () => path.join(app.getPath('userData'), 'art-cache');
+// Main-owned: the page can't write these, unlike settings.json.
+const LASTFM_CREDS_FILE = () => path.join(app.getPath('userData'), 'lastfm-credentials.json');
+const DSP_IR_FILE = () => path.join(app.getPath('userData'), 'dsp-ir.json');
 
 let mainWindow = null;
+// Folders the user picked in an open-folder dialog this session.
+const pickedFolders = new Set();
 let activeExporter = null;
 let activeLoudness = null;
 
@@ -68,12 +78,16 @@ function registerAuralisProtocol() {
       const encoded = url.pathname.replace(/^\//, '');
       const filePath = Buffer.from(encoded, 'base64url').toString('utf8');
       const ext = path.extname(filePath).toLowerCase();
-      // Containment check on the RESOLVED path: a raw startsWith let
-      // "<art-cache>/../settings.json" (and sibling dirs like "art-cache-x")
-      // through, since fs resolves the ".." afterwards.
-      const rel = path.relative(ART_CACHE_DIR(), path.resolve(filePath));
-      const inArtCache = rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
+      if (!isAbsolutePath(filePath)) return new Response('Forbidden', { status: 403 });
+      const inArtCache = isInsideDir(ART_CACHE_DIR(), filePath);
       if (!AUDIO_EXTENSIONS.has(ext) && !inArtCache) {
+        return new Response('Forbidden', { status: 403 });
+      }
+      // Network paths only for files the user put in the library or picked
+      // as an impulse response: a page-chosen \\host\share URL would make
+      // Windows authenticate to that host.
+      if (isUncPath(filePath) && !isLibraryPath(await getCachedLibrary(), filePath) &&
+          filePath !== (await trustedIrPath())) {
         return new Response('Forbidden', { status: 403 });
       }
 
@@ -237,6 +251,8 @@ async function loadArtistIndex() {
   return artistIndex;
 }
 
+const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
+
 // Plain Node HTTPS client with CONNECT tunneling when HTTPS_PROXY is set —
 // works on direct connections and behind corporate proxies alike.
 function httpRequest(url, { method = 'GET', body = null, headers = {} } = {}, redirects = 3) {
@@ -257,7 +273,13 @@ function httpRequest(url, { method = 'GET', body = null, headers = {} } = {}, re
         return;
       }
       const chunks = [];
-      res.on('data', (c) => chunks.push(c));
+      let size = 0;
+      res.on('data', (c) => {
+        size += c.length;
+        // nothing we fetch (JSON, lyrics, one photo) comes near this
+        if (size > MAX_RESPONSE_BYTES) res.destroy(new Error('response too large'));
+        else chunks.push(c);
+      });
       res.on('end', () => resolve({ status: res.statusCode, buffer: Buffer.concat(chunks) }));
       res.on('error', reject);
     };
@@ -332,9 +354,7 @@ async function getArtistInfo(name) {
   if (!key || key === 'unknown artist') return null;
   const index = await loadArtistIndex();
   const cached = index[key];
-  if (cached) {
-    return { ...cached, img: cached.imgFile ? toMediaUrl(cached.imgFile) : null };
-  }
+  if (cached && isFresh(cached, ARTIST_CACHE_LIMITS)) return artistInfoResult(cached);
 
   const info = { bio: null, url: null, imgFile: null, ts: Date.now() };
   let deezerOk = false;
@@ -377,11 +397,24 @@ async function getArtistInfo(name) {
   } catch { /* offline or blocked — degrade gracefully */ }
 
   // Cache the result (including "nothing found") only if the services answered,
-  // so a temporary network failure doesn't stick.
-  if (deezerOk || wikiOk) {
-    index[key] = info;
-    await writeJson(ARTIST_INFO_FILE(), index);
+  // so a temporary network failure doesn't stick; offline, an expired entry
+  // is still better than nothing.
+  if (!deezerOk && !wikiOk) return cached ? artistInfoResult(cached) : artistInfoResult(info);
+  if (cached?.imgFile && !info.imgFile && isInsideDir(ART_CACHE_DIR(), cached.imgFile)) {
+    fsp.unlink(cached.imgFile).catch(() => {}); // photo gone upstream
   }
+  index[key] = info;
+  // Bounded: expired and oldest entries go, along with their downloaded photo.
+  for (const [, old] of pruneCache(index, ARTIST_CACHE_LIMITS, Date.now(), key)) {
+    if (old?.imgFile && old.imgFile !== info.imgFile && isInsideDir(ART_CACHE_DIR(), old.imgFile)) {
+      fsp.unlink(old.imgFile).catch(() => {});
+    }
+  }
+  await writeJson(ARTIST_INFO_FILE(), index);
+  return artistInfoResult(info);
+}
+
+function artistInfoResult(info) {
   return { ...info, img: info.imgFile ? toMediaUrl(info.imgFile) : null };
 }
 
@@ -428,9 +461,77 @@ async function lastfmCall(method, params, creds, { signed = true, post = false }
   return json;
 }
 
+// The API key, shared secret and session key live in a main-owned file,
+// encrypted with safeStorage (DPAPI on Windows) — never in settings.json and
+// never sent back to the page. Access is serialized so a migration and a
+// connect can't interleave their read-modify-writes.
+let lastfmCredsChain = Promise.resolve();
+function withLastfmCreds(fn) {
+  const run = lastfmCredsChain.then(async () => {
+    const creds = decodeSecretRecord(await readJson(LASTFM_CREDS_FILE(), null), safeStorage);
+    const next = await fn(creds);
+    if (next) await writeJson(LASTFM_CREDS_FILE(), encodeSecretRecord(next, safeStorage));
+    return next || creds;
+  });
+  lastfmCredsChain = run.catch(() => {});
+  return run;
+}
+const getLastfmCreds = () => withLastfmCreds(() => null);
+
+// Older versions kept the credentials in settings.json: move them out.
+async function readSettings() {
+  const raw = await readJson(SETTINGS_FILE(), {});
+  const { settings, secrets } = splitLastfmSettings(raw);
+  if (!secrets) return settings;
+  await withLastfmCreds((creds) => {
+    const next = { ...creds };
+    for (const [k, v] of Object.entries(secrets)) {
+      if (v !== undefined && next[k] == null) next[k] = v;
+    }
+    return next;
+  });
+  await writeJson(SETTINGS_FILE(), settings);
+  return settings;
+}
+
+// The page may still send credentials with its settings (a window loaded
+// before the upgrade); they are split off the same way.
+async function writeSettings(incoming) {
+  const { settings, secrets } = splitLastfmSettings(incoming || {});
+  if (secrets) {
+    await withLastfmCreds((creds) => {
+      const next = { ...creds };
+      for (const [k, v] of Object.entries(secrets)) if (v) next[k] = v;
+      return next;
+    });
+  }
+  return writeJson(SETTINGS_FILE(), settings);
+}
+
+async function lastfmStatus() {
+  const c = await getLastfmCreds();
+  return {
+    apiKey: c.apiKey || '',
+    hasSecret: !!c.apiSecret,
+    connected: !!(c.apiKey && c.apiSecret && c.sessionKey),
+    username: c.sessionKey ? (c.username || null) : null,
+  };
+}
+
 let pendingAuthToken = null;
 
-async function lastfmStartAuth(creds) {
+// An empty secret keeps the saved one, so reconnecting doesn't mean
+// re-pasting it.
+async function lastfmStartAuth(input) {
+  const apiKey = String(input?.apiKey || '').trim();
+  const secretIn = String(input?.apiSecret || '').trim();
+  const creds = await withLastfmCreds((c) => {
+    const apiSecret = secretIn || (apiKey === c.apiKey ? c.apiSecret : '');
+    if (!apiKey || !apiSecret) throw new Error('Enter your Last.fm API key and shared secret first');
+    const changed = apiKey !== c.apiKey || apiSecret !== c.apiSecret;
+    // a new key/secret invalidates the old session
+    return changed ? { apiKey, apiSecret } : { ...c };
+  });
   const { token } = await lastfmCall('auth.getToken', {}, creds);
   pendingAuthToken = token;
   await shell.openExternal(
@@ -438,11 +539,25 @@ async function lastfmStartAuth(creds) {
   return true;
 }
 
-async function lastfmCompleteAuth(creds) {
+async function lastfmCompleteAuth() {
   if (!pendingAuthToken) throw new Error('No authorization in progress');
+  const creds = await getLastfmCreds();
   const res = await lastfmCall('auth.getSession', { token: pendingAuthToken }, creds);
   pendingAuthToken = null;
-  return { sessionKey: res.session.key, username: res.session.name };
+  await withLastfmCreds((c) => ({ ...c, sessionKey: res.session.key, username: res.session.name }));
+  return { username: res.session.name };
+}
+
+async function lastfmDisconnect() {
+  pendingAuthToken = null;
+  await withLastfmCreds((c) => ({ apiKey: c.apiKey, apiSecret: c.apiSecret }));
+  return true;
+}
+
+async function connectedLastfmCreds() {
+  const c = await getLastfmCreds();
+  if (!c.apiKey || !c.apiSecret || !c.sessionKey) throw new Error('Not connected to Last.fm');
+  return c;
 }
 
 async function lastfmNowPlaying(creds, track) {
@@ -468,18 +583,18 @@ async function lastfmScrobble(creds, scrobbles) {
 // serialized: two overlapping read-modify-writes of the queue file lost
 // scrobbles (a failed submit's queued entry overwritten by a successful one).
 let scrobbleChain = Promise.resolve();
-function submitScrobble(creds, scrobble) {
-  const run = scrobbleChain.then(() => submitScrobbleNow(creds, scrobble));
+function submitScrobble(scrobble) {
+  const run = scrobbleChain.then(() => submitScrobbleNow(scrobble));
   scrobbleChain = run.catch(() => {});
   return run;
 }
 
-async function submitScrobbleNow(creds, scrobble) {
+async function submitScrobbleNow(scrobble) {
   const queue = await readJson(SCROBBLE_QUEUE_FILE(), []);
   queue.push(scrobble);
   // Last.fm accepts up to 50 per batch
   try {
-    await lastfmScrobble(creds, queue.slice(0, 50));
+    await lastfmScrobble(await connectedLastfmCreds(), queue.slice(0, 50));
     const rest = queue.slice(50);
     await writeJson(SCROBBLE_QUEUE_FILE(), rest);
     return { submitted: Math.min(queue.length, 50), queued: rest.length };
@@ -521,7 +636,7 @@ const LYRICS_CACHE_FILE = () => path.join(app.getPath('userData'), 'lyrics-cache
 let lyricsCache = null;
 
 async function loadLyricsCache() {
-  if (!lyricsCache) lyricsCache = await readJson(LYRICS_CACHE_FILE(), {});
+  if (!lyricsCache) lyricsCache = migrateLyricsCache(await readJson(LYRICS_CACHE_FILE(), {}));
   return lyricsCache;
 }
 
@@ -548,8 +663,9 @@ async function getLyrics(track) {
   // 3. LRCLIB (no API key, community-run)
   const cache = await loadLyricsCache();
   const key = `${track.artist}::${track.title}`.toLowerCase();
-  if (cache[key] !== undefined) {
-    return cache[key] ? { ...cache[key], source: 'lrclib' } : null;
+  const cached = cache[key];
+  if (cached && isFresh(cached, LYRICS_CACHE_LIMITS)) {
+    return cached.entry ? { ...cached.entry, source: 'lrclib' } : null;
   }
   try {
     const url = 'https://lrclib.net/api/search?artist_name=' +
@@ -564,11 +680,15 @@ async function getLyrics(track) {
     const entry = hit && (hit.syncedLyrics || hit.plainLyrics)
       ? { text: hit.syncedLyrics || hit.plainLyrics, synced: !!hit.syncedLyrics }
       : null;
-    cache[key] = entry;
-    await writeJson(LYRICS_CACHE_FILE(), cache);
+    if (!entry || entry.text.length <= LYRICS_MAX_ENTRY_CHARS) {
+      cache[key] = { entry, ts: Date.now() };
+      pruneCache(cache, LYRICS_CACHE_LIMITS, Date.now(), key);
+      await writeJson(LYRICS_CACHE_FILE(), cache);
+    }
     return entry ? { ...entry, source: 'lrclib' } : null;
   } catch {
-    return null; // offline — don't cache, retry next time
+    // offline — don't cache, retry next time; an expired hit still beats nothing
+    return cached?.entry ? { ...cached.entry, source: 'lrclib' } : null;
   }
 }
 
@@ -584,10 +704,19 @@ function registerIpc() {
       title: 'Add Music Folder',
       properties: ['openDirectory', 'multiSelections'],
     });
-    return res.canceled ? [] : res.filePaths;
+    if (res.canceled) return [];
+    res.filePaths.forEach((p) => pickedFolders.add(p));
+    return res.filePaths;
   });
 
-  ipcMain.handle('library:scan', async (_e, folders) => scanFolders(folders));
+  // Folders come back from the page; a network folder is accepted only if the
+  // user picked it in the dialog or it is already in the library.
+  ipcMain.handle('library:scan', async (_e, folders) => {
+    const known = new Set((await getCachedLibrary()).folders || []);
+    const ok = (Array.isArray(folders) ? folders : []).filter((f) => isAbsolutePath(f) &&
+      (!isUncPath(f) || pickedFolders.has(f) || known.has(f)));
+    return scanFolders(ok);
+  });
   ipcMain.handle('library:cancel-scan', () => {
     activeScan?.abort.abort();
     activeScan?.worker?.postMessage({ type: 'cancel' });
@@ -598,11 +727,15 @@ function registerIpc() {
       title: 'Export To…',
       properties: ['openDirectory', 'createDirectory'],
     });
-    return res.canceled ? null : res.filePaths[0];
+    if (res.canceled) return null;
+    pickedFolders.add(res.filePaths[0]);
+    return res.filePaths[0];
   });
 
   ipcMain.handle('library:export', async (_e, { trackIds, destDir, format, downsample }) => {
     if (activeExporter) return { ok: false, error: 'An export is already running' };
+    // only a folder the user picked in the export dialog
+    if (!pickedFolders.has(destDir)) return { ok: false, error: 'Choose the export folder again' };
     const { LibraryExporter } = require('./export');
     const lib = await readJson(LIBRARY_FILE(), { tracks: [] });
     const byId = new Map(lib.tracks.map((t) => [t.id, t]));
@@ -658,8 +791,8 @@ function registerIpc() {
   });
   ipcMain.handle('library:cancel-loudness', () => { activeLoudness?.cancel(); });
 
-  ipcMain.handle('settings:get', () => readJson(SETTINGS_FILE(), {}));
-  ipcMain.handle('settings:set', async (_e, settings) => writeJson(SETTINGS_FILE(), settings));
+  ipcMain.handle('settings:get', () => readSettings());
+  ipcMain.handle('settings:set', async (_e, settings) => writeSettings(settings));
 
   ipcMain.handle('playlists:get', () => readJson(PLAYLISTS_FILE(), { playlists: [] }));
   ipcMain.handle('playlists:set', async (_e, data) => writeJson(PLAYLISTS_FILE(), data));
@@ -673,19 +806,31 @@ function registerIpc() {
   ipcMain.handle('artist:info', (_e, name) => getArtistInfo(String(name)));
   ipcMain.handle('artist:cached-map', () => getCachedArtistMap());
 
-  ipcMain.handle('lyrics:get', (_e, track) => getLyrics(track));
+  // The page names tracks by id; paths always come from the library.
+  ipcMain.handle('lyrics:get', async (_e, track) => {
+    const t = findLibraryTrack(await getCachedLibrary(), track?.id);
+    return t ? getLyrics(t) : null;
+  });
 
-  ipcMain.handle('lastfm:start-auth', (_e, creds) => lastfmStartAuth(creds));
-  ipcMain.handle('lastfm:complete-auth', (_e, creds) => lastfmCompleteAuth(creds));
-  ipcMain.handle('lastfm:now-playing', async (_e, creds, track) => {
-    try { await lastfmNowPlaying(creds, track); return { ok: true }; }
+  ipcMain.handle('lastfm:status', () => lastfmStatus());
+  ipcMain.handle('lastfm:start-auth', (_e, input) => lastfmStartAuth(input));
+  ipcMain.handle('lastfm:complete-auth', () => lastfmCompleteAuth());
+  ipcMain.handle('lastfm:disconnect', () => lastfmDisconnect());
+  ipcMain.handle('lastfm:now-playing', async (_e, track) => {
+    try { await lastfmNowPlaying(await connectedLastfmCreds(), track); return { ok: true }; }
     catch (err) { return { ok: false, error: err.message }; }
   });
-  ipcMain.handle('lastfm:scrobble', (_e, creds, scrobble) => submitScrobble(creds, scrobble));
+  ipcMain.handle('lastfm:scrobble', (_e, scrobble) => submitScrobble(scrobble));
 
   ipcMain.handle('window:mini', (_e, on) => setMiniMode(on));
 
-  ipcMain.handle('shell:show-item', (_e, filePath) => shell.showItemInFolder(filePath));
+  ipcMain.handle('shell:show-track', async (_e, id) => {
+    const t = findLibraryTrack(await getCachedLibrary(), id);
+    if (t) shell.showItemInFolder(t.path);
+  });
+  ipcMain.handle('shell:show-folder', (_e, dir) => {
+    if (pickedFolders.has(dir)) shell.showItemInFolder(dir);
+  });
 
   ipcMain.handle('window:minimize', () => mainWindow?.minimize());
   ipcMain.handle('window:maximize', () => {
@@ -896,15 +1041,32 @@ function registerNativeIpc() {
   ipcMain.handle('native:available', () => getNativeEngine().available);
   ipcMain.handle('native:apis', () => getNativeEngine().listApis());
   ipcMain.handle('native:devices', (_e, apiId) => getNativeEngine().listDevices(apiId));
-  ipcMain.handle('native:config', (_e, partial) => getNativeEngine().setConfig(partial));
+  ipcMain.handle('native:config', async (_e, partial) => {
+    const cfg = { ...(partial || {}) };
+    if (cfg.correction && typeof cfg.correction === 'object') {
+      const irPath = cfg.correction.irPath;
+      cfg.correction = { ...cfg.correction, irPath: (await isAllowedIrPath(irPath)) ? irPath : null };
+    }
+    return getNativeEngine().setConfig(cfg);
+  });
+  // The page names tracks by id; the engine gets the library's copy, so its
+  // path (and cue bounds) can't be chosen by the page.
   ipcMain.handle('native:play', async (_e, track, startAt, startPaused) => {
-    try { await getNativeEngine().play(track, startAt || 0, false, { startPaused: !!startPaused }); return { ok: true }; }
+    try {
+      const t = findLibraryTrack(await getCachedLibrary(), track?.id);
+      if (!t) throw new Error('Track is not in the library');
+      await getNativeEngine().play(t, startAt || 0, false, { startPaused: !!startPaused });
+      return { ok: true };
+    }
     catch (err) { return { ok: false, error: err.message }; }
   });
   ipcMain.handle('native:pause', () => getNativeEngine().pause());
   ipcMain.handle('native:resume', () => getNativeEngine().resume());
   ipcMain.handle('native:seek', (_e, time) => getNativeEngine().seek(time));
-  ipcMain.handle('native:set-next', (_e, track) => getNativeEngine().setNext(track));
+  ipcMain.handle('native:set-next', async (_e, track) => {
+    const t = track ? findLibraryTrack(await getCachedLibrary(), track.id) : null;
+    getNativeEngine().setNext(t);
+  });
   ipcMain.handle('native:stop', () => getNativeEngine().stopAll());
   ipcMain.handle('native:position', () => getNativeEngine().getPosition());
   ipcMain.handle('native:signal-path', () => getNativeEngine().getSignalPath());
@@ -921,8 +1083,25 @@ function registerNativeIpc() {
     });
     if (res.canceled || !res.filePaths.length) return null;
     const irPath = res.filePaths[0];
+    trustedIr = irPath;
+    await writeJson(DSP_IR_FILE(), { path: irPath });
     return { path: irPath, url: toMediaUrl(irPath), name: path.basename(irPath) };
   });
+}
+
+// The impulse response the user last picked in the dialog, remembered in a
+// main-owned file (the copy in settings.json is page-writable).
+let trustedIr;
+async function trustedIrPath() {
+  if (trustedIr === undefined) trustedIr = (await readJson(DSP_IR_FILE(), {})).path || null;
+  return trustedIr;
+}
+
+// ffmpeg opens this path: the picked file, or else a local .wav.
+async function isAllowedIrPath(p) {
+  if (!p) return false;
+  if (p === (await trustedIrPath())) return true;
+  return isAbsolutePath(p) && !isUncPath(p) && path.extname(p).toLowerCase() === '.wav';
 }
 
 // ---------------------------------------------------------------------------
@@ -967,7 +1146,7 @@ function setupAutoUpdater() {
 
   // Silent startup check, unless the user turned auto-updates off.
   if (updater) {
-    readJson(SETTINGS_FILE(), {}).then((s) => {
+    readSettings().then((s) => {
       if (s.autoUpdate !== false) updater.checkForUpdates().catch(() => {});
     });
   }
@@ -1069,6 +1248,9 @@ app.whenReady().then(async () => {
   setupAutoUpdater();
   registerNativeIpc();
   registerUpnpIpc();
+  // Loaded up front so the id lookups in the playback handlers never wait on
+  // disk (a play and the pause right behind it stay in order).
+  await Promise.all([getCachedLibrary(), trustedIrPath()]).catch(() => {});
   createWindow();
   // resume the media server if it was enabled last session
   upnpConfig().then((cfg) => { if (cfg.enabled) applyUpnpConfig({}); }).catch(() => {});

@@ -16,6 +16,7 @@ const state = {
   library: { folders: [], tracks: [] },
   playlists: [],
   settings: {},
+  lastfm: { apiKey: '', hasSecret: false, connected: false, username: null },
   stats: { plays: {}, lastPlayed: {} },
   artistCache: {},
   view: 'albums',
@@ -1300,20 +1301,20 @@ async function renderSettings() {
           (free) Last.fm API account — create one at last.fm/api/account/create, then paste the key
           and shared secret here and connect. Failed scrobbles queue offline and submit later.
         </div>
-        <div id="lastfm-status" style="margin-bottom:12px;font-size:12.5px;color:${state.settings.lastfm?.sessionKey ? 'var(--lossless)' : 'var(--text-3)'}">
-          ${state.settings.lastfm?.sessionKey
-            ? `Connected as ${esc(state.settings.lastfm.username || 'Last.fm user')}`
+        <div id="lastfm-status" style="margin-bottom:12px;font-size:12.5px;color:${state.lastfm.connected ? 'var(--lossless)' : 'var(--text-3)'}">
+          ${state.lastfm.connected
+            ? `Connected as ${esc(state.lastfm.username || 'Last.fm user')}`
             : 'Not connected'}
         </div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px">
           <input type="text" class="lf-input" id="lf-key" placeholder="API key" spellcheck="false"
-                 value="${esc(state.settings.lastfm?.apiKey || '')}" />
-          <input type="text" class="lf-input" id="lf-secret" placeholder="Shared secret" spellcheck="false"
-                 value="${esc(state.settings.lastfm?.apiSecret || '')}" />
+                 value="${esc(state.lastfm.apiKey || '')}" />
+          <input type="password" class="lf-input" id="lf-secret" spellcheck="false" autocomplete="off"
+                 placeholder="${state.lastfm.hasSecret ? 'Shared secret (saved, encrypted)' : 'Shared secret'}" />
         </div>
         <div style="display:flex;gap:10px">
-          <button class="btn primary" id="lf-connect">${state.settings.lastfm?.sessionKey ? 'Reconnect' : 'Connect to Last.fm'}</button>
-          ${state.settings.lastfm?.sessionKey ? '<button class="btn danger" id="lf-disconnect">Disconnect</button>' : ''}
+          <button class="btn primary" id="lf-connect">${state.lastfm.connected ? 'Reconnect' : 'Connect to Last.fm'}</button>
+          ${state.lastfm.connected ? '<button class="btn danger" id="lf-disconnect">Disconnect</button>' : ''}
         </div>
       </div>
 
@@ -1907,23 +1908,23 @@ async function renderSettings() {
   $('#lf-connect').addEventListener('click', async () => {
     const apiKey = $('#lf-key').value.trim();
     const apiSecret = $('#lf-secret').value.trim();
-    if (!apiKey || !apiSecret) return toast('Enter your Last.fm API key and shared secret first', true);
-    state.settings.lastfm = { ...(state.settings.lastfm || {}), apiKey, apiSecret };
-    saveSettings();
+    // a blank secret field means "keep the saved one" (main never sends it back)
+    const keepSecret = !apiSecret && state.lastfm.hasSecret && apiKey === state.lastfm.apiKey;
+    if (!apiKey || (!apiSecret && !keepSecret)) return toast('Enter your Last.fm API key and shared secret first', true);
     try {
       if (!lfAwaitingAuth) {
         await window.auralis.lastfm.startAuth({ apiKey, apiSecret });
+        state.lastfm = await window.auralis.lastfm.status();
+        $('#lf-secret').value = '';
         lfAwaitingAuth = true;
         $('#lf-connect').textContent = 'I’ve authorized — finish connecting';
         $('#lastfm-status').textContent = 'Authorize Auralis in the browser window, then click the button again.';
         toast('Approve Auralis in your browser, then finish connecting');
       } else {
-        const session = await window.auralis.lastfm.completeAuth({ apiKey, apiSecret });
+        const session = await window.auralis.lastfm.completeAuth();
         lfAwaitingAuth = false;
-        state.settings.lastfm = {
-          ...state.settings.lastfm,
-          sessionKey: session.sessionKey, username: session.username, enabled: true,
-        };
+        state.lastfm = await window.auralis.lastfm.status();
+        state.settings.lastfm = { ...(state.settings.lastfm || {}), enabled: true };
         saveSettings();
         toast(`Connected to Last.fm as ${session.username}`);
         render();
@@ -1935,10 +1936,10 @@ async function renderSettings() {
     }
   });
 
-  $('#lf-disconnect')?.addEventListener('click', () => {
-    state.settings.lastfm = {
-      ...state.settings.lastfm, sessionKey: null, username: null, enabled: false,
-    };
+  $('#lf-disconnect')?.addEventListener('click', async () => {
+    await window.auralis.lastfm.disconnect();
+    state.lastfm = await window.auralis.lastfm.status();
+    state.settings.lastfm = { ...(state.settings.lastfm || {}), enabled: false };
     saveSettings();
     render();
     toast('Disconnected from Last.fm');
@@ -2327,7 +2328,7 @@ function openExportModal(tracks, label) {
       const bits = [`${res.exported} exported`];
       if (res.skipped) bits.push(`${res.skipped} already present`);
       if (res.failed) bits.push(`${res.failed} failed`);
-      toast(bits.join(', '), res.failed > 0, { label: 'Show in Folder', fn: () => window.auralis.shell.showItem(res.destDir) });
+      toast(bits.join(', '), res.failed > 0, { label: 'Show in Folder', fn: () => window.auralis.shell.showFolder(res.destDir) });
     } catch (err) {
       exportActive = false;
       hideExportStrip();
@@ -2861,25 +2862,22 @@ function countPlayIfEligible(time, duration) {
 
 // ── Last.fm scrobbling ──
 
-function lastfmCreds() {
-  const lf = state.settings.lastfm || {};
-  return lf.enabled && lf.apiKey && lf.apiSecret && lf.sessionKey ? lf : null;
+function lastfmActive() {
+  return !!(state.settings.lastfm?.enabled && state.lastfm.connected);
 }
 
 async function sendNowPlaying(track) {
-  const creds = lastfmCreds();
-  if (!creds) return;
-  window.auralis.lastfm.nowPlaying(creds, {
+  if (!lastfmActive()) return;
+  window.auralis.lastfm.nowPlaying({
     artist: track.artist, title: track.title, album: track.album, duration: track.duration,
   }).catch(() => {});
 }
 
 async function sendScrobble(track) {
-  const creds = lastfmCreds();
   // Last.fm ignores tracks shorter than 30 seconds
-  if (!creds || (track.duration && track.duration < 30)) return;
+  if (!lastfmActive() || (track.duration && track.duration < 30)) return;
   try {
-    const res = await window.auralis.lastfm.scrobble(creds, {
+    const res = await window.auralis.lastfm.scrobble({
       artist: track.artist, title: track.title, album: track.album,
       duration: track.duration, timestamp: trackStartedAt,
     });
@@ -3157,7 +3155,7 @@ function openTrackMenu(e, tracks, idx, playlistCtx = null) {
     { sep: true },
     { label: 'Export…', fn: () => openExportModal([track], track.title) },
     { label: 'Analyze loudness', fn: () => analyzeLoudness([track], track.title, { force: true }) },
-    { label: 'Show in File Explorer', fn: () => window.auralis.shell.showItem(track.path) },
+    { label: 'Show in File Explorer', fn: () => window.auralis.shell.showTrack(track.id) },
   ];
   ctxMenu.innerHTML = items.map((it, i) =>
     it.sep ? '<div class="cm-sep"></div>'
@@ -3380,6 +3378,8 @@ $$('.nav-item[data-view]').forEach((btn) =>
   state.playlists = pls.playlists || [];
   state.settings = settings || {};
   state.stats = { plays: {}, lastPlayed: {}, ratings: {}, ...stats };
+  // after settings:get, which moves credentials from older settings files
+  state.lastfm = await window.auralis.lastfm.status().catch(() => state.lastfm);
 
   // restore settings
   if (settings.volume != null) {
