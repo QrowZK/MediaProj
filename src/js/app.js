@@ -16,6 +16,7 @@ const state = {
   library: { folders: [], tracks: [] },
   playlists: [],
   settings: {},
+  lastfm: { apiKey: '', hasSecret: false, connected: false, username: null },
   stats: { plays: {}, lastPlayed: {} },
   artistCache: {},
   view: 'albums',
@@ -136,7 +137,8 @@ async function switchEngine(mode) {
         : await engine.play(playingTrack, startAt);
       if (gen !== switchGen) return;
       if (ok && !wasPaused) {
-        onTrackStarted(playingTrack);
+        // the same listen continuing on another output: not a new play
+        onTrackStarted(playingTrack, { resumed: true });
       } else {
         // paused (or failed): reflect a paused transport. The seek bar/time
         // already show this same track at this same position from before the
@@ -1230,12 +1232,7 @@ async function renderSettings() {
 
       <div class="settings-card">
         <h3>ReplayGain &amp; Loudness</h3>
-        <div class="desc">Measures each track's loudness (EBU R128) and derives ReplayGain so albums play at a consistent level, and surfaces dynamics — loudness range and true peak — across the app. Reference level is −18 LUFS (ReplayGain 2.0).</div>
-        <div class="setting-row" style="padding-top:0">
-          <div><div class="lbl">Write ReplayGain tags to files</div>
-            <div class="hint">Embeds the values into the files (FLAC, OGG, Opus, MP3) so other players and DAPs read them. Other formats are measured and stored in Auralis only. Off keeps every change inside Auralis's library.</div></div>
-          <button class="toggle ${s.loudness?.writeTags ? 'on' : ''}" id="toggle-rg-write"></button>
-        </div>
+        <div class="desc">Measures each track's loudness (EBU R128) and derives ReplayGain so albums play at a consistent level, and surfaces dynamics — loudness range and true peak — across the app. Reference level is −18 LUFS (ReplayGain 2.0). Results are stored in Auralis's library; your files are never modified.</div>
         <div style="display:flex;gap:10px;margin-top:12px">
           <button class="btn" id="settings-analyze-library" ${state.library.tracks.length ? '' : 'disabled'}>Analyze Library…</button>
           <button class="btn" id="settings-reanalyze-library" ${state.library.tracks.length ? '' : 'disabled'}>Re-analyze All</button>
@@ -1266,7 +1263,7 @@ async function renderSettings() {
         </div>
         <div class="setting-row">
           <div><div class="lbl">ReplayGain</div>
-            <div class="hint">Volume-matches tracks using ReplayGain tags in your files.</div></div>
+            <div class="hint">Volume-matches tracks using ReplayGain from your files' tags or from Auralis's loudness analysis.</div></div>
           <select class="styled" style="width:160px" id="rg-mode">
             <option value="off" ${engine.replayGainMode === 'off' ? 'selected' : ''}>Off</option>
             <option value="track" ${engine.replayGainMode === 'track' ? 'selected' : ''}>Track gain</option>
@@ -1305,20 +1302,20 @@ async function renderSettings() {
           (free) Last.fm API account — create one at last.fm/api/account/create, then paste the key
           and shared secret here and connect. Failed scrobbles queue offline and submit later.
         </div>
-        <div id="lastfm-status" style="margin-bottom:12px;font-size:12.5px;color:${state.settings.lastfm?.sessionKey ? 'var(--lossless)' : 'var(--text-3)'}">
-          ${state.settings.lastfm?.sessionKey
-            ? `Connected as ${esc(state.settings.lastfm.username || 'Last.fm user')}`
+        <div id="lastfm-status" style="margin-bottom:12px;font-size:12.5px;color:${state.lastfm.connected ? 'var(--lossless)' : 'var(--text-3)'}">
+          ${state.lastfm.connected
+            ? `Connected as ${esc(state.lastfm.username || 'Last.fm user')}`
             : 'Not connected'}
         </div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px">
           <input type="text" class="lf-input" id="lf-key" placeholder="API key" spellcheck="false"
-                 value="${esc(state.settings.lastfm?.apiKey || '')}" />
-          <input type="text" class="lf-input" id="lf-secret" placeholder="Shared secret" spellcheck="false"
-                 value="${esc(state.settings.lastfm?.apiSecret || '')}" />
+                 value="${esc(state.lastfm.apiKey || '')}" />
+          <input type="password" class="lf-input" id="lf-secret" spellcheck="false" autocomplete="off"
+                 placeholder="${state.lastfm.hasSecret ? 'Shared secret (saved, encrypted)' : 'Shared secret'}" />
         </div>
         <div style="display:flex;gap:10px">
-          <button class="btn primary" id="lf-connect">${state.settings.lastfm?.sessionKey ? 'Reconnect' : 'Connect to Last.fm'}</button>
-          ${state.settings.lastfm?.sessionKey ? '<button class="btn danger" id="lf-disconnect">Disconnect</button>' : ''}
+          <button class="btn primary" id="lf-connect">${state.lastfm.connected ? 'Reconnect' : 'Connect to Last.fm'}</button>
+          ${state.lastfm.connected ? '<button class="btn danger" id="lf-disconnect">Disconnect</button>' : ''}
         </div>
       </div>
 
@@ -1804,7 +1801,9 @@ async function renderSettings() {
   // ── Media server ──
 
   const upnpStatusText = (s) => s.running
-    ? `Running at ${s.address} — streamers can browse the library now.`
+    ? (s.zoneOnly
+      ? 'Off — streaming only to the selected network zone, hidden from other devices.'
+      : `Running at ${s.address} — streamers can browse the library now.`)
     : (s.error ? `Failed to start: ${s.error}` : 'Stopped.');
 
   window.auralis.upnp.serverStatus().then((s) => {
@@ -1857,12 +1856,6 @@ async function renderSettings() {
   $('#settings-rescan').addEventListener('click', rescan);
   $('#settings-export-library')?.addEventListener('click', () => openExportModal(state.library.tracks, 'Library'));
 
-  $('#toggle-rg-write')?.addEventListener('click', (e) => {
-    const l = state.settings.loudness || (state.settings.loudness = { writeTags: false });
-    l.writeTags = !l.writeTags;
-    e.target.classList.toggle('on', l.writeTags);
-    saveSettingsDebounced();
-  });
   $('#settings-analyze-library')?.addEventListener('click', () => analyzeLoudness(state.library.tracks, 'Library'));
   $('#settings-reanalyze-library')?.addEventListener('click', () => analyzeLoudness(state.library.tracks, 'Library', { force: true }));
   content.querySelectorAll('.rm[data-folder]').forEach((b) =>
@@ -1916,23 +1909,23 @@ async function renderSettings() {
   $('#lf-connect').addEventListener('click', async () => {
     const apiKey = $('#lf-key').value.trim();
     const apiSecret = $('#lf-secret').value.trim();
-    if (!apiKey || !apiSecret) return toast('Enter your Last.fm API key and shared secret first', true);
-    state.settings.lastfm = { ...(state.settings.lastfm || {}), apiKey, apiSecret };
-    saveSettings();
+    // a blank secret field means "keep the saved one" (main never sends it back)
+    const keepSecret = !apiSecret && state.lastfm.hasSecret && apiKey === state.lastfm.apiKey;
+    if (!apiKey || (!apiSecret && !keepSecret)) return toast('Enter your Last.fm API key and shared secret first', true);
     try {
       if (!lfAwaitingAuth) {
         await window.auralis.lastfm.startAuth({ apiKey, apiSecret });
+        state.lastfm = await window.auralis.lastfm.status();
+        $('#lf-secret').value = '';
         lfAwaitingAuth = true;
         $('#lf-connect').textContent = 'I’ve authorized — finish connecting';
         $('#lastfm-status').textContent = 'Authorize Auralis in the browser window, then click the button again.';
         toast('Approve Auralis in your browser, then finish connecting');
       } else {
-        const session = await window.auralis.lastfm.completeAuth({ apiKey, apiSecret });
+        const session = await window.auralis.lastfm.completeAuth();
         lfAwaitingAuth = false;
-        state.settings.lastfm = {
-          ...state.settings.lastfm,
-          sessionKey: session.sessionKey, username: session.username, enabled: true,
-        };
+        state.lastfm = await window.auralis.lastfm.status();
+        state.settings.lastfm = { ...(state.settings.lastfm || {}), enabled: true };
         saveSettings();
         toast(`Connected to Last.fm as ${session.username}`);
         render();
@@ -1944,10 +1937,10 @@ async function renderSettings() {
     }
   });
 
-  $('#lf-disconnect')?.addEventListener('click', () => {
-    state.settings.lastfm = {
-      ...state.settings.lastfm, sessionKey: null, username: null, enabled: false,
-    };
+  $('#lf-disconnect')?.addEventListener('click', async () => {
+    await window.auralis.lastfm.disconnect();
+    state.lastfm = await window.auralis.lastfm.status();
+    state.settings.lastfm = { ...(state.settings.lastfm || {}), enabled: false };
     saveSettings();
     render();
     toast('Disconnected from Last.fm');
@@ -2193,6 +2186,9 @@ function hideScanStrip() {
 
 let scanActive = false;
 
+// Scans and loudness analysis take turns in main; these name the one ahead.
+const JOB_LABELS = { scan: 'the library scan', loudness: 'loudness analysis' };
+
 async function runScan(folders) {
   if (scanActive) return; // a scan is already running — main joins it anyway
   scanActive = true;
@@ -2201,6 +2197,7 @@ async function runScan(folders) {
     const lib = await window.auralis.library.scan(folders);
     if (lib) {
       state.library = lib;
+      refreshQueueTracks();
       toast(`Library updated — ${lib.tracks.length.toLocaleString()} tracks`);
       render();
     }
@@ -2216,7 +2213,9 @@ async function runScan(folders) {
 
 window.auralis.library.onScanProgress((p) => {
   if (!scanActive) return; // stale event racing the scan's completion
-  if (p.phase === 'discover') {
+  if (p.phase === 'waiting') {
+    showScanStrip(`Waiting for ${JOB_LABELS[p.for] || 'another job'} to finish…`);
+  } else if (p.phase === 'discover') {
     showScanStrip(`Discovering files… ${p.found.toLocaleString()}`);
   } else {
     showScanStrip(`Reading metadata — ${p.file}`, Math.round((p.done / p.total) * 100));
@@ -2331,7 +2330,7 @@ function openExportModal(tracks, label) {
       const bits = [`${res.exported} exported`];
       if (res.skipped) bits.push(`${res.skipped} already present`);
       if (res.failed) bits.push(`${res.failed} failed`);
-      toast(bits.join(', '), res.failed > 0, { label: 'Show in Folder', fn: () => window.auralis.shell.showItem(res.destDir) });
+      toast(bits.join(', '), res.failed > 0, { label: 'Show in Folder', fn: () => window.auralis.shell.showFolder(res.destDir) });
     } catch (err) {
       exportActive = false;
       hideExportStrip();
@@ -2360,6 +2359,10 @@ let loudnessActive = false;
 
 window.auralis.library.onLoudnessProgress((p) => {
   if (!loudnessActive) return;
+  if (p.waiting) {
+    showLoudnessStrip(`Waiting for ${JOB_LABELS[p.waiting] || 'another job'} to finish…`, null);
+    return;
+  }
   const pct = p.total ? Math.round((p.done / p.total) * 100) : 0;
   showLoudnessStrip(p.file ? p.file : `Analyzing ${p.done}/${p.total}…`, pct);
 });
@@ -2370,20 +2373,18 @@ window.auralis.library.onLoudnessProgress((p) => {
 // actions); the library-wide "Analyze" skips already-done tracks.
 async function analyzeLoudness(tracks, label, { force = false } = {}) {
   if (!tracks.length || loudnessActive) return;
-  const writeTags = !!state.settings.loudness?.writeTags;
   const trackIds = tracks.map((t) => t.id);
   loudnessActive = true;
   showLoudnessStrip(`Analyzing “${label}”…`, 0);
   try {
-    const res = await window.auralis.library.analyzeLoudness({ trackIds, writeTags, force });
+    const res = await window.auralis.library.analyzeLoudness({ trackIds, force });
     loudnessActive = false;
     hideLoudnessStrip();
     if (!res.ok && res.error) { toast(res.error, true); return; }
-    if (res.library) { state.library = res.library; render(); }
+    if (res.library) { state.library = res.library; refreshQueueTracks(); render(); }
     if (res.cancelled) { toast(`Analysis cancelled — ${res.analyzed} analyzed`); return; }
     const bits = [`${res.analyzed} analyzed`];
     if (res.skipped) bits.push(`${res.skipped} already done`);
-    if (writeTags && res.tagged) bits.push(`${res.tagged} tagged`);
     if (res.failed) bits.push(`${res.failed} failed`);
     toast(bits.join(' · '), res.failed > 0);
   } catch (err) {
@@ -2394,6 +2395,17 @@ async function analyzeLoudness(tracks, label, { force = false } = {}) {
 }
 
 // ── Queue & transport ────────────────────────────────────────────────────
+
+// The queue and the engine hold track objects, not ids — after the library is
+// replaced (Analyze, rescan) they'd keep playing with the old ReplayGain and
+// metadata. Swap in the fresh objects by id; tracks no longer in the library
+// stay as they were.
+function refreshQueueTracks() {
+  const byId = new Map(state.library.tracks.map((t) => [t.id, t]));
+  state.queue = state.queue.map((t) => byId.get(t.id) || t);
+  engine.refreshTracks?.(byId);
+  renderQueue();
+}
 
 function playTracks(tracks, startIdx) {
   autoplayHold = false; // explicit user start — normal autoplay behavior resumes
@@ -2533,22 +2545,18 @@ function engineOnError(track, msg, transient = false) {
   }
 }
 
-let cueZoneWarned = false;
-
-function onTrackStarted(track) {
-  playCountedFor = null;
+// resumed: the same track carrying on after an output switch — keep its
+// play-count/scrobble state, or the listen is counted (and scrobbled) twice.
+function onTrackStarted(track, { resumed = false } = {}) {
   errorStreak = 0;
-  // Network renderers can't be told to stop at a cue point — the segment plays
-  // on into the rest of the shared file. Say so once, honestly.
-  if (track.cue && engine === zoneEngine && !cueZoneWarned) {
-    cueZoneWarned = true;
-    toast('Cue tracks aren’t split on network renderers — playback continues past the track', true);
-  }
   sessionPlayed.add(track.id);
-  trackStartedAt = Math.floor(Date.now() / 1000);
   updatePlayButton(true);
-  if (!$('#now-playing').classList.contains('hidden')) refreshLyrics(track);
-  sendNowPlaying(track);
+  if (!resumed) {
+    playCountedFor = null;
+    trackStartedAt = Math.floor(Date.now() / 1000);
+    if (!$('#now-playing').classList.contains('hidden')) refreshLyrics(track);
+    sendNowPlaying(track);
+  }
   paintNowPlaying(track);
   saveSession();
 }
@@ -2609,6 +2617,9 @@ function paintNowPlaying(track) {
 
 let _sessionSaveTimer = null;
 let _lastSessionPos = 0;
+// set while boot waits to restore the saved session — an empty queue then
+// means "not restored yet", and must not overwrite the saved one
+let sessionRestorePending = false;
 
 // Persist the current queue (ids), index, and playhead. Coalesced by default so
 // the periodic position updates don't hammer the disk; pass immediate for
@@ -2619,12 +2630,14 @@ function saveSession(immediate = false) {
     _sessionSaveTimer = null;
     const q = state.queue || [];
     if (!q.length || state.queueIndex < 0) {
+      if (sessionRestorePending) return;
       window.auralis.session.set(null).catch(() => {});
       return;
     }
     window.auralis.session.set({
       trackIds: q.map((t) => t.id),
       queueIndex: state.queueIndex,
+      currentTrackId: q[state.queueIndex]?.id ?? null,
       position: engine.currentTrack ? engine.currentTime : 0,
       shuffle: state.shuffle,
       repeat: state.repeat,
@@ -2646,12 +2659,25 @@ async function restoreSession(session) {
   state.queue = q;
   state.shuffle = !!session.shuffle;
   state.repeat = session.repeat || 'off';
-  let idx = session.queueIndex;
-  if (idx == null || idx < 0 || idx >= q.length) idx = 0;
+  // Resolve the current track by id: tracks removed from the library since the
+  // save are filtered out above, so the saved index no longer lines up.
+  const savedIdx = session.queueIndex;
+  const currentId = session.currentTrackId != null ? session.currentTrackId
+    : (savedIdx >= 0 && savedIdx < session.trackIds.length ? session.trackIds[savedIdx] : null);
+  // the saved slot mapped through the filter (kept tracks that precede it) —
+  // preferred when it still holds the current id, so a track queued twice
+  // resolves to the right occurrence
+  const kept = savedIdx > 0
+    ? session.trackIds.slice(0, savedIdx).filter((id) => byId.has(id)).length : 0;
+  let idx = currentId == null ? -1
+    : q[kept]?.id === currentId ? kept : q.findIndex((t) => t.id === currentId);
+  const sameTrack = idx >= 0;
+  // current track is gone: land on whatever now sits nearest its old slot
+  if (!sameTrack) idx = Math.min(kept, q.length - 1);
   state.queueIndex = idx;
   const track = q[idx];
   const dur = track.duration || 0;
-  const pos = (session.position > 1 && (!dur || session.position < dur)) ? session.position : 0;
+  const pos = (sameTrack && session.position > 1 && (!dur || session.position < dur)) ? session.position : 0;
   try {
     if (!(await engine.load(track, pos))) return false;
   } catch { return false; }
@@ -2857,25 +2883,22 @@ function countPlayIfEligible(time, duration) {
 
 // ── Last.fm scrobbling ──
 
-function lastfmCreds() {
-  const lf = state.settings.lastfm || {};
-  return lf.enabled && lf.apiKey && lf.apiSecret && lf.sessionKey ? lf : null;
+function lastfmActive() {
+  return !!(state.settings.lastfm?.enabled && state.lastfm.connected);
 }
 
 async function sendNowPlaying(track) {
-  const creds = lastfmCreds();
-  if (!creds) return;
-  window.auralis.lastfm.nowPlaying(creds, {
+  if (!lastfmActive()) return;
+  window.auralis.lastfm.nowPlaying({
     artist: track.artist, title: track.title, album: track.album, duration: track.duration,
   }).catch(() => {});
 }
 
 async function sendScrobble(track) {
-  const creds = lastfmCreds();
   // Last.fm ignores tracks shorter than 30 seconds
-  if (!creds || (track.duration && track.duration < 30)) return;
+  if (!lastfmActive() || (track.duration && track.duration < 30)) return;
   try {
-    const res = await window.auralis.lastfm.scrobble(creds, {
+    const res = await window.auralis.lastfm.scrobble({
       artist: track.artist, title: track.title, album: track.album,
       duration: track.duration, timestamp: trackStartedAt,
     });
@@ -3153,7 +3176,7 @@ function openTrackMenu(e, tracks, idx, playlistCtx = null) {
     { sep: true },
     { label: 'Export…', fn: () => openExportModal([track], track.title) },
     { label: 'Analyze loudness', fn: () => analyzeLoudness([track], track.title, { force: true }) },
-    { label: 'Show in File Explorer', fn: () => window.auralis.shell.showItem(track.path) },
+    { label: 'Show in File Explorer', fn: () => window.auralis.shell.showTrack(track.id) },
   ];
   ctxMenu.innerHTML = items.map((it, i) =>
     it.sep ? '<div class="cm-sep"></div>'
@@ -3376,6 +3399,8 @@ $$('.nav-item[data-view]').forEach((btn) =>
   state.playlists = pls.playlists || [];
   state.settings = settings || {};
   state.stats = { plays: {}, lastPlayed: {}, ratings: {}, ...stats };
+  // after settings:get, which moves credentials from older settings files
+  state.lastfm = await window.auralis.lastfm.status().catch(() => state.lastfm);
 
   // restore settings
   if (settings.volume != null) {
@@ -3392,6 +3417,7 @@ $$('.nav-item[data-view]').forEach((btn) =>
   }
   engine.setSpeakerCorrection?.(correctionConfig());
   const bootMode = engineMode();
+  let zoneReady = null;
   if (bootMode === 'native') {
     const available = await window.auralis.native.available().catch(() => false);
     if (available) {
@@ -3400,12 +3426,25 @@ $$('.nav-item[data-view]').forEach((btn) =>
     }
   } else if (bootMode === 'zone') {
     // don't block boot on an offline renderer — connect in the background
-    switchEngine('zone').catch(() => {});
+    zoneReady = switchEngine('zone').catch(() => {});
   }
   // Restore the previous session (queue + paused playhead) on the now-active
-  // engine, unless the user turned it off.
+  // engine, unless the user turned it off. With a zone, wait for the renderer
+  // handshake: restoring onto the web engine first loaded the track there,
+  // and the switch (which snapshots the departing engine when it starts)
+  // handed the zone nothing — the restored session was lost.
   if (settings.resumeSession !== false) {
-    try { await restoreSession(session); } catch { /* stale/missing session */ }
+    const restore = async () => {
+      // the user may have started something while the renderer connected
+      if (engine.currentTrack || state.queue.length) return;
+      try { await restoreSession(session); } catch { /* stale/missing session */ }
+    };
+    if (zoneReady) {
+      sessionRestorePending = true;
+      zoneReady.then(restore).then(updateTransportUi).finally(() => { sessionRestorePending = false; });
+    } else {
+      await restore();
+    }
   }
   updateEqButton();
   updateTransportUi();

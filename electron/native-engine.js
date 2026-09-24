@@ -134,6 +134,29 @@ class Biquad {
   }
 }
 
+// ReplayGain as a linear factor, capped at 1/peak so a positive gain can't
+// clip (mirrors replayGainLinear in src/js/player.js).
+function replayGainLinear(track, mode) {
+  if (!track || mode === 'off') return 1;
+  let db = null, peak = null;
+  if (mode === 'track' && track.replayGainTrack != null) {
+    db = track.replayGainTrack;
+    peak = track.rgTrackPeak;
+  } else if (mode === 'album') {
+    if (track.replayGainAlbum != null) {
+      db = track.replayGainAlbum;
+      peak = track.rgAlbumPeak ?? track.rgTrackPeak;
+    } else if (track.replayGainTrack != null) {
+      db = track.replayGainTrack;
+      peak = track.rgTrackPeak;
+    }
+  }
+  if (db == null || !Number.isFinite(db)) return 1;
+  let g = Math.pow(10, db / 20);
+  if (peak > 0 && Number.isFinite(peak) && g * peak > 1) g = 1 / peak;
+  return g;
+}
+
 // ── tiny radix-2 FFT for the spectrum feed ───────────────────────────────
 
 function fftMagnitudes(samples) {
@@ -428,7 +451,26 @@ class NativeAudioEngine {
     this._emitSignalPath();
   }
 
-  setNext(track) { this.nextTrack = track; }
+  setNext(track) {
+    this.nextTrack = track;
+    this._dropStaleJoin();
+  }
+
+  // Analyze updated the library: apply new ReplayGain to the copies we hold
+  // (results: trackId → measured fields). Audio already decoded ahead keeps
+  // the old gain for the ~2 s it covers.
+  refreshTracks(results) {
+    if (!results) return;
+    const held = new Set([this.currentTrack, this.nextTrack, this.seg?.track]);
+    for (const buf of this.pcmQueue) if (buf._join) held.add(buf._join.track);
+    for (const t of held) {
+      const r = t && results[t.id];
+      if (!r) continue;
+      for (const k of ['replayGainTrack', 'replayGainAlbum', 'rgTrackPeak', 'rgAlbumPeak']) {
+        if (k in r) t[k] = r[k];
+      }
+    }
+  }
 
   // ── DSP chain construction ──
 
@@ -465,21 +507,18 @@ class NativeAudioEngine {
     this.dspState = state;
   }
 
-  _processBlock(f64) {
-    // f64: interleaved Float64Array. Applies ReplayGain + per-channel chains.
+  // f64: interleaved Float64Array. Applies ReplayGain + per-channel chains.
+  // `track` is the track the block's audio belongs to; a block straddling a
+  // cue join carries `split` frames of it, then `nextTrack`'s audio.
+  _processBlock(f64, track, split = Infinity, nextTrack = null) {
     const { channels, chains } = this.dspState;
-    let rg = 1;
-    const t = this.currentTrack;
-    if (t && this.config.replayGain === 'track' && t.replayGainTrack != null) {
-      rg = Math.pow(10, t.replayGainTrack / 20);
-    } else if (t && this.config.replayGain === 'album') {
-      rg = Math.pow(10, (t.replayGainAlbum ?? t.replayGainTrack ?? 0) / 20);
-    }
+    const rgA = replayGainLinear(track, this.config.replayGain);
+    const rgB = nextTrack ? replayGainLinear(nextTrack, this.config.replayGain) : rgA;
     const frames = f64.length / channels;
     for (let ch = 0; ch < channels; ch++) {
       const chain = chains[ch];
       for (let i = 0; i < frames; i++) {
-        let s = f64[i * channels + ch] * rg * chain.gain;
+        let s = f64[i * channels + ch] * (i < split ? rgA : rgB) * chain.gain;
         for (const bq of chain.biquads) s = bq.process(s);
         if (chain.delayBuf) {
           const delayed = chain.delayBuf[chain.delayIdx];
@@ -520,18 +559,31 @@ class NativeAudioEngine {
     return { mode: 'dsp', channels, outRate, decodeRate, format: c.outputFormat || 'f32' };
   }
 
+  // The output a track asks for, before any exclusive→shared fallback. Streams
+  // are compared by this, not by what was actually opened: after a fallback
+  // the open stream is shared (and maybe f32), so comparing against it made
+  // every following track reopen the device, retry exclusive mode, fail, and
+  // toast again.
+  _requestFor(track) {
+    const plan = this._planFor(track);
+    // mode MUST be part of this: bit-perfect and s32-DSP share a wire format,
+    // but the byte parser, quantizer, volume, and viz all branch on mode —
+    // reusing the stream across a mode flip feeds f64 bytes into an s32
+    // parser (loud static) and strands the volume/meters.
+    const useWex = !!(this.config.wasapiExclusive && wasapiEx);
+    // WASAPI-exclusive path can only carry integer formats
+    if (useWex && plan.format === 'f32') plan.format = 's32';
+    // the device too: a device change restarts playback, which must reopen
+    const c = this.config;
+    const key = JSON.stringify([plan.outRate, plan.channels, plan.format, plan.mode, useWex,
+      c.api, c.deviceId, c.bufferSize]);
+    return { plan, useWex, key };
+  }
+
   // Would playing `track` next force the output stream to be reopened (which
   // drops whatever is still queued at the device)? Mirrors play()'s needOpen.
   _wouldReopen(track) {
-    if (!this.stream) return true;
-    const plan = this._planFor(track);
-    const useWex = this.config.wasapiExclusive && wasapiEx;
-    if (useWex && plan.format === 'f32') plan.format = 's32';
-    return this.stream.outRate !== plan.outRate ||
-      this.stream.channels !== plan.channels ||
-      this.stream.format !== plan.format ||
-      this.stream.mode !== plan.mode ||
-      this.stream.backend !== (useWex ? 'wasapi-ex' : 'rtaudio');
+    return !this.stream || this.stream.requestKey !== this._requestFor(track).key;
   }
 
   // opts.startPaused: prepare the track (decoder + device) but leave the
@@ -560,38 +612,30 @@ class NativeAudioEngine {
     this.framesWritten = 0;
     this.startOffset = startAt;
     this.dop = null;
+    this.seg = null;
     this.fftMono.fill(0);
 
     const c = this.config;
-    const plan = this._planFor(track);
-    // WASAPI-exclusive path can only carry integer formats
-    const useWex = c.wasapiExclusive && wasapiEx;
-    if (useWex && plan.format === 'f32') plan.format = 's32';
-
-    // mode MUST be part of this check: bit-perfect and s32-DSP share a wire
-    // format, but the byte parser, quantizer, volume, and viz all branch on
-    // mode — reusing the stream across a mode flip feeds f64 bytes into an
-    // s32 parser (loud static) and strands the volume/meters.
-    const needOpen = !this.stream ||
-      this.stream.outRate !== plan.outRate ||
-      this.stream.channels !== plan.channels ||
-      this.stream.format !== plan.format ||
-      this.stream.mode !== plan.mode ||
-      this.stream.backend !== (useWex ? 'wasapi-ex' : 'rtaudio');
+    const { plan, useWex, key: requestKey } = this._requestFor(track);
+    const needOpen = !this.stream || this.stream.requestKey !== requestKey;
     if (needOpen) {
       try {
         this._openStream(plan, useWex);
       } catch (err) {
         if (!useWex) throw err;
         // exclusive mode refused (format/rate/device busy) → shared fallback
+        // informational: playback continues on shared output, so the renderer
+        // must not treat this as a failed track and skip it
         this.emit('native:error', {
           message: `Exclusive mode unavailable (${err.message}) — using shared output`,
+          transient: true,
         });
         if (plan.format !== 'f32' && plan.mode === 'dsp' && (this.config.outputFormat || 'f32') === 'f32') {
           plan.format = 'f32'; // undo the exclusive-only int coercion
         }
         this._openStream(plan, false);
       }
+      this.stream.requestKey = requestKey;
     } else if (!gaplessJoin) {
       // seek / user picked a different track: the old tail queued at the
       // device must not keep playing. A gapless join keeps it — that IS the
@@ -604,25 +648,42 @@ class NativeAudioEngine {
     // the bytes are incompatible, so it stays dropped.
     if (carriedResidual && !needOpen) this.residual = carriedResidual;
 
-    this._buildDsp(plan.outRate, plan.channels);
-    // The exclusive addon may negotiate a different wire format than requested
-    const wireFormat = this.stream.wireFormat || plan.format;
+    // A same-stream gapless join keeps the DSP state: rebuilding zeroes the
+    // EQ biquad history (a step transient on a continuous signal) and the
+    // speaker-correction delay line (drops the outgoing track's delayed tail
+    // on that channel). Config changes still rebuild via setConfig().
+    const keepDsp = gaplessJoin && !needOpen && this.dspState &&
+      this.dspState.fs === plan.outRate && this.dspState.channels === plan.channels;
+    if (!keepDsp) this._buildDsp(plan.outRate, plan.channels);
+    // The exclusive addon may negotiate a different wire format than requested,
+    // and a reused stream may be the shared fallback (f32) for an s32 request
+    const wireFormat = this.stream.wireFormat || this.stream.format;
     this.quantizer = (wireFormat === 'f32' || plan.mode !== 'dsp')
       ? null
       : new Quantizer({ s16: 16, s24: 24, s32: 32 }[wireFormat], plan.channels, c.dither || 'off');
 
     await this.probeSoxr();
     if (seq !== this._playSeq) return; // superseded while awaiting — don't spawn
-    // Cue segment: decode from cueStart (+ any intra-segment offset) and cap
-    // the span at the segment length. The position clock stays segment-relative
-    // because startOffset is the segment offset, not the file offset.
+    // Cue segment: decode from cueStart (+ any intra-segment offset). The
+    // position clock stays segment-relative because startOffset is the
+    // segment offset, not the file offset. The segment's end is enforced by
+    // counting decoded frames (see _onPcm) rather than ffmpeg's -t, so that a
+    // following contiguous segment of the same file can carry on in the same
+    // decoder — a fresh ffmpeg per track restarted the resampler and the
+    // convolution at every join (a transient, and the IR tail cut off).
     const cueStart = track.cue ? (track.cueStart || 0) : 0;
     const fileSeek = cueStart + startAt;
-    const limitSec = (track.cue && track.cueEnd != null)
-      ? Math.max(0.001, (track.cueEnd - cueStart) - startAt)
-      : null;
-    if (plan.mode === 'dop') this._startDopReader(track, startAt, plan);
-    else this._spawnDecoder(track, fileSeek, plan, limitSec);
+    if (plan.mode === 'dop') {
+      this.seg = null;
+      this._startDopReader(track, fileSeek, plan, track.cue && track.cueEnd != null ? track.cueEnd : null,
+        gaplessJoin && !needOpen);
+    } else {
+      // a carried tail from the previous track is decoded-side audio of THAT
+      // track: start the count below zero so it doesn't eat into this segment
+      const carried = Math.floor(this.residual.length / (plan.channels * (plan.mode === 'bitperfect' ? 4 : 8)));
+      this.seg = { track, limit: this._segLimitFrames(track, startAt, plan.outRate), frames: -carried };
+      this._spawnDecoder(track, fileSeek, plan);
+    }
 
     if (opts.startPaused) {
       // decoder fills pcmQueue up to its backpressure limit and waits;
@@ -819,9 +880,7 @@ class NativeAudioEngine {
 
   // `fileSeek` is the absolute position in the file to start decoding (cueStart
   // + intra-segment offset for a cue track; just the offset otherwise).
-  // `limitSec`, when set, caps how much audio is decoded — a cue segment stops
-  // at its cueEnd instead of running to the end of the shared file.
-  _spawnDecoder(track, fileSeek, plan, limitSec = null) {
+  _spawnDecoder(track, fileSeek, plan) {
     const c = this.config;
     const args = ['-v', 'error', '-nostdin'];
     if (fileSeek > 0.05) args.push('-ss', String(fileSeek));
@@ -854,8 +913,6 @@ class NativeAudioEngine {
       }
       args.push('-f', 'f64le', '-acodec', 'pcm_f64le');
     }
-    // Cap the decoded span to the cue segment length (output-side duration).
-    if (limitSec != null && limitSec > 0) args.push('-t', String(limitSec));
     args.push('-');
     const child = spawn(ffmpegPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
     this.decoder = child;
@@ -888,6 +945,70 @@ class NativeAudioEngine {
     });
   }
 
+  // Output frames left in a cue segment from `startAt` (segment-relative), or
+  // null when it plays to the end of the file (last segment / not a cue).
+  _segLimitFrames(track, startAt, rate) {
+    if (!track?.cue || track.cueEnd == null) return null;
+    return Math.max(1, Math.round((track.cueEnd - (track.cueStart || 0) - startAt) * rate));
+  }
+
+  // The queued next track, if it's the cue segment that starts exactly where
+  // `segTrack` ends in the same file (and needs no reopen) — then the running
+  // decoder simply carries on into it.
+  _contiguousNext(segTrack) {
+    const next = this.nextTrack;
+    if (!next || !segTrack?.cue || !next.cue || next.path !== segTrack.path) return null;
+    if (segTrack.cueEnd == null || Math.abs((next.cueStart || 0) - segTrack.cueEnd) > 0.001) return null;
+    if (this._wouldReopen(next)) return null;
+    // a sliver shorter than two device blocks isn't worth the bookkeeping
+    const lim = this._segLimitFrames(next, 0, this.stream.outRate);
+    if (lim != null && lim < this.stream.frameSize * 2) return null;
+    return next;
+  }
+
+  // A cue segment ended and the decoder isn't carrying on into the next one:
+  // stop it here, as if it had reached the end (see the 'close' handler).
+  _endDecodeAtSegment() {
+    this.stopDecoder();
+    this.decodeEnded = true;
+    if (!(this.nextTrack && !this._wouldReopen(this.nextTrack))) this._flushResidual();
+    this._fill();
+  }
+
+  // The next track changed (or was cleared) after the decoder had already
+  // carried on into the old one's audio: cut the queued audio back to the
+  // join. The rest of the join block becomes silence — the same padding an
+  // ordinary track end gets — and the new next starts via _maybeAdvance.
+  _dropStaleJoin() {
+    if (!this.stream) return; // output closed (engine switched away)
+    const i = this.pcmQueue.findIndex((b) => b._join);
+    if (i < 0) return;
+    const join = this.pcmQueue[i]._join;
+    if (this.nextTrack && this.nextTrack.id === join.track.id) return;
+    const jb = this.pcmQueue[i];
+    jb.fill(0, join.split * (jb.length / this.stream.frameSize));
+    jb._join = null;
+    this.pcmQueue.length = i + 1;
+    this.stopDecoder();
+    this.residual = Buffer.alloc(0);
+    this.seg = null;
+    this.decodeEnded = true;
+    this._fill();
+  }
+
+  // The join block went to the device: from here on the position clock and
+  // the UI follow the new segment. Announced like any gapless advance.
+  _adoptJoin(join) {
+    const track = join.track;
+    this.currentTrack = track;
+    if (this.nextTrack && this.nextTrack.id === track.id) this.nextTrack = null;
+    this.framesWritten = 1; // the join block
+    this.startOffset = -join.split / this.stream.outRate;
+    this.emit('native:track-ended', { advancedTo: track.id });
+    this.emit('native:track-changed', { trackId: track.id });
+    this._emitSignalPath();
+  }
+
   // The decoder's last chunk almost never lands on a frame boundary, so a
   // sub-frame tail sits in `residual` — pad it to one full frame of silence
   // and queue it, or end-of-track advance stalls behind it forever.
@@ -899,15 +1020,22 @@ class NativeAudioEngine {
     const padded = Buffer.alloc(frameBytes);
     this.residual.copy(padded, 0, 0, Math.min(this.residual.length, frameBytes));
     this.residual = Buffer.alloc(0);
-    this.pcmQueue.push(this._prepareFrame(padded));
+    this.pcmQueue.push(this._prepareFrame(padded, this.seg?.track || this.currentTrack));
     this._fill();
   }
 
   // ── native DSD: stream DSF blocks, pack as DoP ──
 
-  _startDopReader(track, startAt, plan) {
+  // `startAt` is the absolute file position (cueStart + offset for a cue
+  // segment); `endSec`, when set, is the absolute file position to stop at.
+  // Both round DOWN to a DSF block, so contiguous cue segments neither
+  // overlap nor leave a gap (block granularity ≈ 11.6ms at DSD64).
+  // `join`: a gapless join on the same stream — continue the DoP marker
+  // alternation from the previous track (restarting at 0x05 could repeat a
+  // marker, and a DoP DAC drops lock on a repeated marker: a click).
+  _startDopReader(track, startAt, plan, endSec = null, join = false) {
     const engine = this;
-    const state = { cancelled: false, markerPhase: 0 };
+    const state = { cancelled: false, markerPhase: join ? (this._dopPhase || 0) : 0, carry: Buffer.alloc(0) };
     this.dop = state;
     (async () => {
       let fh = null;
@@ -922,10 +1050,12 @@ class NativeAudioEngine {
         // seek: bytes per channel per second = dsdRate / 8
         const bytesPerChanSec = info.sampleRate / 8;
         let blockIndex = Math.floor((startAt * bytesPerChanSec) / blockSize);
+        const endBlock = endSec != null ? Math.floor((endSec * bytesPerChanSec) / blockSize) : Infinity;
         let offset = dataStart + blockIndex * blockSize * channels;
         const blockPair = Buffer.alloc(blockSize * channels);
-        while (!state.cancelled) {
+        while (!state.cancelled && blockIndex < endBlock) {
           const { bytesRead } = await fh.read(blockPair, 0, blockPair.length, offset);
+          blockIndex++;
           // re-check after the await: a seek/restart may have cancelled us and
           // reset pcmQueue for a new stream while this read was in flight
           if (state.cancelled || bytesRead < blockPair.length) break; // EOF / cancelled
@@ -941,12 +1071,18 @@ class NativeAudioEngine {
           }
           const packed = packDop(perCh, state.markerPhase);
           state.markerPhase = packed.markerPhase;
-          // split into stream frames
+          // split into stream frames, carrying the remainder into the next
+          // block — dropping it broke the DoP stream on any buffer size that
+          // doesn't divide a block's 2048 frames (and queued NOTHING when the
+          // device frame is larger than a block, e.g. WASAPI-exclusive)
           const s = engine.stream;
           const frameBytes = s.frameSize * s.channels * 4;
-          for (let off = 0; off + frameBytes <= packed.buffer.length; off += frameBytes) {
-            engine.pcmQueue.push(Buffer.from(packed.buffer.subarray(off, off + frameBytes)));
+          const buf = state.carry.length ? Buffer.concat([state.carry, packed.buffer]) : packed.buffer;
+          let off = 0;
+          for (; off + frameBytes <= buf.length; off += frameBytes) {
+            engine.pcmQueue.push(Buffer.from(buf.subarray(off, off + frameBytes)));
           }
+          state.carry = Buffer.from(buf.subarray(off));
           engine._fill();
           // backpressure: keep ~2s decoded
           while (!state.cancelled &&
@@ -958,6 +1094,19 @@ class NativeAudioEngine {
         if (!state.cancelled) engine.emit('native:error', { message: 'DSD: ' + err.message });
       } finally {
         if (fh) await fh.close().catch(() => {});
+        if (!state.cancelled && state.carry.length && engine.stream) {
+          // pad the last partial frame with DSD silence (0x69), keeping the
+          // DoP marker alternation intact so the DAC holds lock to the end
+          const s = engine.stream;
+          const frameBytes = s.frameSize * s.channels * 4;
+          const missing = (frameBytes - state.carry.length) / (s.channels * 4);
+          const sil = Array.from({ length: s.channels }, () => Buffer.alloc(missing * 2, 0x69));
+          const pad = packDop(sil, state.markerPhase);
+          state.markerPhase = pad.markerPhase;
+          engine.pcmQueue.push(Buffer.concat([state.carry, pad.buffer]));
+          state.carry = Buffer.alloc(0);
+        }
+        if (!state.cancelled) engine._dopPhase = state.markerPhase;
         if (!state.cancelled) {
           if (engine.dop === state) engine.dop = null;
           engine.decodeEnded = true;
@@ -977,8 +1126,27 @@ class NativeAudioEngine {
     let off = 0;
     while (data.length - off >= frameBytes) {
       const block = data.subarray(off, off + frameBytes);
+      const seg = this.seg;
+      if (seg && seg.limit != null && seg.frames + s.frameSize > seg.limit) {
+        // this block crosses the cue segment's end
+        const split = seg.limit - seg.frames;
+        const next = this._contiguousNext(seg.track);
+        if (!next) {
+          // keep the segment's last sub-block as the residual and stop here
+          this.residual = Buffer.from(block.subarray(0, split * bytesPerFrame));
+          this._endDecodeAtSegment();
+          return;
+        }
+        off += frameBytes;
+        const out = this._prepareFrame(block, seg.track, split, next);
+        out._join = { track: next, split };
+        this.pcmQueue.push(out);
+        this.seg = { track: next, limit: this._segLimitFrames(next, 0, s.outRate), frames: s.frameSize - split };
+        continue;
+      }
       off += frameBytes;
-      this.pcmQueue.push(this._prepareFrame(block));
+      if (seg) seg.frames += s.frameSize;
+      this.pcmQueue.push(this._prepareFrame(block, seg?.track));
     }
     this.residual = Buffer.from(data.subarray(off));
     // Backpressure: pause decoder when we're far ahead (~2s)
@@ -987,13 +1155,13 @@ class NativeAudioEngine {
     this._fill();
   }
 
-  _prepareFrame(block) {
+  _prepareFrame(block, track = this.currentTrack, split = Infinity, nextTrack = null) {
     const s = this.stream;
     if (s.mode === 'bitperfect') return Buffer.from(block); // untouched s32le
 
     // f64 in → DSP → quantize to the configured output format
     const f64 = new Float64Array(block.buffer.slice(block.byteOffset, block.byteOffset + block.length));
-    this._processBlock(f64);
+    this._processBlock(f64, track, split, nextTrack);
     // Every block feeds the rolling FFT window so it stays CONTIGUOUS audio;
     // viz is COMPUTED here at decode time but EMITTED at device-write time
     // (_outWrite): decode runs in ~1s backpressure bursts, so emitting from
@@ -1100,6 +1268,7 @@ class NativeAudioEngine {
         // through the playlist in seconds
         if (!this._outWrite(buf)) { this.pcmQueue.unshift(buf); break; }
         this.framesWritten++;
+        if (buf._join) this._adoptJoin(buf._join);
       }
       // start the device clock only once half the target is buffered (or the
       // decode already finished and this is all the audio there is)
@@ -1119,6 +1288,7 @@ class NativeAudioEngine {
         const buf = this.pcmQueue.shift();
         if (!this._outWrite(buf)) { this.pcmQueue.unshift(buf); break; }
         this.framesWritten++;
+        if (buf._join) this._adoptJoin(buf._join);
       }
     }
     if (this.decoder?.stdout?.isPaused() && this.pcmQueue.length * this.stream.frameSize / this.stream.outRate < 1) {
@@ -1133,7 +1303,14 @@ class NativeAudioEngine {
     // carried into a same-format gapless join — there the next decoder consumes
     // `residual` as its first bytes (see play()/close handler).
     const carryJoin = this.nextTrack && !this._wouldReopen(this.nextTrack);
-    if (this.residual.length > 0 && !carryJoin) return;
+    if (this.residual.length > 0 && !carryJoin) {
+      // The close handler skipped the padded flush because a same-format next
+      // was queued at the time — but the next has since been cleared or
+      // changed to one that needs a reopen. Pad it now, or advance is stuck
+      // forever behind a sub-frame tail (_flushResidual re-enters via _fill).
+      this._flushResidual();
+      return;
+    }
     if (!this.playing) return;
     const next = this.nextTrack;
     // The device still holds the last ~150ms (RtAudio) / ~500ms (exclusive)
@@ -1155,8 +1332,10 @@ class NativeAudioEngine {
       }).catch((err) => {
         // join failed (e.g. device rejected a reopen) — surface it and report
         // a plain end-of-track so the renderer's normal path picks the next
-        // track or stops, instead of stranding the UI on the finished one
-        this.emit('native:error', { message: err.message });
+        // track or stops, instead of stranding the UI on the finished one.
+        // transient: the track-ended below drives the advance — a non-transient
+        // error would ALSO advance the queue (skipping a playable track).
+        this.emit('native:error', { message: err.message, transient: true });
         this.playing = false;
         this.ended = true;
         this._outStop();

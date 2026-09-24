@@ -18,6 +18,33 @@ export const EQ_PRESETS = {
 };
 
 const PRELOAD_AHEAD_SECONDS = 20;
+// How early (element seconds) a cue segment is treated as ended — the handoff
+// to the next element takes a few ms to become audible.
+const CUE_END_LEAD = 0.02;
+
+// ReplayGain for a track as a linear factor, with the standard clipping
+// prevention: never boost past 1/peak, or a positive gain on a track whose
+// peak is already near full scale clips.
+export function replayGainLinear(track, mode) {
+  if (!track || mode === 'off') return 1;
+  let db = null, peak = null;
+  if (mode === 'track' && track.replayGainTrack != null) {
+    db = track.replayGainTrack;
+    peak = track.rgTrackPeak;
+  } else if (mode === 'album') {
+    if (track.replayGainAlbum != null) {
+      db = track.replayGainAlbum;
+      peak = track.rgAlbumPeak ?? track.rgTrackPeak;
+    } else if (track.replayGainTrack != null) {
+      db = track.replayGainTrack;
+      peak = track.rgTrackPeak;
+    }
+  }
+  if (db == null || !isFinite(db)) return 1;
+  let g = Math.pow(10, db / 20);
+  if (peak > 0 && isFinite(peak) && g * peak > 1) g = 1 / peak;
+  return g;
+}
 
 export class AudioEngine {
   constructor() {
@@ -106,6 +133,9 @@ export class AudioEngine {
     this.onTimeUpdate = null;
     this.onError = null;
     this._errorReportedFor = null; // track id whose error was already reported
+    // bumped whenever an element gets a new src, so a deferred seek scheduled
+    // for an earlier load can't land on whatever replaced it
+    this._loadGen = 0;
 
     this.setVolume(this.volume);
     this._bindElementEvents();
@@ -122,15 +152,9 @@ export class AudioEngine {
       });
       el.addEventListener('timeupdate', () => {
         if (idx !== this.active) return;
-        const c = this.currentTrack;
         // Cue segment: the shared file plays past this track's end, so the
         // real 'ended' never fires — detect the segment boundary and advance.
-        if (c && c.cue && c.cueEnd != null && !this._cueEnding &&
-            el.currentTime >= c.cueEnd - 0.02) {
-          this._cueEnding = true;
-          this._handleEnded();
-          return;
-        }
+        if (this._checkCueEnd()) return;
         this.onTimeUpdate?.(this.currentTime, this.duration);
         this._maybePreloadNext();
       });
@@ -143,13 +167,34 @@ export class AudioEngine {
   }
 
   _applyReplayGain(gainNode, track) {
-    let db = 0;
-    if (track && this.replayGainMode === 'track' && track.replayGainTrack != null) {
-      db = track.replayGainTrack;
-    } else if (track && this.replayGainMode === 'album') {
-      db = track.replayGainAlbum ?? track.replayGainTrack ?? 0;
+    gainNode.gain.value = replayGainLinear(track, this.replayGainMode);
+  }
+
+  // Advance past a cue segment's end. 'timeupdate' only fires every ~250 ms,
+  // so on its own the boundary is caught up to that late and the following
+  // part of the disc image leaks out; once the end is within a second a timer
+  // aimed at the boundary takes over. Returns true if the segment ended.
+  _checkCueEnd() {
+    const c = this.currentTrack;
+    if (!c || !c.cue || c.cueEnd == null || this._cueEnding) return false;
+    const el = this.el;
+    const left = c.cueEnd - CUE_END_LEAD - el.currentTime;
+    if (left <= 0) {
+      clearTimeout(this._cueTimer);
+      this._cueTimer = null;
+      this._cueEnding = true;
+      this._handleEnded();
+      return true;
     }
-    gainNode.gain.value = Math.pow(10, db / 20);
+    // re-validated when it fires (seek, pause, track change), so a stale
+    // timer only ever re-checks; paused elements re-arm on their next
+    // 'timeupdate'. The floor keeps a stalled element from spinning.
+    if (left <= 1 && !el.paused) {
+      clearTimeout(this._cueTimer);
+      const ms = Math.max(5, (left / (el.playbackRate || 1)) * 1000);
+      this._cueTimer = setTimeout(() => { this._cueTimer = null; this._checkCueEnd(); }, ms);
+    }
+    return false;
   }
 
   // An undecodable file fires the element 'error' event AND rejects play();
@@ -178,12 +223,17 @@ export class AudioEngine {
 
   _seekTo(el, seconds) {
     if (!(seconds > 0)) return;
-    const doSeek = () => { try { el.currentTime = seconds; } catch { /* not seekable yet */ } };
+    const gen = this._loadGen;
+    const doSeek = () => {
+      if (gen !== this._loadGen) return; // superseded by a newer load
+      try { el.currentTime = seconds; } catch { /* not seekable yet */ }
+    };
     if (el.readyState >= 1) doSeek();
     else el.addEventListener('loadedmetadata', doSeek, { once: true });
   }
 
   async play(track, startAt = 0) {
+    const gen = ++this._loadGen;
     await this.ctx.resume();
     this.preloadedTrack = null;
     this.currentTrack = track;
@@ -199,6 +249,7 @@ export class AudioEngine {
         // seek to the segment start BEFORE playing, or the head of the shared
         // file (the previous track's audio) briefly leaks out
         await this._whenSeekable(el);
+        if (gen !== this._loadGen) return false; // superseded by a newer load
         try { el.currentTime = seekTo; } catch { /* clamped */ }
       } else if (seekTo > 0) {
         el.currentTime = seekTo;
@@ -219,6 +270,7 @@ export class AudioEngine {
   // where the departing engine left off instead of the switch starting audio
   // on its own.
   async load(track, startAt = 0) {
+    ++this._loadGen;
     await this.ctx.resume();
     this.preloadedTrack = null;
     this.currentTrack = track;
@@ -249,6 +301,7 @@ export class AudioEngine {
     this.preloadedTrack = next;
     const idle = this.idleEl;
     this._applyReplayGain(this.sourceGains[1 - this.active], next);
+    ++this._loadGen;
     idle.src = next.url;
     idle.load();
     if (next.cue) this._seekTo(idle, next.cueStart || 0); // pre-position for a clean handoff
@@ -256,7 +309,13 @@ export class AudioEngine {
 
   async _handleEnded() {
     const next = this.onTrackEnd?.();
-    if (!next) { this.currentTrack = null; return; }
+    if (!next) {
+      // a cue segment's shared file would otherwise play on into the
+      // following segments (no-op for an element that really ended)
+      this.el.pause();
+      this.currentTrack = null;
+      return;
+    }
     const c = this.currentTrack;
     // Same physical file, contiguous cue segments: the element is already
     // playing across the boundary — just adopt the next segment. Truly gapless.
@@ -266,13 +325,21 @@ export class AudioEngine {
       this.preloadedTrack = null;
       this._cueEnding = false;
       this._errorReportedFor = null;
+      this._applyReplayGain(this.sourceGains[this.active], next);
       this.onTrackStarted?.(next);
       return;
     }
     if (this.gapless && this.preloadedTrack && this.preloadedTrack.id === next.id &&
         this.idleEl.readyState >= 2) {
       // Instant handoff to the preloaded element
+      const old = this.el;
       this.active = 1 - this.active;
+      // Release the departing element: a cue segment's shared file is still
+      // playing past cueEnd and would keep mixing under the new track. Its
+      // listeners now bail (idx !== active; 'error' also on empty src).
+      old.pause();
+      old.removeAttribute('src');
+      old.load();
       this.currentTrack = next;
       this.preloadedTrack = null;
       this._errorReportedFor = null;
@@ -443,8 +510,21 @@ export class AudioEngine {
 
   getSpectrumNyquist() { return this.ctx.sampleRate / 2; }
 
+  // The library was re-read (Analyze, rescan): swap in the fresh track objects
+  // so new ReplayGain values apply to what's already playing or preloaded.
+  refreshTracks(byId) {
+    const fresh = (t) => (t && byId.get(t.id)) || t;
+    this.currentTrack = fresh(this.currentTrack);
+    if (this.preloadedTrack) {
+      this.preloadedTrack = fresh(this.preloadedTrack);
+      this._applyReplayGain(this.sourceGains[1 - this.active], this.preloadedTrack);
+    }
+    if (this.currentTrack) this._applyReplayGain(this.sourceGains[this.active], this.currentTrack);
+  }
+
   // the queued "next" is gone (queue cleared) — drop the preload
   clearNext() {
+    ++this._loadGen;
     this.preloadedTrack = null;
     this.idleEl.removeAttribute('src');
   }

@@ -27,19 +27,14 @@ export class ZoneEngineProxy {
 
     this._pendingNext = null;
     this._lastSyncedNextId = null;
-    this._cueStart = 0; // file offset of the active cue segment, if any
 
     this._offs = [
       window.auralis.upnp.on('upnp:progress', (p) => {
-        // Cue segment: the renderer reports position within the whole shared
-        // file — shift it to be segment-relative, and keep the segment length
-        // as duration rather than the file's. (No hard cue end is enforced on a
-        // network renderer; it plays on past the segment — see the note in the
-        // app when a cue track starts on a zone.)
-        const t = Math.max(0, p.time - (this._cueStart || 0));
-        this.currentTime = t;
-        if (!this.currentTrack?.cue) this.duration = p.duration || this.duration;
-        this.onTimeUpdate?.(t, this.duration);
+        // A cue track is served cut out of its disc image, so the renderer's
+        // position is already track-relative.
+        this.currentTime = p.time;
+        this.duration = p.duration || this.duration;
+        this.onTimeUpdate?.(p.time, this.duration);
         this._syncNext();
       }),
       window.auralis.upnp.on('upnp:track-ended', (p) => {
@@ -91,11 +86,8 @@ export class ZoneEngineProxy {
     this.currentTrack = track;
     this.duration = track.duration || 0;
     this.currentTime = startAt || 0;
-    this._cueStart = track.cue ? (track.cueStart || 0) : 0;
     this._lastSyncedNextId = null;
-    // For a cue segment the URL is the whole file, so start the renderer at the
-    // segment's file offset.
-    const res = await window.auralis.upnp.zonePlay(this._slim(track), this._cueStart + (startAt || 0));
+    const res = await window.auralis.upnp.zonePlay(this._slim(track), startAt || 0);
     if (!res.ok) {
       this.onError?.(track, res.error || 'Renderer refused playback');
       return false;
@@ -143,8 +135,8 @@ export class ZoneEngineProxy {
   pause() { window.auralis.upnp.zonePause(); this.paused = true; }
   seek(time) {
     if (!isFinite(time)) return;
-    this.currentTime = time; // segment-relative; the renderer seeks in file time
-    window.auralis.upnp.zoneSeek((this._cueStart || 0) + time);
+    this.currentTime = time;
+    window.auralis.upnp.zoneSeek(time);
   }
 
   setVolume(v) { this.volume = v; window.auralis.upnp.zoneVolume(Math.round(v * 100)); }
@@ -171,7 +163,12 @@ export class ZoneEngineProxy {
         label: t.codec || 'PCM',
         detail: `${t.bitsPerSample || 16}-bit / ${((t.sampleRate || 44100) / 1000)} kHz`,
       },
-      {
+      t.cue && (t.cueStart > 0 || t.cueEnd != null) ? {
+        // cut out of the disc image as FLAC: bit-perfect up to 24-bit PCM;
+        // DSD and 32-bit images are converted to 24-bit, lossy ones decoded
+        kind: 'dsp', quality: !t.lossless || t.dsd || t.bitsPerSample > 24 ? 'lossless' : 'bitperfect', label: 'Cue track cut',
+        detail: t.dsd ? 'cut from the disc image as 24-bit / 176.4 kHz FLAC' : 'cut from the disc image as FLAC',
+      } : {
         kind: 'dsp', quality: 'bitperfect', label: 'HTTP serve',
         detail: 'original file streamed untouched',
       },

@@ -142,7 +142,12 @@ class RendererEngine {
 
   async select(location) {
     this.stopAll();
-    this.device = location ? await describeRenderer(location) : null;
+    // Two quick selects: the later one wins even if its describe returns first.
+    const gen = this.selectGen = (this.selectGen || 0) + 1;
+    this.device = null;
+    const device = location ? await describeRenderer(location) : null;
+    if (gen !== this.selectGen) return device ? { name: device.name, openhome: !!device.ohPlaylist } : null;
+    this.device = device;
     return this.device ? { name: this.device.name, openhome: !!this.device.ohPlaylist } : null;
   }
 
